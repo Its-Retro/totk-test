@@ -1,0 +1,8 @@
+# Python packages the builder needs, pinned by version and wheel hash (Windows x64, CPython 3.12).
+# build.ps1 installs them with: pip install --require-hashes --only-binary=:all: -r builder/requirements.txt
+# capstone: ARM64 disassembler used by the translator (its exact version decides the emitted C text).
+capstone==5.0.7 --hash=sha256:4ab8bcb7da8f221ff45926ca168ca33e76f7237d06fbf3c10780002faa2670e1
+# zstandard: the shader tools read the game's zstd-compressed shader archives.
+zstandard==0.25.0 --hash=sha256:ffef5a74088f1e09947aecf91011136665152e0b4b359c42be3373897fb39b01
+# numpy: only needed if the shipped static-entry cache has to be rebuilt (entry_points.py).
+numpy==2.3.5 --hash=sha256:86945f2ee6d10cdfd67bcb4069c1662dd711f7e2a4343db5cecec06b87cf31aa

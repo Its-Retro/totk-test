@@ -1,0 +1,6 @@
+# Keep every file byte for byte as committed (no line-ending conversion on any machine). The sources use
+# Windows line endings; Git Bash, Python, zig and DXC all read them as they are.
+* -text
+*.dxil binary
+*.bin binary
+*.png binary

@@ -1,0 +1,16 @@
+{
+  "_about": "Human names for game functions identified while debugging. Keys are module offsets (module base: main 0x7110000000, sdk 0x7130000000). 'confidence' is how sure we are; 'evidence' says how it was identified.",
+  "main": {
+    "0x937a40": {"name": "JobSystem_HelpOrWait_dispatch", "confidence": "medium", "evidence": "2026-10-14 thread dumps: main thread and workers 48/49 loop here; jump table over job types (0x937a7c switch), calls the SleepThread wrapper while a job group finishes"},
+    "0x9386cc": {"name": "JobSystem_WaitGroup_yield", "confidence": "medium", "evidence": "atomic increment (ldxr/stxr on [x23]) then bl main+0x2aa4c40 (yield) inside the job wait loop"},
+    "0x2aa4ab0": {"name": "os_GetCurrentCoreNumber_or_JobSlot", "confidence": "low", "evidence": "called with [main+0x4557a58] word before each job dispatch case; returns an index (cbz/sub 1)"},
+    "0x2aa4c40": {"name": "os_YieldThread (svc 0xB SleepThread wrapper)", "confidence": "medium", "evidence": "worker stacks end at sdk svc 0xB stub (sdk+0x158360) via this call"},
+    "0x863438": {"name": "copy_u64_array_postinc (str x27,[x18],#8 loop)", "confidence": "low", "evidence": "2026-10-14 straddled-store crash site; 8-byte store with post-increment"},
+    "0x9b5d80": {"name": "GameFrame_main_loop_step", "confidence": "low", "evidence": "frozen-screen diagnosis: main thread frame loop main+0x9b5d80 -> 0x8f6a24 -> 0xae2328 -> 0xf35470 (signals a sync object each frame)"}
+  },
+  "sdk": {
+    "0x158360": {"name": "svcSleepThread stub (svc 0xB)", "confidence": "high", "evidence": "disassembly: svc #0xb; ret"},
+    "0x158454": {"name": "svcSendSyncRequest stub (svc 0x21)", "confidence": "high", "evidence": "disassembly: svc #0x21; ret"},
+    "0x15844c": {"name": "svc stub epilogue area (svc 0x1f ConnectToNamedPort precedes)", "confidence": "high", "evidence": "disassembly"}
+  }
+}
