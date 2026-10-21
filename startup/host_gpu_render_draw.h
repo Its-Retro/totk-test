@@ -4,6 +4,138 @@
 
 #include "host_draw_census.h"   /* TOTK_DRAW_CENSUS=1 diagnostic; off = one branch per hook */
 
+/* G2 (batch-4) point sprites: helpers for the draw path below.
+ * NVN rasterises a POINTS primitive as a point_size x point_size square centred on the vertex (the size set by
+ * nvnCommandBufferSetPointSize, 1.0 until set, unless the vertex shader writes gl_PointSize) and gives the fragment shader
+ * gl_PointCoord, 0..1 across the square. nxport gets both from Metal natively (crates/engine/src/metal/mod.rs:2700-2705
+ * records SetPointSize; metal/msl_specialize.rs:375-379 passes it as the point size when the vertex shader writes none;
+ * Metal's [[point_coord]] has its origin at the upper-left). D3D12 has neither: a point is one pixel, and a pixel shader
+ * that reads the point coordinate (maxwell_hlsl.py op_ipa, a[0x2e0]) declares a POINTCOORD input that no vertex shader
+ * outputs, so CreateGraphicsPipelineState refuses the pipeline (E_INVALIDARG: all 3584 refused draws in play-94's last
+ * boot were NVN mode 0, POINTS) and the draw is lost.
+ * Such a draw (topology type POINT, pixel shader input signature with POINTCOORD) gets a geometry shader that emits the
+ * square as two triangles: make_point_gs.py writes one per vertex-shader output signature, shader-gs\pt-<FNV-1a 64 of the
+ * vertex shader's DXIL OSG1 part, 16 hex>.gs.dxil beside the manifest; it passes every vertex output through unchanged
+ * and adds POINTCOORD, (0,0) at the upper-left corner in render-target rows (as Metal; TOTK_POINT_SPRITE=flip starts it
+ * at the bottom, for an A/B against a capture). The geometry shader reads its parameters from entry 32 of the draw's
+ * vertex attribute table (t2, root table 2, visible to every stage; the per-stage constant tables are not visible to it):
+ * point size, viewport half extents in pixels, winding flags (boot_pt_params). A point whose centre is outside the view
+ * volume in x/y is not drawn (as on the source GPU; z is clipped by the rasteriser, the four corners share it); the size
+ * is clamped to 1..2047 pixels. The pipeline keeps topology type POINT, draws with culling off (a point has no facing:
+ * the square is wound front-facing, so SV_IsFrontFace and two-sided stencil see a front face) and its key carries the
+ * geometry shader's layout (boot_pt_gs_key), so the pre-creation file and the pipeline library keep it apart.
+ * A geometry-shader point expansion is the standard native D3D technique; only semantics come from nxport. Nothing is
+ * dropped or substituted: without a geometry shader file the pipeline is created exactly as before (and logged once).
+ * TOTK_POINT_SPRITE=0: off, the pipelines of before. */
+
+typedef struct BootPtGs { uint64_t key; void *dxil; size_t size; } BootPtGs;   /* dxil NULL: no file (not retried) */
+#define BOOT_PT_GS_MAX 128
+static BootPtGs boot_pt_gs[BOOT_PT_GS_MAX]; static unsigned boot_pt_gs_count; static SRWLOCK boot_pt_lock = SRWLOCK_INIT;
+static uint32_t boot_pt_size_bits = 0x3f800000u;   /* nvnCommandBufferSetPointSize as last played (float bits), NVN default 1.0 */
+static uint64_t boot_pt_draws, boot_pt_missing;    /* point-sprite pipelines built, draws whose layout had no file */
+
+static inline int boot_pt_mode(void) {   /* 0 off, 1 on, 2 on with POINTCOORD.y counted from the bottom */
+    static int m = -1;
+    if (m < 0) { char v[8]; DWORD n = GetEnvironmentVariableA("TOTK_POINT_SPRITE", v, sizeof v);
+                 m = !(n && n < sizeof v) ? 1 : v[0] == '0' ? 0 : v[0] == 'f' ? 2 : 1; }
+    return m;
+}
+static inline void boot_pt_note_size(uint32_t bits) { boot_pt_size_bits = bits; }   /* host_nvn_play.h: SetPointSize(cmd, float) */
+
+/* One part of a DXIL container ('DXBC', digest, version, size, part count, part offsets; part = fourcc, size, data). */
+static inline const uint8_t *boot_pt_part(const void *dxil, size_t n, const char fourcc[4], uint32_t *size) {
+    const uint8_t *p = (const uint8_t *)dxil; uint32_t count, off, sz;
+    if (!p || n < 32 || memcmp(p, "DXBC", 4)) return NULL;
+    memcpy(&count, p + 28, 4);
+    if (count > 64 || 32 + 4 * (size_t)count > n) return NULL;
+    for (uint32_t i = 0; i < count; ++i) {
+        memcpy(&off, p + 32 + 4 * i, 4);
+        if ((size_t)off + 8 > n) return NULL;
+        memcpy(&sz, p + off + 4, 4);
+        if (!memcmp(p + off, fourcc, 4) && (size_t)off + 8 + sz <= n) { *size = sz; return p + off + 8; }
+    }
+    return NULL;
+}
+/* 1 when the pixel shader's input signature (ISG1: count, element offset, 32-byte elements whose second word is the
+ * semantic name's offset in the part) has a POINTCOORD element. */
+static inline int boot_pt_reads_coord(const void *ps, size_t n) {
+    uint32_t sz, count, eo; const uint8_t *s = boot_pt_part(ps, n, "ISG1", &sz);
+    if (!s || sz < 8) return 0;
+    memcpy(&count, s, 4); memcpy(&eo, s + 4, 4);
+    for (uint32_t i = 0; i < count && (size_t)eo + 32 * (size_t)(i + 1) <= sz; ++i) {
+        uint32_t name; memcpy(&name, s + eo + 32 * i + 4, 4);
+        if (name < sz && sz - name >= 11 && !memcmp(s + name, "POINTCOORD", 11)) return 1;
+    }
+    return 0;
+}
+/* The vertex shader's output layout: FNV-1a 64 of its OSG1 part (make_point_gs.py hashes the same bytes); 0 = none. */
+static inline uint64_t boot_pt_layout(const void *vs, size_t n) {
+    uint32_t sz; const uint8_t *s = boot_pt_part(vs, n, "OSG1", &sz);
+    if (!s) return 0;
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (uint32_t i = 0; i < sz; ++i) { h ^= s[i]; h *= UINT64_C(1099511628211); }
+    return h ? h : 1;
+}
+/* The geometry shader for a layout (loaded once; render thread and pre-creation thread). */
+static inline const BootPtGs *boot_pt_gs_load(const char *manifest_path, uint64_t key) {
+    const BootPtGs *g = NULL;
+    AcquireSRWLockShared(&boot_pt_lock);
+    for (unsigned i = 0; i < boot_pt_gs_count; ++i) if (boot_pt_gs[i].key == key) { g = &boot_pt_gs[i]; break; }
+    ReleaseSRWLockShared(&boot_pt_lock);
+    if (g) return g;
+    char path[1100]; const char *mf = boot_manifest_file(manifest_path);
+    const char *sep = strrchr(mf, '\\'), *sep2 = strrchr(mf, '/'); if (sep2 > sep) sep = sep2;
+    snprintf(path, sizeof path, "%.*sshader-gs\\pt-%016llx.gs.dxil", sep ? (int)(sep - mf + 1) : 0, mf, (unsigned long long)key);
+    void *data = NULL; size_t n = 0; FILE *f = fopen(path, "rb");
+    if (f) {
+        long len = -1; if (fseek(f, 0, SEEK_END) == 0) len = ftell(f);
+        if (len > 0 && len < (1L << 24) && fseek(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)len)) != NULL && fread(data, 1, (size_t)len, f) != (size_t)len) { free(data); data = NULL; }
+        if (data) n = (size_t)len;
+        fclose(f);
+    }
+    AcquireSRWLockExclusive(&boot_pt_lock);
+    for (unsigned i = 0; i < boot_pt_gs_count; ++i) if (boot_pt_gs[i].key == key) { g = &boot_pt_gs[i]; break; }   /* the other thread's */
+    if (!g && boot_pt_gs_count < BOOT_PT_GS_MAX) {
+        BootPtGs *e = &boot_pt_gs[boot_pt_gs_count++]; e->key = key; e->dxil = data; e->size = n; data = NULL; g = e;
+        if (!e->dxil) boot_draw_path_logf("point sprite: no geometry shader %s for this vertex-shader output layout: the POINTS draw keeps its pipeline of before", path);
+    }
+    ReleaseSRWLockExclusive(&boot_pt_lock);
+    free(data);   /* never freed once stored: pipeline jobs keep pointing at it */
+    return g;
+}
+/* The key bytes of a pipeline with this geometry shader (0 = none); appended to the pipeline key. */
+static inline uint64_t boot_pt_gs_key(const void *gs) {
+    if (!gs) return 0;
+    uint64_t k = 0;
+    AcquireSRWLockShared(&boot_pt_lock);
+    for (unsigned i = 0; i < boot_pt_gs_count; ++i) if (boot_pt_gs[i].dxil == gs) { k = boot_pt_gs[i].key; break; }
+    ReleaseSRWLockShared(&boot_pt_lock);
+    return k;
+}
+/* Pipeline description of a draw: a POINT pipeline whose pixel shader reads POINTCOORD gets its geometry shader and no
+ * culling. Returns 1 when the geometry shader was set. */
+static inline int boot_pt_apply(const char *manifest_path, D3D12_GRAPHICS_PIPELINE_STATE_DESC *d) {
+    if (d->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT || !d->PS.pShaderBytecode || d->GS.pShaderBytecode || !boot_pt_mode()) return 0;
+    if (!boot_pt_reads_coord(d->PS.pShaderBytecode, d->PS.BytecodeLength)) return 0;
+    uint64_t key = boot_pt_layout(d->VS.pShaderBytecode, d->VS.BytecodeLength);
+    const BootPtGs *g = key ? boot_pt_gs_load(manifest_path, key) : NULL;
+    if (!g || !g->dxil) { ++boot_pt_missing; return 0; }
+    d->GS.pShaderBytecode = g->dxil; d->GS.BytecodeLength = g->size;
+    d->RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    ++boot_pt_draws;
+    return 1;
+}
+/* Entry 32 of the vertex attribute table (8 words, read by the geometry shader as a VertexAttrib): point size (float
+ * bits), viewport half width and half height in pixels (|scale|, boot_render_viewport_map), flags: bit 0 the pipeline's
+ * front face is counter-clockwise, bit 1 POINTCOORD.y from the bottom. */
+static inline void boot_pt_params(uint32_t e[8], const BootDrawState *s, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d) {
+    float hx = s->viewport[0].scale[0], hy = s->viewport[0].scale[1];
+    if (hx < 0) hx = -hx;
+    if (hy < 0) hy = -hy;
+    e[0] = boot_pt_size_bits; memcpy(&e[1], &hx, 4); memcpy(&e[2], &hy, 4);
+    e[3] = (d->RasterizerState.FrontCounterClockwise ? 1u : 0u) | (boot_pt_mode() == 2 ? 2u : 0u);
+}
+
 /* Draw trace (diagnostics, off unless frames\draw-trace.request arms it in host_gpu_draw_exec.h):
  * while `active`, boot_render_draw brackets its draw with a pipeline-statistics query (slot
  * `query`, resolved into `rb`) and records what it bound. */
@@ -108,8 +240,8 @@ static inline int boot_render_zt_format(uint32_t z, DXGI_FORMAT *f) {
  * top, as D3D12's own viewport transform (y_w = TopLeftY + (1 - ndc_y) * Height / 2) does. D3D12 needs
  * Height > 0: scale_y < 0 maps directly (Height = -2 scale_y); scale_y > 0 has the vertex shader negate
  * clip y (HostState host_flip_y, maxwell_runtime.hlsli finish_vs) and Height = 2 scale_y. Either way
- * the D3D12 window position equals the source GPU's (suyu GetViewportState uses a negative Vulkan
- * height for the same transform). */
+ * the D3D12 window position equals the source GPU's (a Vulkan backend gets the same transform from a
+ * negative viewport height, VK_KHR_maintenance1). */
 static inline int boot_render_viewport_flip(float scale_y) { return scale_y > 0; }
 static inline void boot_render_viewport_map(const BootViewport *v, D3D12_VIEWPORT *vp) {
     float sy = boot_render_viewport_flip(v->scale[1]) ? v->scale[1] : -v->scale[1];
@@ -122,13 +254,41 @@ static inline void boot_render_viewport_map(const BootViewport *v, D3D12_VIEWPOR
 static inline BOOL boot_render_front_ccw(uint32_t front_face, uint32_t flip_y) { return (front_face == 0x901) != (flip_y != 0); }
 
 /* Vertex attribute table divisor (maxwell_runtime.hlsli vin_attr4: 0 = index by vertex, otherwise
- * instance / divisor). VERTEX_STREAM_A_FREQUENCY is used only for streams with
- * SET_VERTEX_STREAM_INSTANCE_A set (suyu IsInstancingEnabled); a per-instance stream with frequency 0
- * reads element 0 for every instance (encoded as the largest divisor). Games leave stale frequency
- * values (e.g. 1) on per-vertex streams. */
+ * base instance + instance / divisor; K2 (batch-4), before it (base + instance) / divisor). VERTEX_STREAM_A_FREQUENCY
+ * is used only for streams with SET_VERTEX_STREAM_INSTANCE_A.IS_INSTANCED set
+ * (Ryujinx StateUpdater.UpdateVertexBufferState: instanced ? Divisor : 0); a per-instance stream
+ * with frequency 0 reads the same element for every instance (encoded as the largest divisor: element `base`, or 0
+ * with shaders translated before K2). Games leave stale frequency values (e.g. 1) on per-vertex streams. */
 static inline uint32_t boot_render_attrib_divisor(const BootVertexStream *st) {
     if (!st->per_instance) return 0;
     return st->divisor ? st->divisor : 0xffffffffu;
+}
+/* K2 (batch-4): HostState host_instance_offset (word 8), read only by vertex shaders translated with K2
+ * (maxwell_runtime.hlsli host_iid_offset): the instances before this host draw (TOTK_INSTANCE_EXPAND, else 0), so
+ * InstanceId counts from 0 without the base instance and a per-instance attribute reads base + instance / divisor, as on
+ * the source GPU; host_instance_base (word 5) keeps base instance + it, as before (indirect draws: the GPU-written base).
+ * TOTK_INSTANCE_ID_ZERO_BASED=0 writes 0xffffffff: those shaders then add the base instance to InstanceId and read
+ * (base + instance) / divisor, exactly as before. Shaders translated before K2 never read the word. */
+static inline uint32_t boot_render_iid_offset(uint32_t before) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_INSTANCE_ID_ZERO_BASED", v, sizeof v); on = !(k && k < sizeof v && v[0] == '0'); }
+    return on ? before : 0xffffffffu;
+}
+/* vbounds: vertex attribute table size word (maxwell_runtime.hlsli VertexAttrib.size): the bytes bound from the stream's
+ * start address (NVN BindVertexBuffer size, host_nvn_exec.h boot_nvn_st_vertex; VERTEX_STREAM_LIMIT + 1 - address).
+ * vin_attr4 reads element bytes at or past it as 0, as the source GPU does past the stream limit: TOTK draws with base
+ * vertices beyond the bound buffers while meshes stream in, which the source GPU collapses and we drew as spikes from
+ * the memory behind the stream. 0 = unknown, no bound (also a limit below the address, and sizes above 4 GiB - 16, where
+ * the shader's 32-bit element offset could wrap inside the bound). TOTK_VERTEX_BOUNDS=0: 0 for every stream, the
+ * unbounded fetch of before (read once). */
+static inline int boot_render_vertex_bounds(void) {
+    static int v = -1;
+    if (v < 0) { char t[8]; DWORD k = GetEnvironmentVariableA("TOTK_VERTEX_BOUNDS", t, sizeof t); v = !(k && k < sizeof t && t[0] == '0'); }
+    return v;
+}
+static inline uint32_t boot_render_stream_size(const BootVertexStream *st) {
+    if (!st->enabled || st->limit < st->address || st->limit - st->address >= UINT64_C(0xfffffff0)) return 0;
+    return (uint32_t)(st->limit - st->address + 1);
 }
 
 /* Depth targets share the target cache; their format field holds 0x10000 | ZT format. */
@@ -357,7 +517,12 @@ static DWORD WINAPI boot_render_pso_pre_thread(void *arg) {
             if (rec.has_ps && !pp && m[i].stage == 1 && m[i].mask == rec.vs_mask && !memcmp(m[i].id, key + 32, 32)) pp = m[i].path;
         }
         if (!vp || (rec.has_ps && !pp)) { InterlockedIncrement(&boot_render_pso_pre_failed); continue; }
-        size_t vn = 0, pn = 0; void *vb = boot_render_pso_read_file(vp, &vn), *pb = rec.has_ps ? boot_render_pso_read_file(pp, &pn) : NULL;
+        /* p96 (batch 4): the redirects of boot_render_shader_load (TOTK_LDC_FIX=0, TOTK_SHADER_BATCH4=0), so a pipeline made
+         * here has the bytecode the draw loads (the draw takes it by key, which holds the program ids, not the bytecode) */
+        char vpath[900], ppath[900]; ppath[0] = 0;
+        snprintf(vpath, sizeof vpath, "%s", vp); boot_render_ldc_fix_path(vpath, sizeof vpath); boot_render_batch4_path(vpath, sizeof vpath);
+        if (pp) { snprintf(ppath, sizeof ppath, "%s", pp); boot_render_ldc_fix_path(ppath, sizeof ppath); boot_render_batch4_path(ppath, sizeof ppath); }
+        size_t vn = 0, pn = 0; void *vb = boot_render_pso_read_file(vpath, &vn), *pb = rec.has_ps ? boot_render_pso_read_file(ppath, &pn) : NULL;
         if (vb && (!rec.has_ps || pb)) {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC d; memset(&d, 0, sizeof d); size_t o = 64;
             d.pRootSignature = a->root; d.VS.pShaderBytecode = vb; d.VS.BytecodeLength = vn;
@@ -368,6 +533,9 @@ static DWORD WINAPI boot_render_pso_pre_thread(void *arg) {
             memcpy(&d.PrimitiveTopologyType, key + o, 4); o += 4; memcpy(&d.IBStripCutValue, key + o, 4); o += 4;
             memcpy(&d.DSVFormat, key + o, 4); o += 4; memcpy(d.RTVFormats, key + o, 32);
             d.SampleMask = UINT_MAX; d.NumRenderTargets = rec.nrt; d.SampleDesc.Count = 1;
+            if (rec.k == o + 32 + 8) {   /* G2: a point-sprite pipeline (boot_psoj_key): its geometry shader by layout */
+                uint64_t g; memcpy(&g, key + o + 32, 8); const BootPtGs *pg = boot_pt_gs_load(a->manifest, g);
+                if (pg && pg->dxil) { d.GS.pShaderBytecode = pg->dxil; d.GS.BytecodeLength = pg->size; } }
             ID3D12PipelineState *pso = NULL;
             if (SUCCEEDED(boot_psoc_create_graphics(NULL, a->dev, &d, key, rec.k, &pso))) {   /* play (73): library first */
                 boot_render_pso_pre_put(key, rec.k, pso); InterlockedIncrement(&boot_render_pso_pre_made); }
@@ -1084,6 +1252,183 @@ static inline void boot_gp_draw_tag(ID3D12GraphicsCommandList *cl, const char *f
     boot_gp_draw_begin(cl, file, line, id, (uint64_t)v << 32 | p, info);
 }
 #define BOOT_GP_DRAW_BEGIN(cl, pso, rts, n, zt, vs, ps) do { if (boot_gp_mode > 0) boot_gp_draw_tag((cl), __FILE__, __LINE__, (pso), (rts), (n), (zt), (vs), (ps)); } while (0)
+/* batch-3 state diagnostics (TOTK_STATE_DIAG, default on; =0: none of these checks run). They change no draw: each check
+ * logs its first hits to draw-path.log, and host_nvn_exec.h boot_nvn_state_diag_present writes the non-zero counters
+ * every 300 presents (last 300, total). Counters bumped on game threads (N5, N6) are approximate.
+ *   restart_*      K1/G5 indexed point/line/triangle LIST draws with primitive restart on (boot_render_restart_diag):
+ *                  seen, index ranges scanned, draws whose indices hold the restart index, draws not checked
+ *   int_blend_off  G8 pipeline descriptions whose blend was dropped on an integer target (read-ahead ones included)
+ *   vfmt_*         K3 vertex attributes (per vertex-state build) only the driver table decodes / with no vertex encoding
+ *   stencil_*      N4/G7 stencil draws; back ops (ds[6..7]) / back ref or masks ([1]) differ from the front; either
+ *                  with back faces drawn (not culled)
+ *   bias_*         N11/G9 polygon-offset draws; of points or lines; with fractional units
+ *   viewport_fractional  N10 SetViewports rectangles with a fraction
+ *   flush_*        N6 nvnTextureFlushTexels calls / texture ranges pushed
+ *   tic_*          N5 registrations compared with the driver's TIC words: checked, identical, source (swizzle) mismatch,
+ *                  of those equal to the composed swizzle / to neither rule, driver = ours where composing differs,
+ *                  other field mismatch, pool entry not mapped, not queued (queue full) */
+typedef struct BootStateDiag {
+    uint64_t restart_list_draws, restart_scanned, restart_hits, restart_unscanned, int_blend_off, vfmt_new, vfmt_unsupported;
+    uint64_t stencil_draws, stencil_back_ops, stencil_back_values, stencil_back_drawn, bias_draws, bias_not_triangles, bias_fractional;
+    uint64_t viewport_fractional, flush_texels, flush_pushed;
+    uint64_t tic_checked, tic_same, tic_source_bad, tic_compose, tic_neither, tic_replace, tic_other_bad, tic_unreadable, tic_dropped;
+} BootStateDiag;
+static BootStateDiag boot_state_diag;
+static inline int boot_render_state_diag_on(void) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_STATE_DIAG", v, sizeof v); on = !(k && k < sizeof v && v[0] == '0'); }
+    return on;
+}
+/* Guest GPU VA -> host pointer as boot_render_guest, without its tiling-list guard: a diagnostic never waits (the bytes
+ * may predate pending GPU writes). NULL unless the range is contiguous in one region. */
+static inline const uint8_t *boot_render_diag_guest(const BootRender *r, uint64_t va, uint64_t size) {
+    if ((va >> 12) < r->va_base_page) return NULL;
+    uint64_t page = (va >> 12) - r->va_base_page;
+    if (page >= r->ptable_pages) return NULL;
+    uint32_t e = r->ptable_cpu[page];
+    if (e == 0xffffffffu || (e >> 24) >= r->region_count) return NULL;
+    unsigned region = e >> 24; uint64_t off = ((uint64_t)(e & 0xffffff) << 12) | (va & 0xfff);
+    if (off > r->region_size[region] || size > r->region_size[region] - off) return NULL;
+    uint64_t last = size ? ((va & 0xfff) + size - 1) >> 12 : 0;
+    for (uint64_t p = 1; p <= last; ++p)
+        if (page + p >= r->ptable_pages || r->ptable_cpu[page + p] != e + (uint32_t)p) return NULL;
+    return r->region_cpu[region] + off;
+}
+/* K1/G5 diagnostic: an indexed point/line/triangle LIST draw with primitive restart on whose indices hold the restart
+ * index. NVN (GL rules) ends the primitive there and drops its unfinished vertices; D3D12 cuts strips only, so in a list
+ * the restart index is drawn as a real vertex (index 0xffff / 0xffffffff, fetched past the stream). nxport (MIT,
+ * crates/engine/src/metal/translated.rs:1984-2056) rewrites such index lists; the rewrite waits for this count. A scan
+ * is memoised by (first index VA, count, index size, mapping generation) and at most 1 MiB of indices is scanned per
+ * present; indirect draws (first/count on the GPU) are counted as not checked. */
+#define BOOT_RENDER_RESTART_MEMO 1024
+static struct { uint64_t va, gen; uint32_t count, bytes, hit; } boot_render_restart_memo[BOOT_RENDER_RESTART_MEMO];
+static uint64_t boot_render_restart_budget;   /* index bytes scanned since the last present */
+static inline void boot_render_restart_diag(BootRender *r, const BootDrawState *s, uint32_t idx_bytes, int indirect) {
+    BootStateDiag *g = &boot_state_diag; ++g->restart_list_draws;
+    if (indirect || !s->count) { ++g->restart_unscanned; return; }
+    uint64_t va = s->index_address + (uint64_t)s->first * idx_bytes, bytes = (uint64_t)s->count * idx_bytes;
+    unsigned k = (unsigned)((va >> 2) ^ (va >> 15) ^ ((uint64_t)s->count * 0x9e3779b1u)) & (BOOT_RENDER_RESTART_MEMO - 1);
+    if (boot_render_restart_memo[k].va == va && boot_render_restart_memo[k].count == s->count && boot_render_restart_memo[k].bytes == idx_bytes &&
+        boot_render_restart_memo[k].gen == boot_render_map_gen) { if (boot_render_restart_memo[k].hit) ++g->restart_hits; return; }
+    const uint8_t *p = boot_render_restart_budget + bytes <= (UINT64_C(1) << 20) ? boot_render_diag_guest(r, va, bytes) : NULL;
+    if (!p) { ++g->restart_unscanned; return; }
+    boot_render_restart_budget += bytes; ++g->restart_scanned;
+    uint32_t n = 0, at = 0, rv = s->restart_index;
+    if (idx_bytes == 1) { for (uint32_t i = 0; i < s->count; ++i) if ((uint32_t)p[i] == rv && !n++) at = i; }
+    else if (idx_bytes == 2) { for (uint32_t i = 0; i < s->count; ++i) { uint16_t x; memcpy(&x, p + 2 * (size_t)i, 2); if ((uint32_t)x == rv && !n++) at = i; } }
+    else { for (uint32_t i = 0; i < s->count; ++i) { uint32_t x; memcpy(&x, p + 4 * (size_t)i, 4); if (x == rv && !n++) at = i; } }
+    boot_render_restart_memo[k].va = va; boot_render_restart_memo[k].count = s->count; boot_render_restart_memo[k].bytes = idx_bytes;
+    boot_render_restart_memo[k].gen = boot_render_map_gen; boot_render_restart_memo[k].hit = n != 0;
+    if (!n) return;
+    ++g->restart_hits;
+    static unsigned logged;
+    if (logged < 16) {
+        ++logged;
+        boot_gp_log("nvn native: K1 restart index in an indexed list draw: topology %u, index size %u, restart index %x found %u times (first at %u) "
+                    "in first %u count %u, indices at %llx, base vertex %d (submission %llu)", s->topology, idx_bytes, rv, n, at, s->first, s->count,
+                    (unsigned long long)va, (int)s->base_vertex_reg, (unsigned long long)boot_render_exec_id);
+    }
+}
+/* vbounds diagnostic (TOTK_STATE_DIAG; log only, changes no draw): the island spikes survived the vertex-fetch bound in
+ * play-95, now converging on one point. For each direct draw this finds the highest and lowest vertex the draw fetches
+ * (indices scanned once per index range and map generation, like K1, within a per-present byte budget) and compares
+ * every enabled per-vertex attribute's byte range with the stream's bound size: PARTIAL = some vertices inside, some past
+ * (those read 0 now: triangles pulled to the model origin, visible), FULL = the whole draw past the bound (all vertices
+ * read 0: collapses, as on the source GPU). It also flags index ranges that run past the bound index buffer limit. */
+#define BOOT_RENDER_VB_MEMO 2048
+static volatile LONG boot_render_present_no;   /* call-bind: presents so far (host_nvn.h boot_nvn_ev_present), on these lines to correlate with the call-bind watch */
+static struct { uint64_t va, gen; uint32_t count, bytes, lo, hi; } boot_render_vb_memo[BOOT_RENDER_VB_MEMO];
+static uint64_t boot_render_vb_budget;   /* index bytes scanned since the last present (reset in boot_nvn_state_diag_present) */
+static uint64_t boot_render_vb_checked, boot_render_vb_unscanned, boot_render_vb_partial, boot_render_vb_full, boot_render_vb_idx_past;
+static inline uint32_t boot_render_vb_elem_bytes(uint32_t size) {
+    switch (size) {
+    case 0x01u: return 16u; case 0x02u: return 12u; case 0x03u: case 0x04u: return 8u; case 0x05u: return 6u;
+    case 0x0au: case 0x0fu: case 0x12u: case 0x30u: case 0x31u: case 0x2fu: return 4u; case 0x13u: case 0x33u: return 3u;
+    case 0x18u: case 0x1bu: case 0x32u: return 2u; case 0x1du: case 0x34u: return 1u; default: return 0u;
+    }
+}
+static inline void boot_render_vbounds_diag(BootRender *r, const BootDrawState *s, const uint8_t *vs_id) {
+    uint32_t lo, hi; int32_t base = 0;
+    uint32_t idx_bytes = s->index_size == 0 ? 1u : s->index_size == 1 ? 2u : 4u;
+    if (s->indexed) {
+        uint64_t va = s->index_address + (uint64_t)s->first * idx_bytes, bytes = (uint64_t)s->count * idx_bytes;
+        if (s->index_limit >= s->index_address && va + bytes - 1 > s->index_limit) {
+            static unsigned logged_idx;
+            if (++boot_render_vb_idx_past, logged_idx < 8) { ++logged_idx;
+                boot_gp_log("nvn native: vbounds diag INDEX PAST LIMIT: indices %llx..%llx, index buffer limit %llx (first %u count %u size %u, submission %llu, present %ld)",
+                            (unsigned long long)va, (unsigned long long)(va + bytes - 1), (unsigned long long)s->index_limit, s->first, s->count, idx_bytes,
+                            (unsigned long long)boot_render_exec_id, (long)boot_render_present_no); }
+        }
+        unsigned k = (unsigned)((va >> 2) ^ (va >> 15) ^ ((uint64_t)s->count * 0x9e3779b1u)) & (BOOT_RENDER_VB_MEMO - 1);
+        if (boot_render_vb_memo[k].va == va && boot_render_vb_memo[k].count == s->count && boot_render_vb_memo[k].bytes == idx_bytes &&
+            boot_render_vb_memo[k].gen == boot_render_map_gen) { lo = boot_render_vb_memo[k].lo; hi = boot_render_vb_memo[k].hi; }
+        else {
+            const uint8_t *p = boot_render_vb_budget + bytes <= (UINT64_C(16) << 20) ? boot_render_diag_guest(r, va, bytes) : NULL;
+            if (!p) { ++boot_render_vb_unscanned; return; }
+            boot_render_vb_budget += bytes; lo = UINT32_MAX; hi = 0;
+            for (uint32_t i = 0; i < s->count; ++i) {
+                uint32_t x;
+                if (idx_bytes == 1) x = p[i];
+                else if (idx_bytes == 2) { uint16_t h; memcpy(&h, p + 2 * (size_t)i, 2); x = h; }
+                else memcpy(&x, p + 4 * (size_t)i, 4);
+                if (x < lo) lo = x;
+                if (x > hi) hi = x;
+            }
+            boot_render_vb_memo[k].va = va; boot_render_vb_memo[k].count = s->count; boot_render_vb_memo[k].bytes = idx_bytes;
+            boot_render_vb_memo[k].gen = boot_render_map_gen; boot_render_vb_memo[k].lo = lo; boot_render_vb_memo[k].hi = hi;
+        }
+        base = (int32_t)s->base_vertex_reg;
+    } else { lo = s->first; hi = s->first + s->count - 1; }
+    ++boot_render_vb_checked;
+    int64_t vlo = (int64_t)lo + base, vhi = (int64_t)hi + base;
+    for (unsigned i = 0; i < 32; ++i) {
+        const BootVertexAttrib *a = &s->attrib[i]; const BootVertexStream *st = &s->stream[a->stream & 15];
+        if (a->inactive || !st->enabled || st->per_instance || !st->stride) continue;
+        uint32_t size = boot_render_stream_size(st), elem = boot_render_vb_elem_bytes(a->size);
+        if (!size || !elem) continue;
+        int64_t need_lo = vlo * st->stride + a->offset, need_hi = vhi * st->stride + a->offset + elem;
+        int full = need_lo >= (int64_t)size, partial = !full && need_hi > (int64_t)size;
+        if (!full && !partial) continue;
+        static unsigned logged_partial, logged_full;
+        if (full) ++boot_render_vb_full; else ++boot_render_vb_partial;
+        if (partial ? logged_partial < 48 : logged_full < 8) {
+            if (partial) ++logged_partial; else ++logged_full;
+            char vs[17]; for (int b = 0; b < 8; ++b) snprintf(vs + 2 * b, 3, "%02x", vs_id[b]);
+            boot_gp_log("nvn native: vbounds diag %s: vs %s attr %u stream %llx size %u stride %u offset %u elem %u | vertices %lld..%lld (indices %u..%u, base %d) "
+                        "need %lld bytes | topo %u indexed %u count %u first %u inst %u | totals partial %llu full %llu checked %llu unscanned %llu (submission %llu, present %ld)",
+                        partial ? "PARTIAL" : "FULL", vs, i, (unsigned long long)st->address, size, st->stride, a->offset, elem, (long long)vlo, (long long)vhi,
+                        lo, hi, base, (long long)need_hi, s->topology, s->indexed, s->count, s->first, s->base_instance_reg,
+                        (unsigned long long)boot_render_vb_partial, (unsigned long long)boot_render_vb_full, (unsigned long long)boot_render_vb_checked,
+                        (unsigned long long)boot_render_vb_unscanned, (unsigned long long)boot_render_exec_id, (long)boot_render_present_no);
+        }
+    }
+}
+/* batch-3 G8: NVN ignores blending on an integer colour target (integer data passes the blend unit unchanged); D3D12
+ * refuses a pipeline that enables it there (E_INVALIDARG) and the draw is lost. Blend stays off for UINT/SINT targets,
+ * as nxport does (MIT, crates/engine/src/metal/translated.rs:7308-7309: blending only for pf_kind 0). With
+ * TOTK_STATE_DIAG, a blend asked on a non-integer format D3D12 does not report as blendable is logged once per format
+ * (not changed). TOTK_INT_NO_BLEND=0: blend as asked, as before. */
+static inline int boot_render_blend_ignored(BootRender *r, DXGI_FORMAT f) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_INT_NO_BLEND", v, sizeof v); on = !(k && k < sizeof v && v[0] == '0'); }
+    int is_signed;
+    if (boot_render_dxgi_int_bits(f, &is_signed)) {
+        if (!on) return 0;
+        static unsigned logged; ++boot_state_diag.int_blend_off;
+        if (logged < 8 && boot_render_state_diag_on()) { ++logged; boot_gp_log("nvn native: G8 blend ignored on an integer target (DXGI format %u), as NVN", (unsigned)f); }
+        return 1;
+    }
+    if (boot_render_state_diag_on() && (unsigned)f < 256) {
+        static int8_t blendable[256];   /* 0 not asked yet, 1 blendable, -1 not */
+        if (!blendable[f]) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fs; memset(&fs, 0, sizeof fs); fs.Format = f;
+            int no = SUCCEEDED(ID3D12Device_CheckFeatureSupport(r->gpu->device, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) && !(fs.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE);
+            blendable[f] = no ? -1 : 1;
+            if (no) boot_gp_log("nvn native: G8 blend asked on DXGI format %u, which D3D12 does not report as blendable (the pipeline may be refused)", (unsigned)f);
+        }
+    }
+    return 0;
+}
 /* pso-work: the fixed-function part of a draw's pipeline description (blend, rasterizer, depth/stencil, topology
  * type, strip cut, target formats), moved unchanged out of boot_render_draw_impl99 so the read-ahead
  * (boot_render_pso_predict) derives exactly the description the draw will. rt_on[i] / rt_fmt[i]: colour target i
@@ -1101,7 +1446,7 @@ static inline int boot_render_pso_fixed99(BootRender *r, const BootDrawState *s,
         D3D12_RENDER_TARGET_BLEND_DESC *t = &d->BlendState.RenderTarget[i];
         if (!rt_on[i]) { t->RenderTargetWriteMask = 0; continue; }
         t->RenderTargetWriteMask = boot_render_ps_write_mask(ps_outputs, i, s->rt[s->single_ct_write ? 0 : s->rt_map[i]].write_mask);
-        if (s->blend[i].enabled) {
+        if (s->blend[i].enabled && !boot_render_blend_ignored(r, rt_fmt[i])) {   /* batch-3 G8 */
             t->BlendEnable = TRUE;
             t->SrcBlend = boot_render_blend(b->color_src, 0); t->DestBlend = boot_render_blend(b->color_dst, 0); t->BlendOp = boot_render_blend_op(b->color_op);
             if (b->separate_alpha) {
@@ -1127,7 +1472,8 @@ static inline int boot_render_pso_fixed99(BootRender *r, const BootDrawState *s,
     if (s->cull_enable && s->cull_face == 0x408) return boot_render_fail(r, BOOT_RENDER_E_STATE, "cull front and back");
     d->RasterizerState.CullMode = !s->cull_enable ? D3D12_CULL_MODE_NONE : s->cull_face == 0x404 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
     /* Window coordinates are the source GPU's (boot_render_viewport_map): the front face is decided
-     * on the same window-space winding, so only WINDOW_ORIGIN.flip_y swaps it (suyu UpdateFrontFace). */
+     * on the same window-space winding, so only WINDOW_ORIGIN.flip_y swaps it (clb197.h SET_WINDOW_ORIGIN_FLIP_Y;
+     * Ryujinx StateUpdater.UpdateFrontFace). */
     d->RasterizerState.FrontCounterClockwise = boot_render_front_ccw(s->front_face, s->flip_y);
     d->RasterizerState.DepthClipEnable = s->depth_clamp ? FALSE : TRUE;   /* depth clamp = no near/far clipping, depth clamped to the viewport range */
     if (s->depth_bias_fill) {
@@ -1190,6 +1536,7 @@ static inline size_t boot_psoj_key(uint8_t *buf, const uint8_t vs_id[32], const 
     memcpy(buf + k, &d->DepthStencilState, sizeof d->DepthStencilState); k += sizeof d->DepthStencilState;
     memcpy(buf + k, &d->PrimitiveTopologyType, 4); k += 4; memcpy(buf + k, &d->IBStripCutValue, 4); k += 4;
     memcpy(buf + k, &d->DSVFormat, 4); k += 4; memcpy(buf + k, d->RTVFormats, 32); k += 32;
+    {   uint64_t g = boot_pt_gs_key(d->GS.pShaderBytecode); if (g) { memcpy(buf + k, &g, 8); k += 8; } }   /* G2: the point-sprite GS layout */
     return k;
 }
 /* 1 when the draw path already has the pipeline (r->psos) or the pre-creation table knows the key. */
@@ -1275,9 +1622,222 @@ static inline int boot_render_pso_predict(BootRender *r, const BootDrawState *s)
     if (ps) { d.PS.pShaderBytecode = ps->dxil; d.PS.BytecodeLength = ps->size; }
     int replicate_alpha = 0;
     if (boot_render_pso_fixed99(r, s, &d, ps_outputs, rt_on, rt_fmt, has_zt, zt_fmt, topo, needs_expand, (int)s->indexed, ib_fmt, &replicate_alpha)) return 0;
+    boot_pt_apply(r->manifest_path, &d);   /* G2: as the draw (boot_pt_apply above) */
     uint8_t buf[BOOT_RENDER_PSO_KEY]; size_t k = boot_psoj_key(buf, vs_id, ps_id, &d);
     if (boot_psoj_known(r, buf, k)) return 0;
     return boot_psoj_enqueue(r, &d, buf, k, 1);
+}
+/* suspect-diag (host_gpu_render.h, top): the draw in flight. After the programs are known: its vertex shader, family and the
+ * draw-census key (the same hash as host_draw_census.h boot_census_draw_slow, so a key greps frames\draw-census.log). */
+static inline void boot_sd_draw_begin(const BootDrawState *s, const uint8_t *vs_id, const uint8_t *ps_id) {
+    BootSdState *S = boot_sd_state(); if (!S) return;
+    if (boot_render_exec_id != S->exec_last) { S->exec_last = boot_render_exec_id; S->draw = 0; }
+    ++S->draw; S->in_draw = 1; S->draw_copies = S->draw_direct = 0;
+    uint64_t vt, pt = 0; memcpy(&vt, vs_id, 8); if (ps_id) memcpy(&pt, ps_id, 8);
+    S->vs8 = vt; S->fam = boot_sd_family(S, vt); S->material = !strcmp(S->fam, "material");
+    uint64_t h = boot_census_mix(1, vt);
+    h = boot_census_mix(h, pt); h = boot_census_mix(h, s->stream[0].address); h = boot_census_mix(h, s->index_address);
+    h = boot_census_mix(h, ((uint64_t)s->first << 32) | s->count); h = boot_census_mix(h, s->base_vertex_reg);
+    h = boot_census_mix(h, s->rt_count ? s->rt[s->rt_map[0]].address : (s->zt.enabled ? s->zt.address : 0));
+    S->key = boot_census_final(h);
+}
+/* After the vertex attribute table: S2 (K2), S4 (the vertex shader's bound texture slots), S1 (vertex stream heads). */
+static inline void boot_sd_draw_vs(BootRender *r, const BootDrawState *s, const BootRenderShader *vs, int indirect, uint32_t instances,
+                                   const uint32_t *handles, const uint8_t *handle_valid) {
+    BootSdState *S = boot_sd_state(); if (!S || !S->in_draw) return;
+    for (unsigned i = 0; vs && i < vs->tex_count && i < 64; ++i) {   /* S4 */
+        if (!handle_valid[i]) continue;
+        const uint32_t tic = handles[i] & 0xfffffu;
+        if (tic >= BOOT_SD_TIC) continue;
+        S->vs_tex[tic] = (uint32_t)S->frame + 1;
+        S->vs_tex_va[tic] = boot_render_tex_slots ? boot_render_tex_slots[tic].va : 0;
+    }
+    ++S->c.k2_draws;   /* S2 */
+    const BootSdVs *info = boot_sd_vs_info(S, S->vs8);
+    if (indirect) ++S->c.k2_indirect;   /* base instance written by the GPU: unknown here */
+    else if (s->base_instance_reg) {
+        ++S->c.k2_base;
+        if (!info || (info->flags & 8)) ++S->c.k2_unknown;
+        else if (!(info->flags & 4)) ++S->c.k2_pre;
+        else {
+            char attrs[160]; size_t at = 0; unsigned div = 0, freq0 = 0; attrs[0] = 0;
+            for (unsigned g = 0; g < 32; ++g) {
+                if (!(info->attr_mask >> g & 1)) continue;
+                const BootVertexAttrib *a = &s->attrib[g]; const BootVertexStream *st = &s->stream[a->stream & 15];
+                if (a->inactive || !st->enabled || !st->per_instance) continue;
+                const uint32_t d = boot_render_attrib_divisor(st);
+                if (d <= 1) continue;
+                if (d == 0xffffffffu) ++freq0; else ++div;
+                if (at + 24 < sizeof attrs) at += (size_t)snprintf(attrs + at, sizeof attrs - at, " a%u:%s", g, d == 0xffffffffu ? "freq0" : "div");
+                if (at + 24 < sizeof attrs && d != 0xffffffffu) at += (size_t)snprintf(attrs + at, sizeof attrs - at, "%u", d);
+            }
+            const int iid = (info->flags & 2) != 0;
+            if (iid || div || freq0) {
+                ++S->c.k2_changed; if (S->material) ++S->c.k2_changed_mat;
+                if (iid) ++S->c.k2_iid;
+                if (div) ++S->c.k2_div;
+                if (freq0) ++S->c.k2_freq0;
+                if (S->ev_s2 < S->events_max) {
+                    ++S->ev_s2;
+                    boot_sd_event(S, "S2 K2 CHANGES frame %llu sub %llu draw %u: vs %016llx family %s key %016llx base instance %u instances %u%s per-instance attrs:%s",
+                                   (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, S->draw, (unsigned long long)__builtin_bswap64(S->vs8), S->fam,
+                                   (unsigned long long)S->key, s->base_instance_reg, instances, iid ? " reads InstanceId," : "", at ? attrs : " none");
+                }
+            }
+        }
+    }
+    uint32_t done = 0;   /* S1: the first 4 KiB of each stream an attribute of this vertex shader fetches */
+    for (unsigned g = 0; g < 32; ++g) {
+        if (info && !(info->flags & 8) && !(info->attr_mask >> g & 1)) continue;
+        const BootVertexAttrib *a = &s->attrib[g]; const unsigned k = a->stream & 15; const BootVertexStream *st = &s->stream[k];
+        if (a->inactive || !st->enabled || !st->address || (done >> k & 1)) continue;
+        done |= 1u << k;
+        uint64_t n = 4096 - (st->address & 0xfff);
+        const uint32_t bound = boot_render_stream_size(st);
+        if (bound && bound < n) n = bound;
+        const uint8_t *p = boot_sd_guest(r, st->address, n, NULL);
+        if (p && (boot_ds_vmask >> k & 1)) boot_sd_note(r, BOOT_SD_K_VSNAP, st->address, p, boot_ds_vcopy_cpu[k], n);   /* data-snapshot: the copy the GPU reads */
+        else if (p) boot_sd_note(r, BOOT_SD_K_VERTEX, st->address, p, NULL, n);
+    }
+}
+/* End of the draw (boot_render_draw): snapshot / direct constant buffer counts. */
+static inline void boot_sd_draw_end(void) {
+    BootSdState *S = boot_sd_st; if (!S || !S->in_draw) return;
+    ++S->c.draws; if (S->material) ++S->c.draws_mat;
+    if (S->draw_copies) { ++S->c.draws_copy; if (S->material) ++S->c.draws_mat_copy; }
+    if (S->draw_direct) ++S->c.draws_direct;
+    S->in_draw = 0; S->vs8 = 0; S->key = 0; S->fam = "-"; S->material = 0;
+}
+/* Every present of the native path (host_nvn_play.h, renderer lock held; frames: the frame-N.bmp number of the next frame):
+ * the frame number, S3's turn, and every 300 presents one line per suspect (here and in draw-path.log). */
+static inline void boot_sd_present(uint64_t frames) {
+    BootSdState *S = boot_sd_state(); if (!S) return;
+    S->frame = frames; boot_sd_tag_frame = (LONG64)frames; ++S->presents;
+    if (S->presents % S->gr_every == 0) S->gr_due = 1;
+    if (S->presents % 300 == 0) {
+        const BootSdCount *c = &S->c, *l = &S->l; char line[2400]; size_t at = 0;
+#define BOOT_SD_D(x) (unsigned long long)(c->x - l->x)
+        uint64_t ck = 0, cp = 0, tk = 0, tp = 0;
+        for (unsigned k = 0; k < BOOT_SD_K_N; ++k) { ck += c->ch_kept[k] - l->ch_kept[k]; cp += c->ch_plain[k] - l->ch_plain[k]; tk += c->ch_kept[k]; tp += c->ch_plain[k]; }
+        at += (size_t)snprintf(line + at, sizeof line - at, "suspect-diag S1 rerecord-version frame %llu (nvn present %ld), last 300 presents: calls %llu (keeping versions %llu, versions kept %llu, re-records %llu); "
+                               "RANGES CHANGED during the call: in calls keeping versions %llu, in other calls %llu; per kind checked/changed-keeping/changed-other/host-written/region-gone/unsampled/dup:",
+                               (unsigned long long)S->frame, (long)boot_render_present_no, BOOT_SD_D(calls), BOOT_SD_D(calls_kept), BOOT_SD_D(kept), BOOT_SD_D(rerecords),
+                               (unsigned long long)ck, (unsigned long long)cp);
+        for (unsigned k = 0; k < BOOT_SD_K_N && at < sizeof line; ++k)
+            at += (size_t)snprintf(line + at, sizeof line - at, " %s %llu/%llu/%llu/%llu/%llu/%llu/%llu", boot_sd_kind_name[k], BOOT_SD_D(checked[k]),
+                                   BOOT_SD_D(ch_kept[k]), BOOT_SD_D(ch_plain[k]), BOOT_SD_D(hostw[k]), BOOT_SD_D(gone[k]), BOOT_SD_D(unsampled[k]), BOOT_SD_D(dup[k]));
+        if (at < sizeof line) at += (size_t)snprintf(line + at, sizeof line - at, "; draws %llu, with a CB snapshot copy %llu, with a direct CBV %llu (material draws %llu, with a copy %llu); "
+                                                     "re-check %.2f ms; totals: changed keeping %llu, other %llu", BOOT_SD_D(draws), BOOT_SD_D(draws_copy), BOOT_SD_D(draws_direct),
+                                                     BOOT_SD_D(draws_mat), BOOT_SD_D(draws_mat_copy), (double)(c->recheck_qpc - l->recheck_qpc) * 1000.0 / (double)S->qpf,
+                                                     (unsigned long long)tk, (unsigned long long)tp);
+        boot_sd_event(S, "%s", line); boot_gp_log("%s", line);
+        snprintf(line, sizeof line, "suspect-diag S2 k2-instance-id frame %llu, last 300 presents: draws %llu, base instance != 0 %llu (indirect, base unknown %llu); "
+                                    "K2 changes the result %llu (material %llu; reads InstanceId %llu, divisor > 1 %llu, frequency 0 %llu); vertex shader without K2 %llu, "
+                                    "no .hlsl found %llu; totals: changes %llu (TOTK_INSTANCE_ID_ZERO_BASED %s)",
+                 (unsigned long long)S->frame, BOOT_SD_D(k2_draws), BOOT_SD_D(k2_base), BOOT_SD_D(k2_indirect), BOOT_SD_D(k2_changed), BOOT_SD_D(k2_changed_mat),
+                 BOOT_SD_D(k2_iid), BOOT_SD_D(k2_div), BOOT_SD_D(k2_freq0), BOOT_SD_D(k2_pre), BOOT_SD_D(k2_unknown), (unsigned long long)c->k2_changed,
+                 boot_render_iid_offset(0) == 0 ? "on" : "off (the old rule runs)");
+        boot_sd_event(S, "%s", line); boot_gp_log("%s", line);
+        snprintf(line, sizeof line, "suspect-diag S3 gpu-resident frame %llu, last 300 presents: checks %llu, pages compared %llu (%llu KiB), span views compared %llu; "
+                                    "BYTE MISMATCHES %llu, page-table CPU/GPU copy differ %llu, entry not the mapping's region/offset %llu (bytes still equal %llu), "
+                                    "unmapped %llu, unreadable %llu, view without section %llu; check %.3f ms avg, %.3f ms max; totals: mismatches %llu (TOTK_GPU_RESIDENT %d)",
+                 (unsigned long long)S->frame, BOOT_SD_D(gr_checks), BOOT_SD_D(gr_pages), BOOT_SD_D(gr_bytes) >> 10, BOOT_SD_D(gr_views), BOOT_SD_D(gr_mismatch),
+                 BOOT_SD_D(gr_ptcopy), BOOT_SD_D(gr_ptother), BOOT_SD_D(gr_ptother_eq), BOOT_SD_D(gr_unmapped), BOOT_SD_D(gr_unreadable), BOOT_SD_D(gr_nosec),
+                 c->gr_checks > l->gr_checks ? (double)(c->gr_qpc - l->gr_qpc) * 1000.0 / (double)S->qpf / (double)(c->gr_checks - l->gr_checks) : 0.0,
+                 (double)c->gr_maxq * 1000.0 / (double)S->qpf, (unsigned long long)c->gr_mismatch, boot_gr_mode());
+        boot_sd_event(S, "%s", line); boot_gp_log("%s", line);
+        snprintf(line, sizeof line, "suspect-diag S4 tex-live-trim frame %llu, last 300 presents: evictions %llu (live trim %llu), of slots a vertex shader bound in the last %u presents %llu; "
+                                    "builds %llu, rebuilds of such slots (same address) %llu (after a trim eviction %llu), slots reused for another image %llu; "
+                                    "totals: VS evictions %llu, VS rebuilds after eviction %llu (TOTK_TEX_LIVE_TRIM %s, min age %u)",
+                 (unsigned long long)S->frame, BOOT_SD_D(tx_evict), BOOT_SD_D(tx_evict_live), S->tex_n, BOOT_SD_D(tx_evict_vs), BOOT_SD_D(tx_builds),
+                 BOOT_SD_D(tx_rebuild_vs), BOOT_SD_D(tx_rebuild_vs_ev), BOOT_SD_D(tx_reuse_vs), (unsigned long long)c->tx_evict_vs,
+                 (unsigned long long)c->tx_rebuild_vs_ev, boot_render_tex_live_trim_on() ? "on" : "off", boot_render_tex_min_age());
+        boot_sd_event(S, "%s", line); boot_gp_log("%s", line);
+#undef BOOT_SD_D
+        S->l = S->c; S->c.gr_maxq = 0; S->l.gr_maxq = 0;
+    }
+    if (S->log && S->dirty) { fflush(S->log); S->dirty = 0; }
+}
+/* data-snapshot (host_gpu_render.h, the design note before host_gpu_render_draw.h): the draw path's vertex streams and index
+ * buffers (here, after boot_render_vertex_bounds / boot_render_stream_size). boot_ds_cb_plan ran first for the draw (it folded the
+ * GPU-ordered writes recorded since the previous draw into boot_ds_pend). */
+/* Vertex streams: a stream the snapshot takes is copied into the arena part of the open list's segment (shared by the list's
+ * draws while no host write touched it) and every enabled attribute of the stream reads the copy. Per stream a memo: the same
+ * stream (address, size) as the previous draw's, in the same call, with no class change, that stayed zero-copy stays so. */
+static inline void boot_ds_vertex(BootRender *r, const BootDrawState *s, uint32_t *attribs) {
+    boot_ds_vmask = 0;
+    if (!boot_ds_on()) return;
+    const int draw_snap = boot_ds_draw_cb;   /* (the plan's answer: v2 OR-ed the 36 slots again) */
+    const int timed = !(boot_ds_plan_n & 63); LARGE_INTEGER t0, t1; if (timed) { QueryPerformanceCounter(&t0); boot_ds_plan_timing = 2; }
+    if (boot_ds_arena.cpu && r->recording && boot_render_seg.r == r && boot_render_seg.cur < BOOT_DS_PARTS && boot_render_vertex_bounds()) {
+        uint32_t used = 0;
+        for (unsigned i = 0; i < 32; ++i) if (attribs[i * 8 + 4] >> 31) used |= 1u << (s->attrib[i].stream & 15);
+        const uint64_t call = boot_ds_core.call, gen = boot_ds_cls_gen;
+        for (unsigned k = 0; k < 16 && used >> k; ++k) {
+            if (!(used >> k & 1)) continue;
+            const BootVertexStream *st = &s->stream[k];
+            if (!st->enabled || !st->address) continue;
+            const uint32_t size = boot_render_stream_size(st);
+            if (!size) { ++boot_ds_c.unbounded; continue; }
+            const uint32_t inst = st->per_instance && size <= boot_ds_cfg.instance_cap;
+            __typeof__(boot_ds_vmemo[0]) *vm = &boot_ds_vmemo[k];
+            if (vm->va == st->address && vm->size == size && vm->call == call && vm->gen == gen && vm->inst == inst) { ++boot_ds_c.memo_hits; continue; }
+            if (size > boot_ds_cfg.stream_cap) {
+                ++boot_ds_c.too_large;
+                if (boot_ds_det && boot_ds_det->cap) boot_ds_sample(r, BOOT_DS_K_VERTEX, st->address, 4096 - (st->address & 0xfff), boot_ds_cls_at(&boot_ds_core, st->address));
+                vm->va = st->address; vm->size = size; vm->call = call; vm->gen = gen; vm->inst = inst;
+                continue;
+            }
+            const int t = boot_ds_decide(r, BOOT_DS_K_VERTEX, st->address, size, (int)inst);
+            if (t == 0) { vm->va = st->address; vm->size = size; vm->call = call; vm->gen = gen; vm->inst = inst; continue; }   /* zero-copy by class */
+            vm->call = 0;
+            if (t < 0) continue;
+            __typeof__(boot_ds_vc[0]) *c = &boot_ds_vc[boot_ds_hash32(st->address ^ ((uint64_t)size << 40)) & (BOOT_DS_VCACHE - 1)];
+            uint64_t off;
+            if (c->va == st->address && c->n == size && c->list == boot_render_list_id && boot_render_cb_clean(st->address, size, c->epoch + 1)) off = c->off;
+            else {
+                const uint8_t *live = boot_ds_guest(r, st->address, size, NULL);
+                if (!live) { ++boot_ds_c.split; continue; }
+                off = boot_ds_arena_alloc(&boot_ds_arena, boot_render_seg.cur, boot_render_list_id, size);
+                if (off == UINT64_MAX) { ++boot_ds_c.arena_full; continue; }
+                LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+                const uint64_t sh = boot_ds_fill_core(&boot_ds_core, boot_ds_arena.cpu + off, st->address, live, size, boot_render_map_gen, boot_render_big_writes, boot_ds_clean_fn, NULL);
+                QueryPerformanceCounter(&q1); boot_ds_c.q_copy += (uint64_t)(q1.QuadPart - q0.QuadPart);
+                ++boot_ds_c.copies[BOOT_DS_K_VERTEX]; boot_ds_c.bytes[BOOT_DS_K_VERTEX] += size; boot_ds_c.shadow_bytes[BOOT_DS_K_VERTEX] += sh;
+                if (boot_ds_det) boot_ds_det->call_bytes += size;
+                c->va = st->address; c->n = size; c->list = boot_render_list_id; c->epoch = boot_render_cb_epoch; c->off = off;
+            }
+            ++boot_ds_c.bind_cb[BOOT_DS_K_VERTEX];
+            const uint64_t nva = boot_ds_arena.va + off;
+            for (unsigned i = 0; i < 32; ++i)
+                if ((attribs[i * 8 + 4] >> 31) && (s->attrib[i].stream & 15) == k) { attribs[i * 8] = (uint32_t)nva; attribs[i * 8 + 1] = (uint32_t)(nva >> 32); }
+            boot_ds_vmask |= 1u << k; boot_ds_vcopy_cpu[k] = boot_ds_arena.cpu + off;
+        }
+    }
+    if (timed) { QueryPerformanceCounter(&t1); boot_ds_c.q_vtx += (uint64_t)(t1.QuadPart - t0.QuadPart); ++boot_ds_c.vtx_timed; ++boot_ds_c.timer_intervals; boot_ds_plan_timing = 0; }   /* its own figure (v2fix) */
+    if (draw_snap || boot_ds_vmask) ++boot_ds_c.draws_snap;
+}
+/* Zero-copy index buffer of a direct indexed draw: [va, va + n). A range the snapshot takes is copied into the ring and the
+ * view points there (the draw's ring room covers 8 bytes per index). S1 notes both kinds (index-zc, index-snap). */
+static inline void boot_ds_index(BootRender *r, uint64_t va, uint64_t n, D3D12_INDEX_BUFFER_VIEW *ib) {
+    const uint8_t *live = NULL; uint8_t *dst = NULL;
+    int t = boot_ds_on() && n && n <= boot_ds_cfg.stream_cap && boot_ds_decide(r, BOOT_DS_K_INDEX, va, n, 0) > 0;
+    const uint64_t bytes = (n + 255) & ~UINT64_C(255);
+    if (t && r->ring_used + bytes > r->ring_size) { ++boot_ds_c.ring_full; t = 0; }
+    if (t && !(live = boot_ds_guest(r, va, n, NULL))) { ++boot_ds_c.split; t = 0; }
+    if (t) {
+        dst = r->ring_cpu + r->ring_used;
+        LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+        const uint64_t sh = boot_ds_fill_core(&boot_ds_core, dst, va, live, n, boot_render_map_gen, boot_render_big_writes, boot_ds_clean_fn, NULL);
+        QueryPerformanceCounter(&q1); boot_ds_c.q_copy += (uint64_t)(q1.QuadPart - q0.QuadPart);
+        ib->BufferLocation = ID3D12Resource_GetGPUVirtualAddress(r->ring) + r->ring_used; r->ring_used += bytes;
+        ++boot_ds_c.copies[BOOT_DS_K_INDEX]; ++boot_ds_c.bind_cb[BOOT_DS_K_INDEX]; boot_ds_c.bytes[BOOT_DS_K_INDEX] += n; boot_ds_c.shadow_bytes[BOOT_DS_K_INDEX] += sh;
+        if (boot_ds_det) boot_ds_det->call_bytes += n;
+    }
+    if (boot_sd_on() && n <= 0xffffffffu) {   /* suspect-diag S1: what the GPU reads later (zero-copy) or the copy it reads */
+        const uint8_t *p = t ? live : boot_sd_guest(r, va, n, NULL);
+        if (p) boot_sd_note(r, t ? BOOT_SD_K_ISNAP : BOOT_SD_K_IZC, va, p, t ? dst : NULL, n);
+    }
 }
 static inline int boot_render_draw_impl99(BootRender *r, const BootRenderDraw *in) {
     const UINT draw_instances = boot_render_next_instances ? boot_render_next_instances : 1; boot_render_next_instances = 0;
@@ -1307,10 +1867,11 @@ static inline int boot_render_draw_impl99(BootRender *r, const BootRenderDraw *i
     {   /* this draw's constant buffers: in place (native NVN, guest memory viewable) or a snapshot of its size; the
          * feedback-patched slot 2 always gets a snapshot */
         uint64_t cb = 0;
+        boot_ds_cb_plan(r, in);   /* data-snapshot: slots read from a copy (their ring bytes count below) */
         for (unsigned g = 0; g < 2; ++g)
             for (unsigned slot = 0; slot < 18; ++slot) {
                 const BootCbufBinding *b = &in->cbufs[g ? 4 : 0][slot];
-                if (slot != 2 && b->valid == 2 && boot_render_cbv_direct_ok(r, b->address, b->size)) continue;
+                if (slot != 2 && b->valid == 2 && !boot_ds_cbt[g][slot] && boot_render_cbv_direct_ok(r, b->address, b->size)) continue;
                 cb += boot_render_cb_ring_bytes(b->valid ? b->size : 0);
             }
         uint64_t need = cb + 3 * 256 + (uint64_t)s->count * 8 + 256 + sizeof(uint32_t) * 32 * 8 + (ind.kind ? 256 : 0);
@@ -1364,11 +1925,12 @@ programs_known:
             } else m->r = NULL;
         } }
     {   uint64_t ph1 = boot_render_ph_now(); boot_render_ph_qpc[1] += ph1 - ph; ph = ph1; }
+    if (boot_sd_on()) boot_sd_draw_begin(s, vs_id, has_ps ? ps_id : NULL);   /* suspect-diag: the draw in flight */
     /* targets */
     BootRenderTarget *rts[8] = {0}, *zt = NULL; D3D12_CPU_DESCRIPTOR_HANDLE rtvs[8], dsv = {0};
     for (unsigned i = 0; i < s->rt_count; ++i) {
         if (s->rt[s->rt_map[i]].format == 0) {
-            /* RenderTargetFormat NONE: nothing bound at this slot (suyu leaves the attachment empty);
+            /* SET_COLOR_TARGET_FORMAT_V_DISABLED (0): nothing bound at this slot (Ryujinx StateUpdater.IsRtEnabled);
              * a null view discards the shader's writes to it */
             rts[i] = NULL; rtvs[i] = boot_render_null_rtv(r);
             if (!rtvs[i].ptr) return boot_render_fail(r, BOOT_RENDER_E_D3D, "null render target view");
@@ -1461,6 +2023,7 @@ programs_known:
             if (!fb_handle_valid[stage][i]) continue;
             uint32_t handle = fb_handles[stage][i];
             uint32_t tic = handle & 0xfffff, tsc = s->sampler_via_header ? tic : handle >> 20;
+            boot_bc7_bind(r, s->tic_address, stage, tic);   /* bc7-work: vertex-stage textures stay RGBA8 (TOTK_BC7) */
             if (tic < BOOT_RENDER_FB_SLOT_BASE && boot_render_texmemo_ok(s->tic_address, tic)) {
                 /* nvnpar-work: a remembered binding (host_gpu_render.h boot_render_texmemo): boot_render_texture's unchanged
                  * return, and the index has no feedback view and no target alias, so the feedback test above and the
@@ -1536,6 +2099,7 @@ programs_known:
             if (boot_render_trace.active) boot_render_draw_trace_tex(r, s->tic_address, stage, sh->tex[i], handle);
         }
     }
+    boot_bc7_bind_stage = -1;   /* bc7-work: the texture loop is over */
     const uint64_t txd_after = txd ? boot_render_ph_now() : 0;
     /* textures copied above from a target this draw renders to hold its pre-draw image (what this draw reads,
      * as a feedback read): the draw's writes make them stale for later uses (boot_render_texture_from_target) */
@@ -1583,15 +2147,20 @@ programs_known:
         boot_render_txd_in = 0; }
     /* vertex pulling table (maxwell_runtime.hlsli VertexAttrib): snapshotted per draw into the ring
      * with its own t1/t2 descriptor pair (below), so a change needs no flush */
-    uint32_t attribs[32 * 8];
+    uint32_t attribs[33 * 8];   /* G2 (batch-4): entry 32 = point-sprite parameters (boot_pt_params), zero otherwise */
     boot_render_zero(attribs, sizeof attribs);   /* batch-b: rep stosb (memset was a byte loop) */
+    const int vbounds = boot_render_vertex_bounds();
     for (unsigned i = 0; i < 32; ++i) {
         const BootVertexAttrib *a = &s->attrib[i]; const BootVertexStream *st = &s->stream[a->stream & 15];
         uint32_t *e = attribs + i * 8;
         e[0] = (uint32_t)st->address; e[1] = (uint32_t)(st->address >> 32); e[2] = st->stride; e[3] = a->offset;
         e[4] = a->size | (a->type << 6) | (a->bgra << 9) | ((!a->inactive && st->enabled) ? 0x80000000u : 0);
         e[5] = boot_render_attrib_divisor(st);
+        e[6] = vbounds ? boot_render_stream_size(st) : 0;   /* vbounds: bound bytes (0 = no bound); e[7] stays 0 */
     }
+    boot_ds_vertex(r, s, attribs);   /* data-snapshot: streams it takes read their copy in the arena (stream VA rewritten) */
+    if (boot_render_state_diag_on() && !ind.kind && s->count) boot_render_vbounds_diag(r, s, vs_id);   /* vbounds diagnostic (log only) */
+    if (boot_sd_on()) boot_sd_draw_vs(r, s, vs, ind.kind != 0, draw_instances, fb_handles[0], fb_handle_valid[0]);   /* suspect-diag S1 / S2 / S4 */
     /* topology and index source */
     static const D3D_PRIMITIVE_TOPOLOGY direct[6] = {D3D_PRIMITIVE_TOPOLOGY_POINTLIST, D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,
         D3D_PRIMITIVE_TOPOLOGY_LINESTRIP, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
@@ -1606,6 +2175,7 @@ programs_known:
         if (!boot_render_cpu_read(r, s->index_address + (uint64_t)s->first * idx_bytes, (uint64_t)s->count * idx_bytes)) return boot_render_fail(r, BOOT_RENDER_E_D3D, "pending GPU writes");
         const uint8_t *src = boot_render_guest(r, s->index_address + (uint64_t)s->first * idx_bytes, (uint64_t)s->count * idx_bytes);
         if (!src) return boot_render_fail(r, BOOT_RENDER_E_MEMORY, "index buffer");
+        if (boot_sd_on()) boot_sd_note(r, BOOT_SD_K_INDEX, s->index_address + (uint64_t)s->first * idx_bytes, src, NULL, (uint64_t)s->count * idx_bytes);   /* suspect-diag S1 */
         if (needs_expand) draw_count = boot_render_expand(r, s, src, idx_bytes, &ib, &topo);
         else {   /* 8-bit indices: D3D12 has none, widen into the ring */
             uint64_t bytes = ((uint64_t)s->count * 2 + 255) & ~(uint64_t)255;
@@ -1622,6 +2192,7 @@ programs_known:
         if (!boot_render_resolve(r, s->index_address + (uint64_t)s->first * idx_bytes, (uint64_t)s->count * idx_bytes, &ib.BufferLocation))
             return boot_render_fail(r, BOOT_RENDER_E_MEMORY, "index buffer outside one guest region");
         ib.SizeInBytes = s->count * idx_bytes; ib.Format = idx_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+        boot_ds_index(r, s->index_address + (uint64_t)s->first * idx_bytes, (uint64_t)s->count * idx_bytes, &ib);   /* data-snapshot (and S1 index-zc) */
     } else if (needs_expand) {
         draw_count = boot_render_expand(r, s, NULL, 0, &ib, &topo); indexed = 1;
         if (!draw_count) return boot_render_fail(r, BOOT_RENDER_E_STATE, "vertex expansion");
@@ -1630,6 +2201,8 @@ programs_known:
         uint32_t cut = idx_bytes == 4 ? 0xffffffffu : 0xffffu;
         if (s->restart_index != cut) return boot_render_fail(r, BOOT_RENDER_E_STATE, "primitive restart index other than all-ones");
     }
+    if (s->primitive_restart && s->indexed && (s->topology == 0 || s->topology == 1 || s->topology == 4) && boot_render_state_diag_on())
+        boot_render_restart_diag(r, s, idx_bytes, ind.kind != 0);   /* batch-3 K1/G5 diagnostic (log only) */
     {   uint64_t ph1 = boot_render_ph_now(); boot_render_ph_qpc[4] += ph1 - ph; ph = ph1; }
     /* pipeline state */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
@@ -1647,6 +2220,7 @@ programs_known:
         for (unsigned i = 0; i < s->rt_count && i < 8; ++i) if (rts[i]) { rt_on[i] = 1; rt_fmt[i] = rts[i]->dxgi; }
         int rc = boot_render_pso_fixed99(r, s, &d, ps_outputs, rt_on, rt_fmt, zt != NULL, zt ? zt->dxgi : DXGI_FORMAT_UNKNOWN, topo, needs_expand, indexed, ib.Format, &replicate_alpha);
         if (rc) return rc; }
+    const int point_gs = boot_pt_apply(r->manifest_path, &d);   /* G2 (batch-4): point sprites (boot_pt_apply above) */
     int flip = boot_render_viewport_flip(s->viewport[0].scale[1]);
     /* key = shaders + every fixed-function field set above, compared in full (module-static copies
      * beside r->psos, whose 32-byte key holds a hash of it) */
@@ -1658,6 +2232,7 @@ programs_known:
     memcpy(buf + k, &d.DepthStencilState, sizeof d.DepthStencilState); k += sizeof d.DepthStencilState;
     memcpy(buf + k, &d.PrimitiveTopologyType, 4); k += 4; memcpy(buf + k, &d.IBStripCutValue, 4); k += 4;
     memcpy(buf + k, &d.DSVFormat, 4); k += 4; memcpy(buf + k, d.RTVFormats, 32); k += 32;
+    if (point_gs) { uint64_t g = boot_pt_gs_key(d.GS.pShaderBytecode); memcpy(buf + k, &g, 8); k += 8; }   /* G2: as boot_psoj_key */
     if (boot_render_pso_owner != r) {   /* keys belong to another render object: none can match */
         boot_render_pso_owner = r; memset(boot_render_pso_key_size, 0, sizeof boot_render_pso_key_size);
         memset(boot_render_pso_index, 0, sizeof boot_render_pso_index);
@@ -1720,7 +2295,7 @@ programs_known:
         }
         cbv_tap_token=boot_cbv_tap_begin(&begin);
     }
-    uint32_t host[8]; memcpy(host, in->host_state, sizeof host);
+    uint32_t host[12]; memset(host, 0, sizeof host); memcpy(host, in->host_state, sizeof in->host_state);   /* K2: words 8-11 below */
     host[1] = s->z_clip_zero_to_w ? 0u : 1u;     /* [-W, W] clip space: vertex shader remaps z */
     host[2] = r->ptable_pages; host[3] = r->va_base_page;
     host[4] = s->indexed ? s->base_vertex_reg : s->first;
@@ -1729,6 +2304,7 @@ programs_known:
     {   static int first = -1;   /* render-36: flat inputs from the last vertex (Maxwell/NVN default); A/B TOTK_PROVOKING_FIRST=1 */
         if (first < 0) { char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_PROVOKING_FIRST", v, sizeof v); first = k && k < sizeof v && v[0] == '1'; }
         host[7] = (uint32_t)first; }
+    host[8] = boot_render_iid_offset(in->host_state[5]);   /* K2 (batch-4): HostState host_instance_offset (boot_render_iid_offset above) */
     D3D12_GPU_VIRTUAL_ADDRESS ind_host = 0;   /* render-38d: b18 = the ring slot the pre-pass writes */
     if (ind.kind) {
         if (!boot_render_ind_stage(r, &ind, host, sizeof host, 256, 4)) { boot_cbv_tap_end(cbv_tap_token,1); return boot_render_fail(r, BOOT_RENDER_E_CAPACITY, "ring (indirect HostState)"); }
@@ -1741,7 +2317,7 @@ programs_known:
     BootRenderCbPatch fb_live[128]; unsigned fb_lives = 0;
     for (unsigned p = 0; p < fb_patches; ++p) if (fb_redirected[p]) fb_live[fb_lives++] = fb_patch[p];
     for (unsigned stage = 0; stage < 2; ++stage) {
-        unsigned group = stage ? 4 : 0;   /* bind groups: 0 vertex (A+B), 1 tess control, 2 tess eval, 3 geometry, 4 pixel (suyu stage_index = program - 1) */ uint32_t base = stage ? ps_base : vs_base;
+        unsigned group = stage ? 4 : 0;   /* bind groups: 0 vertex (A+B), 1 tess control, 2 tess eval, 3 geometry, 4 pixel (clb197.h BIND_GROUP_*: pipeline program p >= 1 uses group p - 1) */ uint32_t base = stage ? ps_base : vs_base;
         boot_render_cbv_capturing = 1; boot_render_cbv_cap_base = base;   /* play (39): resolve first, write below */
         const int dd_mode = boot_cbv_tap_registered || r->overlay_count ? 0 : boot_render_cb_dedupe_mode();   /* nvnpar-work 1f */
         int dd_have = 0; uint64_t dd_va = 0, dd_epoch = 0, dd_scope = 0; uint32_t dd_size = 0; D3D12_CONSTANT_BUFFER_VIEW_DESC dd_cv; memset(&dd_cv, 0, sizeof dd_cv);
@@ -1749,13 +2325,17 @@ programs_known:
             const BootCbufBinding *b = &in->cbufs[group][slot];
             boot_cbv_tap_request(stage,group,slot,b->address,b->size,b->valid);
             unsigned patched = 0; if (slot == 2) for (unsigned p = 0; p < fb_lives; ++p) patched += fb_live[p].group == group;
-            if (!patched && b->valid == 2 && boot_render_cbv_direct(r, b->address, b->size, base + slot)) continue;   /* GPU-side (native NVN) */
+            const int ds_take = !patched && b->valid == 2 ? boot_ds_cbt[stage][slot] : 0;   /* data-snapshot: the rule that copies it (0: the live range) */
+            if (!patched && b->valid == 2 && !ds_take && boot_render_cbv_direct(r, b->address, b->size, base + slot)) continue;   /* GPU-side (native NVN) */
             const uint32_t dd_req = b->valid ? b->size : 0;
             const int dd_same = dd_mode && !patched && dd_have && dd_va == b->address && dd_size == dd_req && dd_epoch == boot_render_cb_epoch && dd_scope == boot_render_cb_scope;
             if (dd_same && dd_mode == 1) { boot_render_cbv_cap[slot] = dd_cv; ++boot_render_cb_hits; ++boot_render_cb_dedupe_hits; continue; }   /* the previous slot's snapshot */
             const uint64_t dd_hits0 = boot_render_cb_hits;
             if (!patched && dd_mode) { dd_have = 1; dd_va = b->address; dd_size = dd_req; }
-            if (!boot_render_cbv_ex(r, b->address, b->valid ? b->size : 0, base + slot, fb_live, patched ? fb_lives : 0, group)) {
+            boot_ds_cb_now = ds_take;
+            const int cbv_ok = boot_render_cbv_ex(r, b->address, b->valid ? b->size : 0, base + slot, fb_live, patched ? fb_lives : 0, group);
+            boot_ds_cb_now = 0;
+            if (!cbv_ok) {
                 uint64_t page = (b->address >> 12) - r->va_base_page;
                 int mapped = (b->address >> 12) >= r->va_base_page && page < r->ptable_pages && r->ptable_cpu[page] != 0xffffffffu;
                 snprintf(r->error, sizeof r->error, "constant buffer stage %u slot %u va %llx size %u: page %s (table %llx..%llx), ring %llu/%llu",
@@ -1775,7 +2355,7 @@ programs_known:
         }
         boot_render_cbv_capturing = 0;
         /* HostState: the previous copy in this ring scope when the bytes are the same (both stages share it) */
-        static uint32_t last_host[8]; static uint64_t last_host_loc, last_host_scope, last_host_offset, last_host_ring_bytes;
+        static uint32_t last_host[12]; static uint64_t last_host_loc, last_host_scope, last_host_offset, last_host_ring_bytes;
         static ID3D12Resource *last_host_ring; static uint8_t *last_host_cpu;
         unsigned host_reused=!ind_host && last_host_scope==boot_render_cb_scope && !memcmp(last_host,host,sizeof host);
         if (ind_host) last_host_scope = UINT64_MAX;   /* render-38d: the GPU-patched copy is not shared with later draws */
@@ -1817,21 +2397,23 @@ programs_known:
     boot_cbv_tap_end(cbv_tap_token,0);
     /* t1 page table, t2 this draw's vertex attribute table (ring snapshot); play (39): the previous draw's pair
      * when the attribute bytes and the page table are the same in this ring scope */
-    static uint32_t last_attribs[32 * 8]; static uint64_t last_attr_scope; static uint32_t last_mem_base, last_pt_pages; static ID3D12Resource *last_pt; static BootRender *last_attr_r;
+    if (point_gs) boot_pt_params(attribs + 32 * 8, s, &d);   /* G2: read by the geometry shader */
+    const size_t attr_bytes = point_gs ? sizeof attribs : 32 * 32;   /* G2: entry 32 goes to the ring only for point-sprite draws */
+    static uint32_t last_attribs[33 * 8]; static uint64_t last_attr_scope; static uint32_t last_mem_base, last_pt_pages; static ID3D12Resource *last_pt; static BootRender *last_attr_r;
     int attr_reuse = last_attr_scope == boot_render_cb_scope && last_attr_r == r && last_pt == r->ptable && last_pt_pages == r->ptable_pages &&
                      boot_render_memeq(last_attribs, attribs, sizeof attribs);   /* batch-b */
     if (attr_reuse) { mem_base = last_mem_base; ++boot_render_tables_reused; }
-    else {   if (r->ring_used + sizeof attribs > r->ring_size) { boot_cbv_tap_issued(cbv_tap_token,(uintptr_t)in,0); return boot_render_fail(r, BOOT_RENDER_E_CAPACITY, "ring"); }
-        memcpy(r->ring_cpu + r->ring_used, attribs, sizeof attribs);
+    else {   if (r->ring_used + attr_bytes > r->ring_size) { boot_cbv_tap_issued(cbv_tap_token,(uintptr_t)in,0); return boot_render_fail(r, BOOT_RENDER_E_CAPACITY, "ring"); }
+        memcpy(r->ring_cpu + r->ring_used, attribs, attr_bytes);
         D3D12_SHADER_RESOURCE_VIEW_DESC pt; memset(&pt, 0, sizeof pt);
         pt.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; pt.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         pt.Format = DXGI_FORMAT_UNKNOWN; pt.Buffer.NumElements = r->ptable_pages; pt.Buffer.StructureByteStride = 4;
         if (!boot_mtr_srv(r, r->ptable, &pt, boot_render_cpu(r, r->srv_heap, r->srv_inc, mem_base)))   /* heavy-work: on the recording worker */
         ID3D12Device_CreateShaderResourceView(r->gpu->device, r->ptable, &pt, boot_render_cpu(r, r->srv_heap, r->srv_inc, mem_base));
-        D3D12_SHADER_RESOURCE_VIEW_DESC at = pt; at.Buffer.FirstElement = r->ring_used / 32; at.Buffer.NumElements = 32; at.Buffer.StructureByteStride = 32;
+        D3D12_SHADER_RESOURCE_VIEW_DESC at = pt; at.Buffer.FirstElement = r->ring_used / 32; at.Buffer.NumElements = (UINT)(attr_bytes / 32); at.Buffer.StructureByteStride = 32;
         if (!boot_mtr_srv(r, r->ring, &at, boot_render_cpu(r, r->srv_heap, r->srv_inc, mem_base + 1)))
         ID3D12Device_CreateShaderResourceView(r->gpu->device, r->ring, &at, boot_render_cpu(r, r->srv_heap, r->srv_inc, mem_base + 1));
-        r->ring_used += (sizeof attribs + 255) & ~(size_t)255;
+        r->ring_used += (attr_bytes + 255) & ~(size_t)255;
         memcpy(last_attribs, attribs, sizeof attribs); last_attr_scope = boot_render_cb_scope; last_attr_r = r;
         last_mem_base = mem_base; last_pt = r->ptable; last_pt_pages = r->ptable_pages; ++boot_render_tables_written;
     }
@@ -1937,6 +2519,7 @@ programs_known:
         boot_render_uav_pending = 0; ++boot_render_uav_barriers;tile89_emitted=1;
     }
     if (stores) { boot_render_gmem_pending = 1; boot_render_uav_pending = 1; ++boot_render_store_draws; }   /* until a waiting submission / the next UAV barrier */
+    if (stores && boot_ds_on()) boot_ds_store_stages = (boot_render_shader_stores(r, vs) ? 1u : 0u) | (ps && boot_render_shader_stores(r, ps) ? 2u : 0u);   /* data-snapshot: which stage stores */
     BootTile89Record *tile89=boot_tile89_issue_record(cbv_tap_token,(uintptr_t)in);
     if(tile89) {
         uint64_t *v89=tile89->v;v89[4]=(uintptr_t)r->gpu->device;v89[5]=(uintptr_t)r->gpu->queue;v89[6]=(uintptr_t)cl;v89[9]=(uintptr_t)r->gpu->fence;
@@ -2117,6 +2700,7 @@ static inline int boot_render_draw(BootRender *r, const BootRenderDraw *in) {
     BootRenderFbFrame99 *frame = &boot_render_fb_frames99[index]; memset(frame,0,sizeof *frame);
     frame->active = 1; frame->prev = boot_render_fb_current99; frame->r = r; boot_render_fb_current99 = index;
     int result = boot_render_draw_impl99(r, in);
+    if (boot_sd_on()) boot_sd_draw_end();   /* suspect-diag */
     if (BOOT_CENSUS_ON()) BOOT_CENSUS_DRAW(in->state, result, result ? r->error : NULL);
     boot_render_fb_current99 = frame->prev;
     if (frame->copies) for (unsigned k = 0; k < BOOT_RENDER_FB_COPIES; ++k) if (frame->copies & (1u << k)) --boot_render_fb_copy_pins99[k];
@@ -2206,7 +2790,7 @@ static inline int boot_render_clear_masked(BootRender *r, BootRenderTarget *t, u
     return BOOT_RENDER_OK;
 }
 /* CLEAR_SURFACE: value bits 0-1 depth/stencil, 2-5 RGBA, 6-9 target, 10-25 layer. A layer of a
- * layered target is the 2D target at address + layer * array pitch (suyu layer_stride = pitch * 4),
+ * layered target is the 2D target at address + layer * array pitch (SET_COLOR_TARGET_ARRAY_PITCH in 4-byte units, Ryujinx RtColorState.LayerSize * 4),
  * which is how each layer's host target is keyed. */
 static inline int boot_render_clear(BootRender *r, const BootDrawState *s, const uint32_t *regs, uint32_t value) {
     boot_render_fb_pb_sync(2);   /* batch-c: a clear writes a target: feedback copies are retaken */
@@ -2228,8 +2812,9 @@ static inline int boot_render_clear(BootRender *r, const BootDrawState *s, const
         if (!t) return boot_render_fail(r, BOOT_RENDER_E_FORMAT, "clear target format");
         boot_render_rt_barrier(r, t, D3D12_RESOURCE_STATE_RENDER_TARGET);
         float c[4]; for (unsigned k = 0; k < 4; ++k) c[k] = boot_f32(regs[(0xd80 + 4 * k) / 4]);
-        /* Integer targets: the clear colour is normalised and scaled to the channel range (suyu
-         * RasterizerVulkan::Clear); D3D12 converts the float clear value to the integer by value. */
+        /* Integer targets: the clear colour is taken as normalised and scaled to the channel range (clb197.h
+         * defines SET_COLOR_CLEAR_VALUE only as raw words; this conversion is not checked against hardware);
+         * D3D12 converts the float clear value to the integer by value. */
         int is_signed; uint32_t bits = boot_render_dxgi_int_bits(t->dxgi, &is_signed);
         for (unsigned k = 0; bits && k < 4; ++k) {
             double v;

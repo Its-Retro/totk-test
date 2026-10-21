@@ -390,7 +390,8 @@ static inline uint64_t boot_bl_offset(uint32_t x, uint32_t y, uint32_t width_byt
 }
 
 /* Byte offset of (x bytes, y, z) in a block-linear surface of width_bytes x height rows with blocks of
- * 2^log_bh GOBs by 2^log_bd slices (suyu SwizzleImpl addressing; z = 0 and log_bd = 0 is the 2D case). */
+ * 2^log_bh GOBs by 2^log_bd slices (Tegra X1 TRM v1.3 block-linear addressing, pp. 1217-1218, in the form of
+ * tegra_swizzle (MIT) src/swizzle.rs gob_address_x/y/z + gob_offset; z = 0 and log_bd = 0 is the 2D case). */
 static inline uint64_t boot_bl_offset3(uint32_t x, uint32_t y, uint32_t z, uint32_t width_bytes, uint32_t height, unsigned log_bh, unsigned log_bd) {
     uint64_t block = (uint64_t)512 << (log_bh + log_bd), gx = ((uint64_t)width_bytes + 63) / 64, gy = ((uint64_t)height + (8u << log_bh) - 1) >> (3 + log_bh);
     return (uint64_t)(z >> log_bd) * gx * gy * block + ((uint64_t)(z & ((1u << log_bd) - 1)) << (9 + log_bh)) +
@@ -729,11 +730,112 @@ static inline int boot_draw_zpass_commit(BootGpuStage *stage, unsigned channel, 
     return 1;
 }
 
+/* mem-work: one "texture budget:" line after perf3 with TOTK_TEX_LIVE_TRIM=1 or TOTK_TEX_CENSUS=1 (neither: nothing).
+ * Live trim counters; with the census also the resident textures by kind (ASTC decoded to RGBA8 and what BC7 would hold,
+ * native block-compressed, other uncompressed, buffers), their size as 64 KiB-granular committed allocations, clock ticks
+ * since the last use, guest images held by more than one resource (other TIC views of the same bytes), and the texture
+ * memory perf3 does not show (feedback copies, reinterpret staging). Diagnostic only: reads, frees nothing. */
+static int boot_draw_tex_seen_cmp(const void *a, const void *b) {
+    const BootRenderTexSeen *x = (const BootRenderTexSeen *)a, *y = (const BootRenderTexSeen *)b;
+    if (x->va != y->va) return x->va < y->va ? -1 : 1;
+    if (x->size != y->size) return x->size < y->size ? -1 : 1;
+    return x->bytes > y->bytes ? -1 : x->bytes < y->bytes;
+}
+static inline void boot_draw_tex_census(FILE *f) {
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); const double us = fq.QuadPart ? 1e6 / (double)fq.QuadPart : 0.0;
+    fprintf(f, "\ntexture budget: budget %llu MiB, live trim %s (min age %u), live trims %llu (+%llu skipped: nothing built), evictions %llu (%llu MiB), over 7/8 after a trim %llu, %.0f us avg / %.0f us max, released by the worker %llu of %llu queued (%llu on the spot)",
+            (unsigned long long)(boot_render_tex_budget() >> 20), boot_render_tex_live_trim_on() ? "on" : "off", boot_render_tex_min_age(),
+            (unsigned long long)boot_render_tex_lt_runs, (unsigned long long)boot_render_tex_lt_skips, (unsigned long long)boot_render_tex_lt_evictions, (unsigned long long)(boot_render_tex_lt_bytes >> 20),
+            (unsigned long long)boot_render_tex_lt_short, boot_render_tex_lt_runs ? (double)boot_render_tex_lt_qpc * us / (double)boot_render_tex_lt_runs : 0.0,
+            (double)boot_render_tex_lt_max_qpc * us, (unsigned long long)boot_render_rel.released, (unsigned long long)boot_render_rel.queued, (unsigned long long)boot_render_rel.inline_releases);
+    if (!boot_render_tex_census_on() || !boot_render_tex_slots) return;
+    uint64_t slots = 0; const uint64_t resident = boot_render_tex_seen_fill(NULL, &slots);
+    if (resident == UINT64_MAX) return;
+    uint64_t alloc = 0, small = 0, kn[4] = {0}, kb[4] = {0}, ab[4] = {0}, shared = 0, ac[3] = {0}, asrgb = 0, abig = 0, from_rt = 0;
+    uint32_t m = 0;
+    for (uint32_t h = 0; h < boot_render_tex_seen_used; ++h) {
+        BootRenderTexSeen *e = &boot_render_tex_seen[h];
+        if (!e->res) continue;
+        D3D12_RESOURCE_DESC d; e->res->lpVtbl->GetDesc(e->res, &d);
+        uint64_t a = (e->bytes + 0xffff) & ~UINT64_C(0xffff); if (!a) a = 0x10000;
+        alloc += a; small += e->bytes < 0x10000; shared += e->holders - 1u;
+        const int bc = (d.Format >= DXGI_FORMAT_BC1_TYPELESS && d.Format <= DXGI_FORMAT_BC5_SNORM) || (d.Format >= DXGI_FORMAT_BC6H_TYPELESS && d.Format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+        const unsigned kind = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 3u : bc ? 1u : (e->astc && (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) ? 0u : 2u;
+        ++kn[kind]; kb[kind] += e->bytes;
+        if (!kind) {   /* components the swizzle reads: 1 -> R8, 2 -> RG8 would hold the same texels (not for sRGB views) */
+            const unsigned cm = (e->astc >> 1) & 15u, nc = (cm & 1u) + (cm >> 1 & 1u) + (cm >> 2 & 1u) + (cm >> 3 & 1u);
+            ac[nc <= 1 ? 0 : nc == 2 ? 1 : 2] += e->bytes; if (e->astc & 32u) asrgb += e->bytes; if (e->astc & 64u) abig += e->bytes; }
+        ab[e->age < 2 ? 0 : e->age < 8 ? 1 : e->age < 64 ? 2 : 3] += e->bytes;
+        if (!e->size) from_rt += e->bytes;   /* contents copied from render targets (no guest bytes behind the slot) */
+        boot_render_tex_seen[m++] = *e;   /* compacted (the table is rebuilt by every fill) */
+    }
+    qsort(boot_render_tex_seen, m, sizeof *boot_render_tex_seen, boot_draw_tex_seen_cmp);
+    uint64_t dup_images = 0, dup_extra = 0, dup_bytes = 0;
+    for (uint32_t k = 0; k < m; ) {
+        uint32_t j = k + 1;
+        while (j < m && boot_render_tex_seen[j].va == boot_render_tex_seen[k].va && boot_render_tex_seen[j].size == boot_render_tex_seen[k].size) ++j;
+        if (j - k > 1 && boot_render_tex_seen[k].size) { ++dup_images; dup_extra += j - k - 1; for (uint32_t q = k + 1; q < j; ++q) dup_bytes += boot_render_tex_seen[q].bytes; }
+        k = j;
+    }
+    boot_render_tex_seen_used = 0;   /* compacted: not a hash table any more */
+    uint64_t fb = 0; unsigned fbn = 0;
+    for (unsigned k = 0; k < BOOT_RENDER_FB_COPIES; ++k) if (boot_render_fb_copies[k].copy) {
+        D3D12_RESOURCE_DESC d; boot_render_fb_copies[k].copy->lpVtbl->GetDesc(boot_render_fb_copies[k].copy, &d); fb += boot_render_tex_estimate(&d); ++fbn; }
+    char up[160]; size_t at = 0; up[0] = 0;   /* upload ring chunk sizes (grow-only, system RAM) */
+    for (unsigned k = 0; k < boot_render_up_ring.count && at + 16 < sizeof up; ++k)
+        at += (size_t)snprintf(up + at, sizeof up - at, "%s%llu", k ? "+" : "", (unsigned long long)(boot_render_up_ring.size[k] >> 20));
+    fprintf(f, "; texture census: slots %llu, resources %u (%llu MiB; as 64 KiB-granular allocations ~%llu MiB, %llu under 64 KiB), slots sharing another's resource %llu; "
+               "ASTC decoded to RGBA8 %llu (%llu MiB, as BC7 %llu MiB; swizzle reads 0-1 components %llu MiB, 2 %llu MiB, 3-4 %llu MiB; sRGB %llu MiB; blocks over 4x4 %llu MiB), block-compressed %llu (%llu MiB), other uncompressed %llu (%llu MiB), buffers %llu (%llu MiB); "
+               "clock ticks since last use: 0-1 %llu MiB, 2-7 %llu MiB, 8-63 %llu MiB, 64+ %llu MiB; guest images held by several resources %llu (+%llu resources, %llu MiB), copied from render targets %llu MiB; "
+               "texture pool %llu MiB, feedback copies %u (%llu MiB), reinterpret staging %llu MiB, upload ring chunks %s MiB, write-back staging chunks %u",
+            (unsigned long long)slots, m, (unsigned long long)(resident >> 20), (unsigned long long)(alloc >> 20), (unsigned long long)small, (unsigned long long)shared,
+            (unsigned long long)kn[0], (unsigned long long)(kb[0] >> 20), (unsigned long long)(kb[0] >> 22),
+            (unsigned long long)(ac[0] >> 20), (unsigned long long)(ac[1] >> 20), (unsigned long long)(ac[2] >> 20), (unsigned long long)(asrgb >> 20), (unsigned long long)(abig >> 20),
+            (unsigned long long)kn[1], (unsigned long long)(kb[1] >> 20),
+            (unsigned long long)kn[2], (unsigned long long)(kb[2] >> 20), (unsigned long long)kn[3], (unsigned long long)(kb[3] >> 20),
+            (unsigned long long)(ab[0] >> 20), (unsigned long long)(ab[1] >> 20), (unsigned long long)(ab[2] >> 20), (unsigned long long)(ab[3] >> 20),
+            (unsigned long long)dup_images, (unsigned long long)dup_extra, (unsigned long long)(dup_bytes >> 20), (unsigned long long)(from_rt >> 20),
+            (unsigned long long)(boot_render_tex_pool_bytes >> 20), fbn, (unsigned long long)(fb >> 20), (unsigned long long)(boot_render_reint_bytes >> 20), up, boot_render_gt.chunks);
+}
 /* Memory accounting appended to the perf3 line (absolute values; host GPU objects are charged to
  * process commit, video memory included): texture slots (resident, LRU evictions since the last
  * line), texture pool, render targets and spares, staging rings, GPU write-back staging, memory
  * batch pool, DXGI local/non-local usage against the budget, process private bytes, system commit. */
 static BootGpu *boot_draw_perf_gpu;
+static BootRender *boot_draw_perf_render;   /* mem-work (TOTK_MEM_LOG): the native path's render object, set before each perf line, cleared after it */
+/* mem-work (TOTK_MEM_LOG; default on, =0: the memory part of the perf3 line exactly as before). On the native path the perf
+ * line then also carries the DXGI local / non-local video memory against its budget (as the emulated path), and, after
+ * "system commit" (the fields the existing parsers read stay where they are): the RAM the process holds (working set: a
+ * guest-memory view D3D12 opened stays resident), peak private, the upload ring (BOOT_RENDER_RING_BYTES, pinned RAM), the
+ * texture slots counted now (the "textures" counter above is refreshed only by a trim: it went stale for 1500 submissions
+ * in play-96), and the candidates for the private bytes nothing above explains: graphics pipelines alive (driver objects,
+ * plus retired ones not released yet), compute pipelines, the DXIL bytecode kept per shader, feedback copies (render-target
+ * sized) and the reinterpret staging buffer. Reads only (the recount drops invalid entries from the live slot list, as every
+ * range scan does); ~0.1-0.3 ms per perf line (every 100 submissions). */
+static inline int boot_draw_mem_log_on(void) {
+    static int v = -1;
+    if (v < 0) { char e[8]; DWORD n = GetEnvironmentVariableA("TOTK_MEM_LOG", e, sizeof e); v = !(n && n < sizeof e && e[0] == '0'); }
+    return v;
+}
+static inline void boot_draw_mem_log(FILE *f) {
+    PROCESS_MEMORY_COUNTERS_EX m; memset(&m, 0, sizeof m); m.cb = sizeof m;
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) memset(&m, 0, sizeof m);
+    uint64_t tex = 0, slots = 0;
+    if (boot_render_tex_slots) { tex = boot_render_tex_seen_fill(NULL, &slots); if (tex == UINT64_MAX) tex = slots = 0; }
+    const unsigned tex_res = boot_render_tex_slots ? boot_render_tex_seen_n : 0;
+    BootRender *r = boot_draw_perf_render; unsigned gs = r ? boot_render_shader_total(r) : 0, cp = 0; uint64_t gb = 0, cb = 0, fb = 0; unsigned fbn = 0;
+    for (unsigned i = 0; i < gs; ++i) { const BootRenderShader *s = boot_render_shader_at(r, i); if (s->dxil) gb += s->size; }
+    for (unsigned i = 0; i < boot_compute.shader_count; ++i) { if (boot_compute.shaders[i].dxil) cb += boot_compute.shaders[i].size; cp += boot_compute.shaders[i].pso != NULL; }
+    for (unsigned k = 0; k < BOOT_RENDER_FB_COPIES; ++k) if (boot_render_fb_copies[k].copy) {
+        D3D12_RESOURCE_DESC d; boot_render_fb_copies[k].copy->lpVtbl->GetDesc(boot_render_fb_copies[k].copy, &d); fb += boot_render_tex_estimate(&d); ++fbn; }
+    fprintf(f, "; host memory (TOTK_MEM_LOG): working set %llu MiB, peak private %llu MiB, upload ring %llu MiB, textures counted now %llu MiB (%u resources, %llu slots), "
+               "graphics PSOs %u (+%u retired), compute PSOs %u, DXIL held: graphics %u shaders %llu MiB, compute %u shaders %llu MiB, feedback copies %u (%llu MiB), reinterpret staging %llu MiB",
+            (unsigned long long)(m.WorkingSetSize >> 20), (unsigned long long)(m.PeakPagefileUsage >> 20), (unsigned long long)(boot_render_seg.ring_total >> 20),
+            (unsigned long long)(tex >> 20), tex_res, (unsigned long long)slots, r ? r->pso_count : 0u, boot_render_pso_retired_count, cp,
+            gs, (unsigned long long)(gb >> 20), boot_compute.shader_count, (unsigned long long)(cb >> 20), fbn, (unsigned long long)(fb >> 20),
+            (unsigned long long)(boot_render_reint_bytes >> 20));
+    boot_draw_perf_render = NULL;   /* set again by the next native perf line (never a render object freed meanwhile) */
+}
 static inline void boot_draw_perf_memory(FILE *f) {
     static uint64_t l_ev, l_evb, l_mb;
     uint64_t up = 0, rb = 0, gt = 0, mb = 0, spare = 0; unsigned spares = 0;
@@ -777,6 +879,9 @@ static inline void boot_draw_perf_memory(FILE *f) {
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm) && K32GetPerformanceInfo(&pi, sizeof pi))
         fprintf(f, ", process private %llu MiB, system commit %llu / %llu MiB", (unsigned long long)(pm.PrivateUsage >> 20),
                 (unsigned long long)((uint64_t)pi.CommitTotal * pi.PageSize >> 20), (unsigned long long)((uint64_t)pi.CommitLimit * pi.PageSize >> 20));
+    if (boot_draw_mem_log_on()) boot_draw_mem_log(f);   /* mem-work: after the fields the existing parsers read */
+    boot_gr_log(f);   /* gpu-resident: opened guest heaps (TOTK_GPU_RESIDENT 1 or 2; nothing with 0) */
+    if (boot_render_tex_live_trim_on() || boot_render_tex_census_on()) boot_draw_tex_census(f);   /* mem-work: its own line */
 }
 /* Profiling line (with the every-100-submissions counters): command lists executed per call site
  * and the CPU time in them since the previous line, wall time per submission, program id cache and
@@ -1372,6 +1477,296 @@ static inline void boot_draw_flicker_watch(BootRender *r, BootRenderTarget *x) {
     ring[k].d.nvn = boot_draw_flicker_nvn_sub(&now.nvn, &last.nvn);   /* flashfix */
     last = now; last_exec = boot_render_exec_id;
 }
+/* water-work (2026-10-21): single-frame LOCAL flash scanner (TOTK_GLITCH_SCAN=1, or =<min flagged grid pixels>; off by
+ * default). The idea and three of its tests come from nxport's frame glitch scanner (MIT, reference/nxport-main/crates/
+ * engine/src/metal/mod.rs glitch_scan / glitch_analyze: per-pixel tests on a half-resolution grid over the last five
+ * presented frames, tint-flash and sky-dip tests on the frame means, the frames and the bounding box dumped). The flicker
+ * detector above only sees whole-image luma drops; this one finds a REGION that flashes for one present while the rest of
+ * the image is normal (water and waterfalls that vanish or change for single frames).
+ * Capture: like the flicker detector, every presented image is copied (no wait) into one of 8 readback buffers; completed
+ * copies are read in present order on later presents and reduced to an RGB grid of every 2nd pixel of every 2nd row; the
+ * last five consecutive presents are kept (f0..f4; f2, the one tested, is reported ~2 presents + the readback lag late).
+ * Per grid pixel (d = largest channel difference), when f2 departs from both neighbours (d(f2,f1), d(f2,f3) > 40):
+ *   still  (nxport) d(f1,f3), d(f0,f1), d(f3,f4) < 12: a one-frame error on a still image;
+ *   local  (ours, tolerates camera motion) d(f1,f3) < 16, f2 brighter than both or darker than both, and f2 not equal to
+ *          f0 and f4: the same before and after, different in between (moving content fails d(f1,f3) < 16);
+ *   alt    as local but f2 equals f0 and f4 (< 16): a region alternating every present (period 2), counted apart (temporal
+ *          dither does this too; so would a resource that flips between two images);
+ *   black  (nxport) f2 black (max < 6) where f1 and f3 are lit (max > 30).
+ * Flagged pixels are binned into 16x16-pixel tiles of the presented image; a tile with >= 1/4 of its grid pixels flagged
+ * is hot, so scattered noise (dither, particles) does not make an event. Whole-image tests (nxport, logged and counted
+ * only): TINT (the mean colour of f2 jumps away from f1 and f3 while they agree) and SKY (the same on the top third).
+ * Events append to frames\glitch.log: GLITCH (still + local > the minimum, default 200, or >= 2 hot tiles of them),
+ * GLITCH (black) (black > 200, budget 30) and GLITCH (alternating) (alt > the minimum with >= 2 hot alt tiles, budget 30):
+ * the present number (frames\frame-N.bmp numbering), local time, submissions, the counts, the bounding box of the
+ * flagged pixels and of their hot tiles in presented-image pixels, and the native executor's counters of the flash
+ * present and both neighbours (draws, clears, skipped, failed, ...: a draw we skipped or the game did not issue shows
+ * there). The first 30 GLITCH events (and each black / alternating one) also write
+ * frames\glitch-<present>-{a-prev,b-flash,c-next,d-mask}.bmp (half size; d-mask: the flash present dimmed, still =
+ * magenta, local = red, black = blue, alt = green, hot box yellow).
+ * Naming the draws: with TOTK_DRAW_CENSUS=1 every event is also an F mark in frames\draw-census.log (census frame of the
+ * flash present), so the census's vanish groups of that frame (gap 1, GAME = the game did not issue the draw, OURS = we
+ * dropped it, with vs/ps ids) say which draws disappeared. TOTK_GLITCH_TRACE=<events>: the first GLITCH event also
+ * creates frames\draw-trace.request with that event count (one shot): the next frames' draws (programs, targets,
+ * textures, constants) are traced, which names the draws that normally cover the box.
+ * A line every 600 scanned presents shows the scanner ran. Diagnostic only: no GPU work changes; cost when on: one image
+ * copy per present and a few ms of CPU on the present thread; off: one cached environment read. */
+typedef struct BootGlitchMeta { uint64_t present, exec_lo, exec_hi; uint32_t census; SYSTEMTIME at; BootFlickerNvn nvn; } BootGlitchMeta;
+static inline unsigned boot_draw_glitch_min(void) {
+    static int v = -1;
+    if (v < 0) {
+        char e[16]; DWORD k = GetEnvironmentVariableA("TOTK_GLITCH_SCAN", e, sizeof e);
+        unsigned long n = (k && k < sizeof e) ? strtoul(e, NULL, 10) : 0;
+        v = n == 0 ? 0 : n == 1 ? 200 : n > 1000000 ? 1000000 : (int)n;
+    }
+    return (unsigned)v;
+}
+static inline unsigned boot_draw_glitch_trace_events(void) {
+    static int v = -1;
+    if (v < 0) {
+        char e[16]; DWORD k = GetEnvironmentVariableA("TOTK_GLITCH_TRACE", e, sizeof e);
+        unsigned long n = (k && k < sizeof e) ? strtoul(e, NULL, 10) : 0;
+        v = n > 200000 ? 200000 : (int)n;
+    }
+    return (unsigned)v;
+}
+static inline void boot_draw_glitch_bmp(const uint8_t *rgb, uint32_t gw, uint32_t gh, uint64_t present, const char *tag) {
+    char path[96]; snprintf(path, sizeof path, "frames\\glitch-%05llu-%s.bmp", (unsigned long long)present, tag);
+    FILE *o = fopen(path, "wb"); if (!o) return;
+    uint32_t row = (gw * 3 + 3) & ~3u, size = 54 + row * gh; uint8_t hd[54] = {'B', 'M'};
+    memcpy(hd + 2, &size, 4); hd[10] = 54; hd[14] = 40; memcpy(hd + 18, &gw, 4); memcpy(hd + 22, &gh, 4); hd[26] = 1; hd[28] = 24;
+    fwrite(hd, 1, 54, o);
+    uint8_t *line = (uint8_t *)calloc(1, row);
+    for (uint32_t y = gh; line && y-- > 0; ) {   /* bottom-up rows, BGR */
+        const uint8_t *s = rgb + (size_t)y * gw * 3;
+        for (uint32_t x = 0; x < gw; ++x) { line[x * 3] = s[x * 3 + 2]; line[x * 3 + 1] = s[x * 3 + 1]; line[x * 3 + 2] = s[x * 3]; }
+        fwrite(line, 1, row, o);
+    }
+    free(line); fclose(o);
+}
+static inline int boot_draw_glitch_d(const uint8_t *a, const uint8_t *b) {
+    int d0 = abs((int)a[0] - (int)b[0]), d1 = abs((int)a[1] - (int)b[1]), d2 = abs((int)a[2] - (int)b[2]);
+    int m = d0 > d1 ? d0 : d1;
+    return m > d2 ? m : d2;
+}
+static inline int boot_draw_glitch_mx(const uint8_t *a) { int m = a[0] > a[1] ? a[0] : a[1]; return m > a[2] ? m : a[2]; }
+static inline void boot_draw_glitch_when(char *s, size_t n, const BootGlitchMeta *m) {
+    snprintf(s, n, "%02u:%02u:%02u.%03u", (unsigned)m->at.wHour % 100u, (unsigned)m->at.wMinute % 100u, (unsigned)m->at.wSecond % 100u, (unsigned)m->at.wMilliseconds % 1000u);
+}
+/* One class of flagged pixels: count, bounding box (grid pixels), tiles of 8x8 grid pixels and the hot ones. */
+typedef struct BootGlitchBox { uint32_t n, x0, y0, x1, y1, hot, hx0, hy0, hx1, hy1; uint16_t *tile; } BootGlitchBox;
+static inline void boot_draw_glitch_hot(BootGlitchBox *b, uint32_t gw, uint32_t gh) {
+    const uint32_t tw = (gw + 7) / 8, th = (gh + 7) / 8;
+    b->hot = 0; b->hx0 = tw; b->hy0 = th; b->hx1 = b->hy1 = 0;
+    for (uint32_t ty = 0; ty < th; ++ty)
+        for (uint32_t tx = 0; tx < tw; ++tx) {
+            const uint32_t cw = gw - tx * 8 < 8 ? gw - tx * 8 : 8, ch = gh - ty * 8 < 8 ? gh - ty * 8 : 8;
+            if ((uint32_t)b->tile[ty * tw + tx] * 4 < cw * ch) continue;
+            ++b->hot; b->hx0 = tx < b->hx0 ? tx : b->hx0; b->hy0 = ty < b->hy0 ? ty : b->hy0; b->hx1 = tx > b->hx1 ? tx : b->hx1; b->hy1 = ty > b->hy1 ? ty : b->hy1;
+        }
+}
+static inline void boot_draw_glitch_analyze(uint8_t *const f[5], const BootGlitchMeta m[5], uint32_t gw, uint32_t gh, uint32_t w, uint32_t h, uint8_t *mask) {
+    static uint64_t scanned, events, tints, skies, black_events, alt_events, alt_seen, text_lines; static uint32_t window_max;
+    static uint16_t *tiles; static uint32_t tile_cap; static uint8_t *shade; static size_t shade_cap; static int trace_armed;
+    const unsigned minpx = boot_draw_glitch_min();
+    const uint32_t tw = (gw + 7) / 8, th = (gh + 7) / 8;
+    if (tile_cap < tw * th) { free(tiles); tiles = (uint16_t *)calloc((size_t)tw * th * 2, sizeof *tiles); tile_cap = tiles ? tw * th : 0; }
+    if (!tiles) return;
+    memset(tiles, 0, (size_t)tw * th * 2 * sizeof *tiles);
+    BootGlitchBox mainb = {0, gw, gh, 0, 0, 0, 0, 0, 0, 0, tiles}, altb = {0, gw, gh, 0, 0, 0, 0, 0, 0, 0, tiles + (size_t)tw * th};
+    uint32_t n_still = 0, n_local = 0, n_black = 0;
+    for (uint32_t y = 0; y < gh; ++y)
+        for (uint32_t x = 0; x < gw; ++x) {
+            const size_t i = ((size_t)y * gw + x) * 3; uint8_t flag = 0;
+            const int d21 = boot_draw_glitch_d(f[2] + i, f[1] + i), d23 = boot_draw_glitch_d(f[2] + i, f[3] + i);
+            if (d21 > 40 && d23 > 40) {
+                const int d13 = boot_draw_glitch_d(f[1] + i, f[3] + i);
+                if (d13 < 12 && boot_draw_glitch_d(f[0] + i, f[1] + i) < 12 && boot_draw_glitch_d(f[3] + i, f[4] + i) < 12) flag = 1;
+                else if (d13 < 16) {
+                    const int s1 = f[1][i] + f[1][i + 1] + f[1][i + 2], s2 = f[2][i] + f[2][i + 1] + f[2][i + 2], s3 = f[3][i] + f[3][i + 1] + f[3][i + 2];
+                    if ((s2 > s1 && s2 > s3) || (s2 < s1 && s2 < s3))
+                        flag = (boot_draw_glitch_d(f[2] + i, f[0] + i) < 16 && boot_draw_glitch_d(f[2] + i, f[4] + i) < 16) ? 4 : 2;
+                }
+            }
+            if (!flag && boot_draw_glitch_mx(f[2] + i) < 6 && boot_draw_glitch_mx(f[1] + i) > 30 && boot_draw_glitch_mx(f[3] + i) > 30) flag = 3;
+            mask[(size_t)y * gw + x] = flag;
+            if (!flag) continue;
+            if (flag == 1) ++n_still;
+            else if (flag == 2) ++n_local;
+            else if (flag == 3) ++n_black;
+            BootGlitchBox *b = flag == 4 ? &altb : &mainb;
+            ++b->n; b->x0 = x < b->x0 ? x : b->x0; b->y0 = y < b->y0 ? y : b->y0; b->x1 = x > b->x1 ? x : b->x1; b->y1 = y > b->y1 ? y : b->y1;
+            ++b->tile[(y / 8) * tw + x / 8];
+        }
+    boot_draw_glitch_hot(&mainb, gw, gh); boot_draw_glitch_hot(&altb, gw, gh);
+    /* whole-image tests (nxport): the mean colour on a coarse grid (every 8th image pixel), the top third for the sky */
+    double mean[3][3] = {{0}}, sky[3] = {0}; uint64_t km = 0, ks = 0;
+    for (uint32_t y = 0; y < gh; y += 4)
+        for (uint32_t x = 0; x < gw; x += 4, ++km) {
+            const size_t i = ((size_t)y * gw + x) * 3;
+            for (unsigned q = 0; q < 3; ++q) for (unsigned c = 0; c < 3; ++c) mean[q][c] += f[q + 1][i + c];
+        }
+    for (uint32_t y = 0; y < gh / 3; y += 2)
+        for (uint32_t x = 0; x < gw; x += 2, ++ks) {
+            const size_t i = ((size_t)y * gw + x) * 3;
+            for (unsigned q = 0; q < 3; ++q) sky[q] += (f[q + 1][i] + f[q + 1][i + 1] + f[q + 1][i + 2]) / 3.0;
+        }
+    double tint = 0;
+    for (unsigned c = 0; c < 3 && km; ++c) {
+        const double m1 = mean[0][c] / (double)km, m2 = mean[1][c] / (double)km, m3 = mean[2][c] / (double)km;
+        const double a = m2 > m1 ? m2 - m1 : m1 - m2, b = m2 > m3 ? m2 - m3 : m3 - m2, jump = a < b ? a : b, base = m1 > m3 ? m1 - m3 : m3 - m1;
+        if (jump > 4.0 && base < jump / 3.0 && jump > tint) tint = jump;
+    }
+    const double s1 = ks ? sky[0] / (double)ks : 0, s2 = ks ? sky[1] / (double)ks : 0, s3 = ks ? sky[2] / (double)ks : 0;
+    const int sky_dip = (s2 - s1 > 4.0 || s1 - s2 > 4.0) && (s2 - s3 > 4.0 || s3 - s2 > 4.0) && s1 - s3 < 1.5 && s3 - s1 < 1.5 && ((s2 > s1) == (s2 > s3));
+    ++scanned;
+    const uint32_t flagged = n_still + n_local; if (flagged > window_max) window_max = flagged;
+    if (altb.n > minpx && altb.hot >= 2) ++alt_seen;
+    char when[16]; boot_draw_glitch_when(when, sizeof when, &m[2]);
+    if ((tint > 0 || sky_dip) && text_lines < 4000) {
+        FILE *lf = fopen("frames\\glitch.log", "a");
+        if (lf) {
+            if (tint > 0) {
+                ++tints; ++text_lines;
+                fprintf(lf, "TINT present %llu at %s: mean colour %.1f %.1f %.1f between %.1f %.1f %.1f and %.1f %.1f %.1f (jump %.1f)\n",
+                        (unsigned long long)m[2].present, when, mean[1][0] / (double)km, mean[1][1] / (double)km, mean[1][2] / (double)km,
+                        mean[0][0] / (double)km, mean[0][1] / (double)km, mean[0][2] / (double)km, mean[2][0] / (double)km, mean[2][1] / (double)km,
+                        mean[2][2] / (double)km, tint);
+            }
+            if (sky_dip) { ++skies; ++text_lines; fprintf(lf, "SKY present %llu at %s: top third %.1f, neighbours %.1f / %.1f\n", (unsigned long long)m[2].present, when, s2, s1, s3); }
+            fclose(lf);
+        }
+    }
+    const int event = flagged > minpx || mainb.hot >= 2;
+    const int black_event = !event && n_black > 200 && black_events < 30;
+    const int alt_event = !event && !black_event && altb.n > minpx && altb.hot >= 2 && alt_events < 30;
+    if (event || black_event || alt_event) {
+        if (event) ++events;
+        else if (black_event) ++black_events;
+        else ++alt_events;
+        const BootGlitchBox *b = alt_event ? &altb : &mainb;
+        const uint32_t hbx0 = b->hot ? b->hx0 * 16 : 0, hby0 = b->hot ? b->hy0 * 16 : 0;
+        const uint32_t hbx1 = b->hot ? ((b->hx1 + 1) * 16 < w ? (b->hx1 + 1) * 16 : w) - 1 : 0, hby1 = b->hot ? ((b->hy1 + 1) * 16 < h ? (b->hy1 + 1) * 16 : h) - 1 : 0;
+        FILE *lf = fopen("frames\\glitch.log", "a");
+        if (lf) {
+            char a[512], bb[512], c[512]; boot_draw_flicker_nvn_text(a, sizeof a, &m[2].nvn); boot_draw_flicker_nvn_text(bb, sizeof bb, &m[1].nvn);
+            boot_draw_flicker_nvn_text(c, sizeof c, &m[3].nvn);
+            fprintf(lf, "GLITCH%s present %llu at %s (submissions %llu..%llu, image %ux%u): still %u local %u black %u alt %u of %u grid pixels, hot tiles %u; "
+                        "bbox %u,%u-%u,%u; hot bbox %u,%u-%u,%u; census frame %u | flash: %s | before: %s | after: %s\n",
+                    event ? "" : black_event ? " (black)" : " (alternating)", (unsigned long long)m[2].present, when, (unsigned long long)m[2].exec_lo,
+                    (unsigned long long)m[2].exec_hi, w, h, n_still, n_local, n_black, altb.n, gw * gh, b->hot,
+                    b->n ? b->x0 * 2 : 0, b->n ? b->y0 * 2 : 0, b->n ? b->x1 * 2 + 1 : 0, b->n ? b->y1 * 2 + 1 : 0, hbx0, hby0, hbx1, hby1, m[2].census, a, bb, c);
+            fclose(lf);
+        }
+        if ((event && events <= 30) || black_event || alt_event) {
+            boot_draw_glitch_bmp(f[1], gw, gh, m[2].present, "a-prev");
+            boot_draw_glitch_bmp(f[2], gw, gh, m[2].present, "b-flash");
+            boot_draw_glitch_bmp(f[3], gw, gh, m[2].present, "c-next");
+            const size_t need = (size_t)gw * gh * 3;
+            if (shade_cap < need) { free(shade); shade = (uint8_t *)malloc(need); shade_cap = shade ? need : 0; }
+            if (shade) {
+                static const uint8_t col[5][3] = {{0, 0, 0}, {255, 0, 255}, {255, 0, 0}, {0, 128, 255}, {0, 255, 0}};
+                for (size_t p = 0; p < (size_t)gw * gh; ++p)
+                    for (unsigned q = 0; q < 3; ++q) shade[p * 3 + q] = mask[p] ? col[mask[p]][q] : (uint8_t)(f[2][p * 3 + q] / 3);
+                if (b->hot) {   /* hot box outline (yellow), grid pixels */
+                    const uint32_t gx0 = b->hx0 * 8, gy0 = b->hy0 * 8, gx1 = ((b->hx1 + 1) * 8 < gw ? (b->hx1 + 1) * 8 : gw) - 1, gy1 = ((b->hy1 + 1) * 8 < gh ? (b->hy1 + 1) * 8 : gh) - 1;
+                    static const uint8_t yel[3] = {255, 255, 0};
+                    for (uint32_t x = gx0; x <= gx1; ++x) { memcpy(shade + ((size_t)gy0 * gw + x) * 3, yel, 3); memcpy(shade + ((size_t)gy1 * gw + x) * 3, yel, 3); }
+                    for (uint32_t y = gy0; y <= gy1; ++y) { memcpy(shade + ((size_t)y * gw + gx0) * 3, yel, 3); memcpy(shade + ((size_t)y * gw + gx1) * 3, yel, 3); }
+                }
+                boot_draw_glitch_bmp(shade, gw, gh, m[2].present, "d-mask");
+            }
+        }
+        if (BOOT_CENSUS_ON() && m[2].census) {
+            char what[112]; snprintf(what, sizeof what, "%s present %llu, hot bbox %u,%u-%u,%u", event ? "local flash" : black_event ? "black flash" : "alternating region",
+                                     (unsigned long long)m[2].present, hbx0, hby0, hbx1, hby1);
+            BOOT_CENSUS_GLITCH(m[2].census, what);
+        }
+        const unsigned tn = boot_draw_glitch_trace_events();
+        if (event && tn && !trace_armed && !boot_draw_trace_left && GetFileAttributesA("frames\\draw-trace.request") == INVALID_FILE_ATTRIBUTES) {
+            FILE *q = fopen("frames\\draw-trace.request", "w");
+            if (q) {
+                fprintf(q, "%u\n", tn); fclose(q); trace_armed = 1;
+                FILE *lf2 = fopen("frames\\glitch.log", "a");
+                if (lf2) { fprintf(lf2, "TRACE armed by the glitch at present %llu: %u events from the next submission after %llu (frames\\draw-trace.txt)\n",
+                                   (unsigned long long)m[2].present, tn, (unsigned long long)boot_render_exec_id); fclose(lf2); }
+            }
+        }
+    }
+    if (scanned % 600 == 0) {
+        FILE *lf = fopen("frames\\glitch.log", "a");
+        if (lf) {
+            fprintf(lf, "scan present %llu at %s: %llu presents scanned (image %ux%u, min %u), events %llu, black %llu, alternating %llu (seen %llu), tint %llu, sky %llu; "
+                        "most flagged pixels in the last 600: %u\n",
+                    (unsigned long long)m[2].present, when, (unsigned long long)scanned, w, h, minpx, (unsigned long long)events, (unsigned long long)black_events,
+                    (unsigned long long)alt_events, (unsigned long long)alt_seen, (unsigned long long)tints, (unsigned long long)skies, window_max);
+            fclose(lf);
+        }
+        window_max = 0;
+    }
+}
+/* Present hook (after boot_draw_flicker_watch): `present` = this present's number (BootPresent.frames, the frame-N.bmp
+ * numbering); copies are matched to it, and the five-present history restarts after a gap (a copy skipped while all 8
+ * readback buffers were in flight, or a size change). */
+static inline void boot_draw_glitch_scan(BootRender *r, BootRenderTarget *x, uint64_t present) {
+    if (!boot_draw_glitch_min() || !x || !x->texture) return;
+    enum { N = 8 };
+    static struct { ID3D12Resource *rb; uint64_t bytes, fence; UINT pitch; uint32_t w, h; BootGlitchMeta m; int busy; } ring[N];
+    static uint64_t copies, harvest, last_exec; static BootFlickerNvn last;
+    static uint8_t *grid[5], *mask; static BootGlitchMeta meta[5]; static uint32_t gw, gh, iw, ih; static unsigned have;
+    BootGpu *g = r->gpu;
+    while (harvest < copies) {   /* completed copies, in present order */
+        const unsigned k = (unsigned)(harvest % N);
+        if (!ring[k].busy) { ++harvest; continue; }
+        if (ID3D12Fence_GetCompletedValue(g->fence) < ring[k].fence) break;
+        const uint32_t nw = ring[k].w / 2, nh = ring[k].h / 2;
+        if (nw != gw || nh != gh || !grid[0]) {   /* (re)allocate for this size; the history restarts */
+            for (unsigned q = 0; q < 5; ++q) { free(grid[q]); grid[q] = (uint8_t *)malloc((size_t)nw * nh * 3 + 1); }
+            free(mask); mask = (uint8_t *)malloc((size_t)nw * nh + 1);
+            gw = nw; gh = nh; iw = ring[k].w; ih = ring[k].h; have = 0;
+        }
+        uint8_t *mp = NULL;
+        const int ok = grid[0] && grid[1] && grid[2] && grid[3] && grid[4] && mask && gw && gh;
+        if (ok && SUCCEEDED(ID3D12Resource_Map(ring[k].rb, 0, NULL, (void **)&mp))) {
+            uint8_t *dst = grid[0];   /* the oldest grid becomes the newest */
+            for (unsigned q = 0; q < 4; ++q) { grid[q] = grid[q + 1]; meta[q] = meta[q + 1]; }
+            grid[4] = dst; meta[4] = ring[k].m;
+            for (uint32_t y = 0; y < gh; ++y) {
+                const uint8_t *src = mp + (size_t)(y * 2) * ring[k].pitch; uint8_t *o = dst + (size_t)y * gw * 3;
+                for (uint32_t xx = 0; xx < gw; ++xx) { o[xx * 3] = src[xx * 8]; o[xx * 3 + 1] = src[xx * 8 + 1]; o[xx * 3 + 2] = src[xx * 8 + 2]; }
+            }
+            D3D12_RANGE none = {0, 0}; ID3D12Resource_Unmap(ring[k].rb, 0, &none);
+            have = (have && meta[3].present + 1 == meta[4].present) ? (have < 5 ? have + 1 : 5) : 1;
+            if (have == 5) boot_draw_glitch_analyze(grid, meta, gw, gh, iw, ih, mask);
+        } else have = 0;
+        ring[k].busy = 0; ++harvest;
+    }
+    /* this present: copy into the next slot (skipped while that slot is still in flight) */
+    const BootFlickerNvn now = boot_draw_flicker_nvn;
+    const unsigned k = (unsigned)(copies % N);
+    if (ring[k].busy || (x->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && x->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) { last = now; last_exec = boot_render_exec_id; return; }
+    D3D12_RESOURCE_DESC sd; x->texture->lpVtbl->GetDesc(x->texture, &sd);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; UINT rows; UINT64 rs, total;
+    ID3D12Device_GetCopyableFootprints(g->device, &sd, 0, 1, 0, &fp, &rows, &rs, &total);
+    if (!ring[k].rb || ring[k].bytes < total) {
+        if (ring[k].rb) ID3D12Resource_Release(ring[k].rb);   /* not busy: its copy completed */
+        ring[k].rb = boot_render_buffer(r, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST, NULL); ring[k].bytes = ring[k].rb ? total : 0;
+        if (!ring[k].rb) return;
+    }
+    if (!boot_render_begin(r)) return;
+    const D3D12_RESOURCE_STATES was = x->state;
+    if (!boot_render_rt_barrier(r, x, D3D12_RESOURCE_STATE_COPY_SOURCE)) return;
+    D3D12_TEXTURE_COPY_LOCATION dl = {ring[k].rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {0}}, sl = {x->texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    dl.PlacedFootprint = fp; dl.PlacedFootprint.Offset = 0;
+    ID3D12GraphicsCommandList_CopyTextureRegion(r->cl, &dl, 0, 0, 0, &sl, NULL);
+    boot_render_rt_barrier(r, x, was);
+    ring[k].busy = 1; ring[k].fence = g->submitted + 1;   /* the next signal executes the list holding this copy */
+    ring[k].pitch = fp.Footprint.RowPitch; ring[k].w = x->width; ring[k].h = x->height;
+    ring[k].m.present = present; ring[k].m.exec_lo = last_exec + 1; ring[k].m.exec_hi = boot_render_exec_id;
+    ring[k].m.census = (BOOT_CENSUS_ON() && boot_census.mode == 1 && boot_census.frame > 1) ? boot_census.frame - 1 : 0;   /* the census ended this present's frame just before */
+    GetLocalTime(&ring[k].m.at); ring[k].m.nvn = boot_draw_flicker_nvn_sub(&now, &last);
+    last = now; last_exec = boot_render_exec_id; ++copies;
+}
 static inline int boot_draw_present(BootWindow *w, const BootGraphicSlot *slot) {
     if (!boot_draw_device_recover(w) || !boot_draw_open(w)) return 0;
     BootRender *r = w->render;
@@ -1406,6 +1801,7 @@ static inline int boot_draw_present(BootWindow *w, const BootGraphicSlot *slot) 
         if (x) {
             boot_draw_dump_targets(r, x->address);
             boot_draw_flicker_watch(r, x);   /* render-23 */
+            boot_draw_glitch_scan(r, x, w->present->frames);   /* water-work: TOTK_GLITCH_SCAN (off when unset) */
             int rc = boot_render_present_target(r, w->present, w->hwnd, x);
             if (rc) boot_draw_log("present: %s %llu %llu", r->error, m->gpu, 0);
             return rc == 0;

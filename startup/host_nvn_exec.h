@@ -24,6 +24,10 @@
  * memory that pending GPU work may write (boot_render_cpu_read, indirect arguments). */
 
 #define BOOT_NVN_NATIVE_BLOCK  (UINT64_C(2) << 20)
+/* data-snapshot: the copy arena (host_gpu_render.h boot_ds_arena) follows the driver buffer in the same block, so the page table
+ * maps it next to the driver buffer and vertex streams read from a copy go through gmem_load like guest memory. The block is
+ * BOOT_NVN_NATIVE_BLOCK (2 MiB) exactly with TOTK_DATA_SNAPSHOT=0. */
+static inline uint64_t boot_nvn_block_bytes(void) { return BOOT_NVN_NATIVE_BLOCK + boot_ds_arena_bytes(); }
 #define BOOT_NVN_C0_SIZE       0x7000u
 #define BOOT_NVN_C2_BASE       0x7000u
 #define BOOT_NVN_DUMMY_BASE    0x8000u
@@ -40,7 +44,7 @@ typedef struct BootNvnExec {
     uint32_t tex[6][32];
     uint64_t tex_pool, smp_pool; uint32_t tex_count, smp_count;
     BootColorTarget rt[8]; uint32_t rt_count; BootDepthTarget zt;
-    int32_t vp[16][4]; float depth_range[16][2]; int32_t scissor[16][4];
+    float vp[16][4]; float depth_range[16][2]; int32_t scissor[16][4];   /* batch-3 N10: vp float (SetViewports takes floats) */
     float blend_color[4]; uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
     float poly_offset[3]; uint32_t restart, restart_index, depth_clamp, guest_barrier;
     uint32_t depth_mode, origin_upper_left;
@@ -82,8 +86,9 @@ static inline uint32_t boot_nvn_rt_format(uint32_t f) { return f < BOOT_NVN_FORM
 static inline uint32_t boot_nvn_zt_format(uint32_t f) {   /* STENCIL8, DEPTH16, DEPTH24, DEPTH32F, DEPTH24_STENCIL8, DEPTH32F_STENCIL8 */
     switch (f) { case 49: return 0x17; case 50: return 0x13; case 51: return 0x14; case 52: return 0x0a; case 53: return 0x14; case 54: return 0x19; default: return 0; }
 }
-/* NVN vertex format -> Maxwell (size code, numeric type, bgra). 0 size = unsupported. */
-static inline int boot_nvn_vertex_format(uint32_t f, uint32_t *size, uint32_t *type) {
+/* NVN vertex format -> Maxwell (size code, numeric type, bgra). 0 size = unsupported. The hand-written table (formats
+ * 1-48, 61-63, 105), kept for TOTK_VERTEX_FORMATS=0 (batch-3 K3, below). */
+static inline int boot_nvn_vertex_format_hand(uint32_t f, uint32_t *size, uint32_t *type) {
     /* channel groups of the public NVN order: R8(1..4) R16(5..9) R32(10..12) RG8(13..16) RG16(17..21) RG32(22..24)
      * RGB8(25..28) RGB16(29..33) RGB32(34..36) RGBA8(37..40) RGBA16(41..45) RGBA32(46..48) */
     static const struct { uint8_t first, count, size8, size16, size32; } g[4] = {{0}};
@@ -107,6 +112,40 @@ static inline int boot_nvn_vertex_format(uint32_t f, uint32_t *size, uint32_t *t
     if (f == 63) { *size = 0x31; *type = FL; return 1; }          /* R11G11B10F */
     if (f == 105) { *size = 0x30; *type = SN; return 1; }         /* RGB10A2SN */
     return 0;
+}
+/* batch-3 K3: NVN vertex format -> Maxwell (size code, numeric type) from the NVN driver's own vertex attribute format
+ * column (sdk+0xd01614 + 48 * format - 8, i.e. byte +0x10 of each 48-byte per-format record whose +0x18 is the
+ * render-target format of boot_nvn_rt_formats and +0x20 the TIC word of boot_nvn_format_tic): size bits 21-26, type
+ * bits 27-29 (1 snorm, 2 unorm, 3 sint, 4 uint, 5 uscaled, 6 sscaled, 7 float). 0x26800000 is the driver's placeholder
+ * for formats with no vertex encoding (depth, compressed, RGBX*, RGB9E5F, BGR*): 0 (unsupported) here too. Written by
+ * gen_game_headers.py from the dumped 1.0.0 sdk. Formats 1-48, 61-63 and 105 match the hand-written table above bit for
+ * bit; 81-104 (*_UI2F / *_I2F: integer data the fetch unit converts to float) and 106-108 (RGB10A2 I / UI2F / I2F) are
+ * new: the hand-written table left those attributes inactive, reading (0,0,0,1). maxwell_runtime.hlsli conv_ already
+ * converts types 5 and 6, and vin_layout has every size code these use. Cross-check: nxport (MIT)
+ * crates/engine/src/metal/translated.rs:2134-2216 maps 81-104 the same way (it also maps 64 and 109-120, which the
+ * driver does not, and lacks 106-108). TOTK_VERTEX_FORMATS=0: the hand-written table, as before. */
+#include "generated_nvn_format_vertex.h"   /* boot_nvn_vertex_words[161]: gen_game_headers.py, from the dumped sdk */
+static inline int boot_nvn_vertex_format(uint32_t f, uint32_t *size, uint32_t *type) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_VERTEX_FORMATS", v, sizeof v); on = !(k && k < sizeof v && v[0] == '0'); }
+    if (!on) return boot_nvn_vertex_format_hand(f, size, type);
+    uint32_t w = f < 161 ? boot_nvn_vertex_words[f] : 0;
+    if (!w) return 0;
+    *size = (w >> 21) & 0x3f; *type = (w >> 27) & 7;
+    return 1;
+}
+/* K3 diagnostic (TOTK_STATE_DIAG): a vertex format code is logged once when only the driver table decodes it, or when it
+ * has no vertex encoding (the attribute reads (0,0,0,1)); format 0 (none) is not. */
+static inline void boot_nvn_vertex_format_note(uint32_t f, unsigned attr, int decoded) {
+    if (!boot_render_state_diag_on() || (!decoded && !f)) return;
+    uint32_t s0, t0;
+    if (decoded && boot_nvn_vertex_format_hand(f, &s0, &t0)) return;
+    if (decoded) ++boot_state_diag.vfmt_new; else ++boot_state_diag.vfmt_unsupported;
+    static uint8_t seen[162]; uint32_t k = f < 161 ? f : 161;
+    if (seen[k]) return;
+    seen[k] = 1;
+    boot_gp_log("nvn native: K3 vertex format %u (attribute %u): %s", f, attr,
+                decoded ? "decoded from the driver table (before: inactive, read as (0,0,0,1))" : "no vertex encoding, the attribute reads (0,0,0,1)");
 }
 
 /* One layer and mip level of a block-linear texture as a render target, the way the driver programs it (the
@@ -251,7 +290,496 @@ static inline int boot_nvn_texture_target(BootContext *c, uint64_t self, uint64_
 #define BOOT_NVN_MAPS BOOT_GPU_MAPPING_CAPACITY   /* one entry per guest GPU mapping */
 typedef struct BootNvnMap { uint64_t gpu, off, size; int region; } BootNvnMap;
 static uint64_t boot_nvn_pack_qpc;   /* play (74): time in boot_gpu_pack_regions (per submission), for the hitch line */
+/* gpu-resident (TOTK_GPU_RESIDENT, default 1; =0: every block a GPU mapping uses is opened whole, exactly as before; =2: dry
+ * run, whole blocks as with 0 plus the perf3 "guest heaps" part saying what 1 would open; mechanism and measurements:
+ * host_gpu_render.h boot_gr_view, play-work/gpu-resident/README.md). The GPU can only reach guest memory through the GPU
+ * mappings (NVN memory pools mapped by the driver; CPU-only pools have none), so with 1 a mapping inside a fastmem section is
+ * given a view of just its span instead of the whole block:
+ *  - spans: the mappings' section byte ranges rounded out to the granule (TOTK_GPU_RESIDENT_KB, default 2 MiB) and merged
+ *    where they overlap or touch, per section. Mappings adjacent in host memory always share a view, so a range that spans
+ *    them stays contiguous in one region (boot_render_guest, constant buffer and vertex views need that), as with whole
+ *    blocks. More spans than BOOT_NVN_GR_BUDGET (or the number of sections, if larger): the smallest gaps between spans of a
+ *    section are bridged until they fit, which locks the fewest extra bytes for that count (a section bridged throughout
+ *    is one span, the whole-block case). (Doubling the granule instead merged a section whole as soon as the granule
+ *    reached the spacing of regularly placed pools: 400 pools of 64 KiB 7 MiB apart became one 2.8 GiB span.);
+ *  - a span is served by the smallest live view of its section containing it, unless that view is more than twice the span
+ *    plus 32 MiB; otherwise a new view of the span plus 1/16 of its size (at least a granule) on both sides is opened, so a
+ *    growing span is reopened a logarithmic number of times;
+ *  - views (and whole-block regions of sections) no mapping uses are released right after the next page-table rebuild,
+ *    which waits for the queue (as every rebuild did), so nothing recorded can name them. Unmapped or finalized pools thus
+ *    stop pinning RAM: their pages become ordinary pageable memory. A region table filled meanwhile by old and new views is
+ *    reclaimed at once: the queue is waited for and the views this assignment did not pick are released (the old page
+ *    table they serve is replaced before anything is recorded again);
+ * The page table, the regions' layout (one buffer per region), the shaders and every read and write path are unchanged:
+ * the GPU does exactly the same work, only fewer pages are locked. Not section-backed blocks (the native block,
+ * VirtualAlloc'd memory), a section changed under the assignment, or a view that cannot be opened (region table full, D3D12
+ * failure) fall back to the whole block (counted as fallbacks / failures). The assignment is cached while the mappings, the
+ * sections and the views are unchanged (one hash per submission). The idea is nxport's (MIT; reference/nxport-main,
+ * crates/engine/src/metal/translated.rs pool_buffer_slow / drop_released_pool_buffers): one zero-copy buffer per pool's
+ * page-rounded range, made when the GPU first uses it and dropped when the pool's memory is released. Here the GPU mappings
+ * stand for the pools (shaders reach memory through the page table, not per binding), merged into spans for the 256-region
+ * limit, and released at the rebuild after their mapping goes. */
+#define BOOT_NVN_GR_DEFER (-2)
+#define BOOT_NVN_GR_BUDGET 192u   /* spans (of 256 region slots); a table filled by old and new views is reclaimed (boot_nvn_gr_reclaim) */
+#define BOOT_NVN_GR_SECS 512u
+typedef struct BootNvnGrSec { const uint8_t *host; uint64_t size, gen; HANDLE dup, src; } BootNvnGrSec;
+static BootNvnGrSec boot_nvn_gr_sec[BOOT_NVN_GR_SECS]; static unsigned boot_nvn_gr_nsec;
+static uint64_t boot_nvn_gr_sec_gen, boot_nvn_gr_seen_allocs = UINT64_MAX, boot_nvn_gr_seen_frees = UINT64_MAX;
+typedef struct BootNvnGrEnt { uint64_t so, len, blk_size; uint8_t *blk; uint32_t sec, map; } BootNvnGrEnt;
+typedef struct BootNvnGrSpan { uint64_t a, b, need; uint32_t sec, first, last; } BootNvnGrSpan;
+static BootNvnGrEnt boot_nvn_gr_ent[BOOT_NVN_MAPS]; static uint32_t boot_nvn_gr_ord[BOOT_NVN_MAPS]; static unsigned boot_nvn_gr_n;
+static BootNvnGrSpan boot_nvn_gr_span[BOOT_NVN_MAPS]; static unsigned boot_nvn_gr_nspan;
+typedef struct BootNvnGrGap { uint64_t gap; uint32_t at, pad; } BootNvnGrGap;
+static BootNvnGrGap boot_nvn_gr_gap[BOOT_NVN_MAPS]; static uint8_t boot_nvn_gr_bridge[BOOT_NVN_MAPS];
+static int boot_nvn_gr_reg[BOOT_NVN_MAPS]; static uint64_t boot_nvn_gr_off[BOOT_NVN_MAPS];   /* last assignment, by deferred ordinal */
+static uint64_t boot_nvn_gr_hash, boot_nvn_gr_w; static unsigned boot_nvn_gr_hash_n; static const BootRender *boot_nvn_gr_hash_r;
+static uint32_t boot_nvn_gr_pass, boot_nvn_gr_pick[BOOT_RENDER_MAX_REGIONS];   /* assignment pass that picked the view in a slot */
+static int boot_nvn_gr_best[BOOT_NVN_MAPS];   /* per span: its region */
+/* Region table full while assigning: waits for the queue and releases the views this pass did not pick. Number released. */
+static inline unsigned boot_nvn_gr_reclaim(BootRender *r) {
+    unsigned freed = 0; int quiet = 0;
+    for (unsigned j = 0; j < r->region_count; ++j) {
+        const BootGrView *v = &boot_gr_view[j];
+        if (!v->cpu || v->r != r || r->region_cpu[j] != v->cpu || boot_nvn_gr_pick[j] == boot_nvn_gr_pass) continue;
+        if (!quiet) { if (!boot_render_gpu_quiet(r)) return 0; quiet = 1; }
+        boot_gr_slot_release(r, j); ++freed;
+    }
+    ++boot_gr_st.reclaims;
+    return freed;
+}
+/* The fastmem sections (host view, size, a duplicate of the section handle), copied while the section table cannot change: the
+ * caller holds the kernel lock or is the kernel. A section keeps its generation while its handle names the same object
+ * (CompareObjectHandles); views of a generation no longer listed turn stale (never used again, released at the next rebuild). */
+static inline void boot_nvn_gr_refresh_locked(void) {
+#if TOTK_FASTMEM
+    static BOOL (WINAPI *same)(HANDLE, HANDLE); static int same_init;
+    if (!same_init) { same_init = 1; HMODULE kb = GetModuleHandleA("kernelbase.dll");
+        if (kb) same = (BOOL (WINAPI *)(HANDLE, HANDLE))(void (*)(void))GetProcAddress(kb, "CompareObjectHandles"); }
+    static BootNvnGrSec next[BOOT_NVN_GR_SECS]; unsigned n = 0;
+    for (uint32_t i = 0; i < boot_fm.alloc_count && n < BOOT_NVN_GR_SECS; ++i) {
+        const BootFmAlloc *a = &boot_fm.allocs[i];
+        if (!a->section || a->hwm != a->size) continue;   /* SEC_COMMIT sections only: every page of a view of one is committed */
+        unsigned k = 0;
+        while (k < boot_nvn_gr_nsec && !(boot_nvn_gr_sec[k].dup && boot_nvn_gr_sec[k].host == a->host && boot_nvn_gr_sec[k].size == a->size &&
+                                          boot_nvn_gr_sec[k].src == a->section && same && same(boot_nvn_gr_sec[k].dup, a->section))) ++k;
+        if (k < boot_nvn_gr_nsec) { next[n++] = boot_nvn_gr_sec[k]; boot_nvn_gr_sec[k].dup = NULL; continue; }
+        HANDLE d = NULL;
+        if (!DuplicateHandle(GetCurrentProcess(), a->section, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS) || !d) continue;
+        next[n].host = a->host; next[n].size = a->size; next[n].gen = ++boot_nvn_gr_sec_gen; next[n].dup = d; next[n].src = a->section; ++n;
+    }
+    for (unsigned k = 0; k < boot_nvn_gr_nsec; ++k) if (boot_nvn_gr_sec[k].dup) CloseHandle(boot_nvn_gr_sec[k].dup);   /* views keep a section alive themselves */
+    memcpy(boot_nvn_gr_sec, next, n * sizeof *next); boot_nvn_gr_nsec = n;   /* boot_fm.allocs is sorted by host: so is this */
+    for (unsigned j = 0; j < BOOT_RENDER_MAX_REGIONS; ++j) {
+        BootGrView *v = &boot_gr_view[j];
+        if (!v->cpu || v->stale) continue;
+        unsigned k = 0; while (k < n && boot_nvn_gr_sec[k].gen != v->gen) ++k;
+        if (k == n) { v->stale = 1; ++boot_gr_st.stale; ++boot_gr_vgen; }
+    }
+    boot_nvn_gr_seen_allocs = boot_fm.section_allocs; boot_nvn_gr_seen_frees = boot_fm.section_frees; ++boot_gr_st.refreshes;
+#endif
+}
+/* At the start of a submission's memory sync, when a section was made or freed since the last copy. With TOTK_CORES>1 the
+ * kernel lock is taken as boot_mt_gpu_pack takes it (lock order: kernel lock, then w->lock), before anything is read. */
+static inline void boot_nvn_gr_refresh(BootContext *c, BootWindow *w) {
+#if TOTK_FASTMEM
+    if (__atomic_load_n(&boot_fm.section_allocs, __ATOMIC_ACQUIRE) == boot_nvn_gr_seen_allocs &&
+        __atomic_load_n(&boot_fm.section_frees, __ATOMIC_ACQUIRE) == boot_nvn_gr_seen_frees) return;
+    BootCore *k = boot_mt.active && boot_mt_core_ctx(c) ? (BootCore *)(void *)c : NULL;
+    if (k) {
+        ReleaseSRWLockExclusive(&w->lock);
+        __atomic_store_n(&k->in_guest, 0, __ATOMIC_SEQ_CST);
+        AcquireSRWLockExclusive(&boot_mt.klock);
+        boot_mt.kernel_core = k->index;
+        AcquireSRWLockExclusive(&w->lock);
+    }
+    boot_nvn_gr_refresh_locked();
+    if (k) { c->exclusive_valid = 0; boot_mt.kernel_core = UINT32_MAX; ReleaseSRWLockExclusive(&boot_mt.klock); boot_mt_guest_enter(k); }
+#else
+    (void)c; (void)w;
+#endif
+}
+static inline int boot_nvn_gr_find(const uint8_t *blk, uint64_t size) {   /* section holding [blk, blk + size), or -1 */
+    unsigned lo = 0, hi = boot_nvn_gr_nsec;
+    while (lo < hi) { unsigned mid = lo + (hi - lo) / 2; if (boot_nvn_gr_sec[mid].host <= blk) lo = mid + 1; else hi = mid; }
+    if (!lo) return -1;
+    const BootNvnGrSec *s = &boot_nvn_gr_sec[lo - 1];
+    return blk >= s->host && (uint64_t)(blk - s->host) <= s->size && size <= s->size - (uint64_t)(blk - s->host) ? (int)(lo - 1) : -1;
+}
+static inline int boot_nvn_gr_is_host(const uint8_t *p) {   /* p is the host view base of a listed section */
+    int k = p ? boot_nvn_gr_find(p, 1) : -1;
+    return k >= 0 && boot_nvn_gr_sec[k].host == p;
+}
+static inline int boot_nvn_gr_cmp(const void *x, const void *y) {
+    const uint32_t i = *(const uint32_t *)x, j = *(const uint32_t *)y;
+    const BootNvnGrEnt *a = &boot_nvn_gr_ent[i], *b = &boot_nvn_gr_ent[j];
+    if (a->sec != b->sec) return a->sec < b->sec ? -1 : 1;
+    if (a->so != b->so) return a->so < b->so ? -1 : 1;
+    return i < j ? -1 : i > j;
+}
+/* Spans at granule w over the sorted entries; stored when fill. Returns the count. */
+static inline unsigned boot_nvn_gr_spans(uint64_t w, int fill) {
+    unsigned n = 0; BootNvnGrSpan cur; memset(&cur, 0, sizeof cur); uint64_t ub = 0;
+    for (uint32_t k = 0; k < boot_nvn_gr_n; ++k) {
+        const BootNvnGrEnt *e = &boot_nvn_gr_ent[boot_nvn_gr_ord[k]];
+        const uint64_t ssz = boot_nvn_gr_sec[e->sec].size, end = e->so + e->len;
+        uint64_t ea = e->so / w * w, eb = (end + w - 1) / w * w;
+        if (eb > ssz) eb = ssz;
+        if (!k || e->sec != cur.sec || ea > cur.b) {
+            if (k) { if (fill) { cur.last = k; boot_nvn_gr_span[n] = cur; } ++n; }
+            cur.a = ea; cur.b = eb; cur.sec = e->sec; cur.first = k; cur.need = e->len; ub = end;
+        } else {
+            if (eb > cur.b) cur.b = eb;
+            if (e->so >= ub) { cur.need += e->len; ub = end; } else if (end > ub) { cur.need += end - ub; ub = end; }
+        }
+    }
+    if (boot_nvn_gr_n) { if (fill) { cur.last = boot_nvn_gr_n; boot_nvn_gr_span[n] = cur; } ++n; }
+    if (fill) boot_nvn_gr_nspan = n;
+    return n;
+}
+static inline int boot_nvn_gr_gap_cmp(const void *x, const void *y) {
+    const BootNvnGrGap *a = (const BootNvnGrGap *)x, *b = (const BootNvnGrGap *)y;
+    if (a->gap != b->gap) return a->gap < b->gap ? -1 : 1;
+    return a->at < b->at ? -1 : a->at > b->at;
+}
+/* Sorts the entries and builds the spans at the granule, then bridges the smallest gaps down to the budget. */
+static inline void boot_nvn_gr_build(void) {
+    boot_nvn_gr_w = boot_gr_granule();
+    for (uint32_t k = 0; k < boot_nvn_gr_n; ++k) boot_nvn_gr_ord[k] = k;
+    qsort(boot_nvn_gr_ord, boot_nvn_gr_n, sizeof boot_nvn_gr_ord[0], boot_nvn_gr_cmp);
+    const unsigned n = boot_nvn_gr_spans(boot_nvn_gr_w, 1);
+    unsigned sections = 0, ng = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        if (!i || boot_nvn_gr_span[i].sec != boot_nvn_gr_span[i - 1].sec) { ++sections; continue; }
+        boot_nvn_gr_gap[ng].gap = boot_nvn_gr_span[i].a - boot_nvn_gr_span[i - 1].b; boot_nvn_gr_gap[ng].at = i; boot_nvn_gr_gap[ng].pad = 0; ++ng;
+    }
+    const unsigned budget = sections > BOOT_NVN_GR_BUDGET ? sections : BOOT_NVN_GR_BUDGET;
+    if (n <= budget) return;
+    qsort(boot_nvn_gr_gap, ng, sizeof boot_nvn_gr_gap[0], boot_nvn_gr_gap_cmp);
+    unsigned bridge = n - budget; if (bridge > ng) bridge = ng;
+    memset(boot_nvn_gr_bridge, 0, n);
+    for (unsigned k = 0; k < bridge; ++k) boot_nvn_gr_bridge[boot_nvn_gr_gap[k].at] = 1;
+    unsigned m = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        if (i && boot_nvn_gr_bridge[i]) { BootNvnGrSpan *p = &boot_nvn_gr_span[m - 1]; p->b = boot_nvn_gr_span[i].b; p->need += boot_nvn_gr_span[i].need; p->last = boot_nvn_gr_span[i].last; }
+        else boot_nvn_gr_span[m++] = boot_nvn_gr_span[i];
+    }
+    boot_nvn_gr_nspan = m; boot_gr_st.coarsened += bridge;
+}
+static inline uint64_t boot_nvn_gr_headroom(uint64_t a, uint64_t b) {   /* 1/16 of the span, at least a granule, in granules */
+    const uint64_t w = boot_nvn_gr_w, h = (b - a) / 16;
+    return h <= w ? w : (h + w - 1) / w * w;
+}
+/* Assigns a region and offset to every deferred mapping (maps[].region == BOOT_NVN_GR_DEFER) and folds them into sig. */
+static inline int boot_nvn_gr_assign(BootRender *r, BootNvnMap *maps, uint64_t *sig) {
+    const unsigned n = boot_nvn_gr_n;
+    boot_gr_check(r);
+    uint64_t h = UINT64_C(1469598103934665603) ^ n ^ (boot_gr_vgen << 20) ^ (boot_gr_granule() << 1);
+    for (unsigned k = 0; k < n; ++k) {
+        const BootNvnGrEnt *e = &boot_nvn_gr_ent[k];
+        h = (h ^ e->so) * UINT64_C(1099511628211); h = (h ^ e->len) * UINT64_C(1099511628211);
+        h = (h ^ boot_nvn_gr_sec[e->sec].gen) * UINT64_C(1099511628211);
+    }
+    int cached = boot_nvn_gr_hash_r == r && boot_nvn_gr_hash_n == n && boot_nvn_gr_hash == h;
+    if (!cached) {
+        const int raced = __atomic_load_n(&boot_fm.section_frees, __ATOMIC_ACQUIRE) != boot_nvn_gr_seen_frees;   /* a section went since the copy */
+        boot_nvn_gr_build(); ++boot_nvn_gr_pass;
+        for (unsigned s = 0; s < boot_nvn_gr_nspan; ++s) {   /* 1: spans an existing view serves */
+            const BootNvnGrSpan *sp = &boot_nvn_gr_span[s]; const BootNvnGrSec *sec = &boot_nvn_gr_sec[sp->sec];
+            int best = -1; uint64_t best_size = UINT64_MAX;
+            for (unsigned j = 0; j < r->region_count && !raced; ++j) {
+                const BootGrView *v = &boot_gr_view[j];
+                if (!v->cpu || v->stale || v->gen != sec->gen || v->lo > sp->a || sp->b > v->lo + v->size) continue;
+                if (v->size > 2 * (sp->b - sp->a) + (UINT64_C(32) << 20) || v->size >= best_size) continue;
+                best = (int)j; best_size = v->size;
+            }
+            if (best >= 0) { ++boot_gr_st.reused; boot_render_region_used[best] = 1; boot_nvn_gr_pick[best] = boot_nvn_gr_pass; }
+            boot_nvn_gr_best[s] = best;
+        }
+        for (unsigned s = 0; s < boot_nvn_gr_nspan; ++s) {   /* 2: new views (a full table gives up the views no span picked) */
+            const BootNvnGrSpan *sp = &boot_nvn_gr_span[s]; const BootNvnGrSec *sec = &boot_nvn_gr_sec[sp->sec];
+            int best = boot_nvn_gr_best[s];
+            if (best < 0 && !raced) {
+                const uint64_t room = boot_nvn_gr_headroom(sp->a, sp->b);
+                uint64_t a = sp->a > room ? sp->a - room : 0, b = sp->b + room < sec->size ? sp->b + room : sec->size;
+                a &= ~UINT64_C(0xffff); b = (b + 0xfff) & ~UINT64_C(0xfff);
+                best = boot_gr_view_open(r, sec->dup, a, b - a, sec->gen);
+                if (best < 0 && r->region_count == BOOT_RENDER_MAX_REGIONS && boot_nvn_gr_reclaim(r)) best = boot_gr_view_open(r, sec->dup, a, b - a, sec->gen);
+                if (best >= 0) boot_nvn_gr_pick[best] = boot_nvn_gr_pass;
+            }
+            for (uint32_t k = sp->first; k < sp->last; ++k) {
+                const uint32_t q = boot_nvn_gr_ord[k]; const BootNvnGrEnt *e = &boot_nvn_gr_ent[q];
+                if (best >= 0) { boot_nvn_gr_reg[q] = best; boot_nvn_gr_off[q] = e->so - boot_gr_view[best].lo; continue; }
+                int idx = boot_render_region(r, e->blk, e->blk_size);   /* fallback: the whole block, as with TOTK_GPU_RESIDENT=0 */
+                if (idx < 0) { boot_draw_log("nvn native: region (gpu-resident fallback) %s %llu %llu", r->error, (uint64_t)(uintptr_t)e->blk, e->blk_size); return 0; }
+                boot_nvn_gr_reg[q] = idx; boot_nvn_gr_off[q] = e->so - (uint64_t)(e->blk - sec->host); ++boot_gr_st.fallbacks;
+            }
+        }
+        boot_nvn_gr_hash_r = r; boot_nvn_gr_hash_n = n;
+        boot_nvn_gr_hash = UINT64_C(1469598103934665603) ^ n ^ (boot_gr_vgen << 20) ^ (boot_gr_granule() << 1);   /* views opened above changed the generation */
+        for (unsigned k = 0; k < n; ++k) {
+            const BootNvnGrEnt *e = &boot_nvn_gr_ent[k];
+            boot_nvn_gr_hash = (boot_nvn_gr_hash ^ e->so) * UINT64_C(1099511628211); boot_nvn_gr_hash = (boot_nvn_gr_hash ^ e->len) * UINT64_C(1099511628211);
+            boot_nvn_gr_hash = (boot_nvn_gr_hash ^ boot_nvn_gr_sec[e->sec].gen) * UINT64_C(1099511628211);
+        }
+        if (raced) boot_nvn_gr_hash_n = UINT32_MAX;   /* never taken: the next submission copies the sections and assigns again */
+    }
+    for (unsigned k = 0; k < n; ++k) {
+        const BootNvnGrEnt *e = &boot_nvn_gr_ent[k]; BootNvnMap *m = &maps[e->map];
+        m->region = boot_nvn_gr_reg[k]; m->off = boot_nvn_gr_off[k]; boot_render_region_used[m->region] = 1;
+        *sig = (*sig ^ m->gpu) * UINT64_C(1099511628211); *sig = (*sig ^ m->off) * UINT64_C(1099511628211);
+        *sig = (*sig ^ m->size) * UINT64_C(1099511628211); *sig = (*sig ^ (uint64_t)m->region) * UINT64_C(1099511628211);
+    }
+    return 1;
+}
+/* After a page-table rebuild (the queue was waited for, or nothing was ever submitted): releases views and whole-block regions of
+ * sections that no mapping uses, and takes the numbers of the perf3 part. */
+static inline void boot_nvn_gr_rebuilt(BootRender *r, const BootNvnMap *maps, unsigned count, int mode) {
+    ++boot_gr_st.rebuilds; boot_gr_st.mode = (uint32_t)mode;
+    boot_gr_st.budget = BOOT_NVN_GR_BUDGET; boot_gr_st.mappings = count; boot_gr_st.deferred = boot_nvn_gr_n;
+    if (!boot_nvn_gr_n) boot_nvn_gr_nspan = 0;   /* no mapping in a section: no spans (the last build is of other mappings) */
+    if (mode == 1) {
+        int quiet = 0;
+        for (unsigned j = 0; j < r->region_count; ++j) {
+            if (boot_render_region_used[j] || !r->region_cpu[j]) continue;
+            const BootGrView *v = &boot_gr_view[j];
+            if (!(v->cpu && v->r == r && r->region_cpu[j] == v->cpu) && !boot_nvn_gr_is_host(r->region_cpu[j])) continue;
+            if (!quiet) { if (!boot_render_gpu_quiet(r)) return; quiet = 1; }   /* normally idle already: the rebuild waited */
+            boot_gr_slot_release(r, j);
+        }
+    } else {
+        boot_nvn_gr_build();   /* dry run: what the views would open */
+    }
+    /* numbers: what is opened (D3D12 locks the whole allocation of a whole-block region), what that locks (overlaps once), what the
+     * mappings need, and what opening their blocks whole locks */
+    static uint64_t seen[BOOT_RENDER_MAX_REGIONS]; unsigned nseen = 0;
+    uint32_t views = 0, wholes = 0; uint64_t vb = 0, wb = 0, res = 0, today = 0, stale_b = 0, mapped = 0, would = 0;
+    static struct { uint64_t gen, a, b; } iv[BOOT_RENDER_MAX_REGIONS]; unsigned niv = 0;
+    for (unsigned j = 0; j < r->region_count; ++j) {
+        if (!r->region[j]) continue;
+        const BootGrView *v = &boot_gr_view[j];
+        if (v->cpu && v->r == r && r->region_cpu[j] == v->cpu) {
+            ++views; vb += v->size; if (v->stale) stale_b += v->size;
+            iv[niv].gen = v->gen; iv[niv].a = v->lo; iv[niv].b = v->lo + v->size; ++niv;
+            continue;
+        }
+        int k = boot_nvn_gr_find(r->region_cpu[j], 1);
+        uint64_t sz = k >= 0 && boot_nvn_gr_sec[k].host == r->region_cpu[j] ? boot_nvn_gr_sec[k].size : r->region_size[j];
+        ++wholes; wb += sz;
+        if (k >= 0 && boot_nvn_gr_sec[k].host == r->region_cpu[j]) { iv[niv].gen = boot_nvn_gr_sec[k].gen; iv[niv].a = 0; iv[niv].b = sz; ++niv; }
+        else res += sz;
+    }
+    for (unsigned i = 1; i < niv; ++i) {   /* by (section, start) */
+        __typeof__(iv[0]) t = iv[i]; unsigned q = i;
+        while (q && (iv[q - 1].gen > t.gen || (iv[q - 1].gen == t.gen && iv[q - 1].a > t.a))) { iv[q] = iv[q - 1]; --q; }
+        iv[q] = t;
+    }
+    for (unsigned i = 0; i < niv;) {
+        uint64_t a = iv[i].a, b = iv[i].b; const uint64_t gen = iv[i].gen; ++i;
+        while (i < niv && iv[i].gen == gen && iv[i].a <= b) { if (iv[i].b > b) b = iv[i].b; ++i; }
+        res += b - a;
+    }
+    for (unsigned s = 0; s < boot_nvn_gr_nspan; ++s) {
+        const BootNvnGrSpan *sp = &boot_nvn_gr_span[s]; mapped += sp->need;
+        const uint64_t room = boot_nvn_gr_headroom(sp->a, sp->b), ssz = boot_nvn_gr_sec[sp->sec].size;
+        would += (sp->b + room < ssz ? sp->b + room : ssz) - (sp->a > room ? (sp->a - room) & ~UINT64_C(0xffff) : 0);
+        unsigned q = 0; while (q < nseen && seen[q] != boot_nvn_gr_sec[sp->sec].gen) ++q;
+        if (q == nseen && nseen < BOOT_RENDER_MAX_REGIONS) { seen[nseen++] = boot_nvn_gr_sec[sp->sec].gen; today += ssz; }
+    }
+    boot_gr_st.sections = nseen;
+    uint8_t other[BOOT_RENDER_MAX_REGIONS]; memset(other, 0, sizeof other);   /* 1: a region of another block (opened whole either way); 2: counted */
+    for (unsigned j = 0; j < r->region_count; ++j) {
+        const BootGrView *v = &boot_gr_view[j];
+        other[j] = r->region[j] && !(v->cpu && v->r == r && r->region_cpu[j] == v->cpu) && !boot_nvn_gr_is_host(r->region_cpu[j]);
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        const int j = maps[i].region;
+        if (j < 0 || (unsigned)j >= r->region_count || !other[j]) continue;
+        mapped += maps[i].size;   /* overlaps of these few counted twice */
+        if (other[j] == 1) { other[j] = 2; today += r->region_size[j]; }
+    }
+    boot_gr_st.spans = boot_nvn_gr_nspan; boot_gr_st.views = views; boot_gr_st.wholes = wholes; boot_gr_st.view_bytes = vb; boot_gr_st.whole_bytes = wb;
+    boot_gr_st.resident_bytes = res; boot_gr_st.mapped_bytes = mapped; boot_gr_st.today_bytes = today; boot_gr_st.would_bytes = would; boot_gr_st.stale_bytes = stale_b;
+    boot_gr_st.granule = boot_nvn_gr_w ? boot_nvn_gr_w : boot_gr_granule();
+    if (boot_gr_st.rebuilds <= 8 || boot_gr_st.rebuilds % 200 == 0) {
+        FILE *lf = fopen("draw-path.log", "a");
+        if (lf) {
+            fprintf(lf, "gpu-resident: rebuild %llu (mode %d, granule %llu KiB): %u mappings, %u in sections, %u spans; per section (host, MiB, mapped MiB, spans):",
+                    (unsigned long long)boot_gr_st.rebuilds, mode, (unsigned long long)(boot_gr_st.granule >> 10), count, boot_nvn_gr_n, boot_nvn_gr_nspan);
+            unsigned shown = 0;
+            for (unsigned s = 0; s < boot_nvn_gr_nspan && shown < 24;) {
+                const uint32_t sec = boot_nvn_gr_span[s].sec; uint64_t need = 0; unsigned ns = 0;
+                while (s < boot_nvn_gr_nspan && boot_nvn_gr_span[s].sec == sec) { need += boot_nvn_gr_span[s].need; ++ns; ++s; }
+                fprintf(lf, " [%p %llu %.1f %u]", (const void *)boot_nvn_gr_sec[sec].host, (unsigned long long)(boot_nvn_gr_sec[sec].size >> 20), (double)need / 1048576.0, ns); ++shown;
+            }
+            fputc('\n', lf); fclose(lf);
+        }
+    }
+}
+/* suspect-diag (host_gpu_render.h, top), S3: canonical host pointer of each mapping of the last boot_nvn_exec_memory (by its
+ * index in maps[]): the guest region's host bytes at the mapping's CPU address, which every view and whole block aliases. */
+static const uint8_t **boot_sd_map_host;
+static inline void boot_sd_map_note(unsigned i, const uint8_t *host) {
+    if (!boot_sd_map_host) boot_sd_map_host = (const uint8_t **)calloc(BOOT_NVN_MAPS, sizeof *boot_sd_map_host);
+    if (boot_sd_map_host && i < BOOT_NVN_MAPS) boot_sd_map_host[i] = host;
+}
+/* Copies n bytes at p into out without touching unmapped memory (another thread may release guest memory meanwhile). */
+static inline int boot_sd_safe_read(const void *p, void *out, size_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), p, out, n, &got) && got == n;
+}
+static inline uint32_t boot_sd_mix32(uint64_t a, uint64_t b) { uint64_t h = (a * UINT64_C(0x9E3779B97F4A7C15)) ^ (b + UINT64_C(0x632BE59BD9B4E019)); h ^= h >> 29; h *= UINT64_C(0xBF58476D1CE4E5B9); return (uint32_t)(h >> 32); }
+/* S3, when due (every TOTK_SUSPECT_DIAG_GR_EVERY presents) and the page table describes maps[0, count) (renderer lock held):
+ * sampled pages of the mappings, round-robin from a cursor, within ~0.4 ms. For each: the page-table entry (CPU table and the
+ * GPU's copy) against the mapping's region / offset, and the 4 KiB behind the entry (what the GPU reads: region view + offset)
+ * against the same guest bytes through the canonical host view; a difference is read again twice before it counts. Then one
+ * page of up to 4 open span views against their section's host view. */
+static inline void boot_sd_gr_check(BootRender *r, const BootNvnMap *maps, unsigned count) {
+    BootSdState *S = boot_sd_state();
+    if (!S || !S->gr_due || !boot_sd_map_host || !count || !r->ptable_cpu || !boot_render_pt_gpu) return;
+    S->gr_due = 0; ++S->c.gr_checks;
+    LARGE_INTEGER q0, qn; QueryPerformanceCounter(&q0);
+    const uint64_t limit = S->qpf * 4 / 10000;   /* 0.4 ms */
+    static uint8_t a[4096], b[4096];
+    unsigned k = 0, pages = 0;
+    for (; k < count && pages < S->gr_pages_max; ++k) {
+        const unsigned i = (S->gr_cursor + k) % count; const BootNvnMap *m = &maps[i]; const uint8_t *host = boot_sd_map_host[i];
+        if (!host || !m->size || m->region < 0) continue;
+        if ((k & 7) == 7) { QueryPerformanceCounter(&qn); if ((uint64_t)(qn.QuadPart - q0.QuadPart) > limit) break; }
+        const uint64_t np = (m->size + 0xfff) >> 12, x = (uint64_t)(boot_sd_mix32(S->c.gr_checks, i) % np) << 12;
+        const uint64_t gpu = m->gpu + x; uint64_t len = m->size - x < 4096 ? m->size - x : 4096;
+        if ((gpu >> 12) < r->va_base_page || (gpu >> 12) - r->va_base_page >= r->ptable_pages) { ++S->c.gr_unmapped; continue; }
+        const uint64_t page = (gpu >> 12) - r->va_base_page;
+        const uint32_t pte = r->ptable_cpu[page], gpte = boot_render_pt_gpu[page];
+        const uint32_t want = ((uint32_t)m->region << 24) | (uint32_t)((m->off + x) >> 12);
+        ++pages; ++S->c.gr_pages;
+        if (pte != gpte) {
+            ++S->c.gr_ptcopy;
+            if (S->ev_s3 < S->events_max) { ++S->ev_s3; boot_sd_event(S, "S3 PAGE TABLE COPY frame %llu sub %llu: gpu %llx (mapping %u gpu %llx size %llx): CPU entry %08x, GPU copy %08x",
+                (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, (unsigned long long)gpu, i, (unsigned long long)m->gpu, (unsigned long long)m->size, pte, gpte); }
+        }
+        if (pte == 0xffffffffu || (pte >> 24) >= r->region_count || !r->region_cpu[pte >> 24]) {
+            ++S->c.gr_unmapped;
+            if (S->ev_s3 < S->events_max) { ++S->ev_s3; boot_sd_event(S, "S3 UNMAPPED frame %llu sub %llu: gpu %llx (mapping %u gpu %llx size %llx region %d off %llx): entry %08x, expected %08x",
+                (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, (unsigned long long)gpu, i, (unsigned long long)m->gpu, (unsigned long long)m->size,
+                m->region, (unsigned long long)m->off, pte, want); }
+            continue;
+        }
+        const unsigned reg = pte >> 24; const uint64_t roff = (uint64_t)(pte & 0xffffff) << 12;
+        if (roff >= r->region_size[reg]) { ++S->c.gr_unmapped; continue; }
+        if (len > r->region_size[reg] - roff) len = r->region_size[reg] - roff;
+        int same = 0, tries = 0, readable = 1;
+        for (; tries < 3 && !same; ++tries) {
+            if (!boot_sd_safe_read(r->region_cpu[reg] + roff, a, (size_t)len) || !boot_sd_safe_read(host + x, b, (size_t)len)) { readable = 0; break; }
+            same = !memcmp(a, b, (size_t)len);
+        }
+        if (!readable) { ++S->c.gr_unreadable; continue; }
+        S->c.gr_bytes += len;
+        if (pte != want) { ++S->c.gr_ptother; if (same) ++S->c.gr_ptother_eq; }
+        if (same) continue;
+        ++S->c.gr_mismatch;
+        if (S->ev_s3 < S->events_max) {
+            unsigned at = 0; while (at < len && a[at] == b[at]) ++at;
+            const BootGrView *v = &boot_gr_view[reg]; const int view = v->cpu && v->cpu == r->region_cpu[reg];
+            uint32_t ga = 0, ha = 0; if (at + 4 <= len) { memcpy(&ga, a + at, 4); memcpy(&ha, b + at, 4); }
+            ++S->ev_s3;
+            boot_sd_event(S, "S3 BYTE MISMATCH frame %llu sub %llu: gpu %llx (mapping %u gpu %llx size %llx, assigned region %d off %llx) entry %08x (expected %08x) -> region %u %s "
+                             "(view section offset %llx, size %llx, gen %llu%s) + %llx: first difference at +%u: GPU side %08x, host view %08x (host %p)",
+                           (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, (unsigned long long)gpu, i, (unsigned long long)m->gpu, (unsigned long long)m->size,
+                           m->region, (unsigned long long)m->off, pte, want, reg, view ? "span view" : "whole block", view ? (unsigned long long)v->lo : 0ull,
+                           view ? (unsigned long long)v->size : 0ull, view ? (unsigned long long)v->gen : 0ull, view && v->stale ? ", stale" : "",
+                           (unsigned long long)roff, at, ga, ha, (const void *)(host + x));
+        }
+    }
+    S->gr_cursor = (S->gr_cursor + k) % count;
+    for (unsigned n = 0, j = 0; j < BOOT_RENDER_MAX_REGIONS && n < 4; ++j) {   /* span views against their section's host view */
+        const unsigned s = (S->gr_vcursor + j) % BOOT_RENDER_MAX_REGIONS; const BootGrView *v = &boot_gr_view[s];
+        if (!v->cpu || v->stale || v->r != r || s >= r->region_count || r->region_cpu[s] != v->cpu || v->size < 4096) continue;
+        ++n;
+        unsigned q = 0; while (q < boot_nvn_gr_nsec && boot_nvn_gr_sec[q].gen != v->gen) ++q;
+        if (q == boot_nvn_gr_nsec) { ++S->c.gr_nosec; continue; }
+        const uint64_t o = (uint64_t)(boot_sd_mix32(S->c.gr_checks, s + 7777u) % (v->size >> 12)) << 12;
+        if (v->lo + o + 4096 > boot_nvn_gr_sec[q].size) continue;
+        int same = 0, readable = 1;
+        for (int tries = 0; tries < 3 && !same; ++tries) {
+            if (!boot_sd_safe_read(v->cpu + o, a, 4096) || !boot_sd_safe_read(boot_nvn_gr_sec[q].host + v->lo + o, b, 4096)) { readable = 0; break; }
+            same = !memcmp(a, b, 4096);
+        }
+        if (!readable) { ++S->c.gr_unreadable; continue; }
+        ++S->c.gr_views; S->c.gr_bytes += 4096;
+        if (same) continue;
+        ++S->c.gr_mismatch;
+        if (S->ev_s3 < S->events_max) { ++S->ev_s3; boot_sd_event(S, "S3 VIEW MISMATCH frame %llu sub %llu: span view in region %u (section gen %llu offset %llx size %llx) + %llx differs from the section's host view %p",
+            (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, s, (unsigned long long)v->gen, (unsigned long long)v->lo, (unsigned long long)v->size,
+            (unsigned long long)o, (const void *)(boot_nvn_gr_sec[q].host + v->lo + o)); }
+    }
+    S->gr_vcursor = (S->gr_vcursor + 5) % BOOT_RENDER_MAX_REGIONS;
+    QueryPerformanceCounter(&qn); const uint64_t took = (uint64_t)(qn.QuadPart - q0.QuadPart);
+    S->c.gr_qpc += took; if (took > S->c.gr_maxq) S->c.gr_maxq = took;
+}
+/* S1 at the end of a submit call (host_nvn.h boot_nvn_queue_submit, before the call's pins go): the re-hash under the renderer
+ * lock, with the versions kept and the recordings replaced since the previous call's end. */
+static inline void boot_sd_call_end(BootContext *c) {
+    if (!boot_sd_on()) return;
+    BootWindow *w = (BootWindow *)(uintptr_t)c->window_native;
+    if (!w) return;
+    AcquireSRWLockExclusive(&w->lock);
+    BootSdState *S = w->render ? boot_sd_state() : NULL;
+    if (S) {
+        const uint64_t kept = (uint64_t)__atomic_load_n(&boot_nvn_rv.n[BOOT_NVN_RV_KEPT], __ATOMIC_RELAXED);
+        const uint64_t re = (uint64_t)__atomic_load_n(&boot_nvn_sub.rerecords, __ATOMIC_RELAXED);
+        if (!S->c.calls) { S->last_kept = kept; S->last_rerecords = re; }   /* the first call: counted from here */
+        boot_sd_recheck(w->render, kept - S->last_kept, re - S->last_rerecords);
+        S->last_kept = kept; S->last_rerecords = re;
+    }
+    ReleaseSRWLockExclusive(&w->lock);
+}
+/* data-snapshot (host_gpu_render.h, the design note before host_gpu_render_draw.h): the parts that need the window, the GPU
+ * mappings and deferred compute. */
+/* Deferred dispatches recorded since the last sync (boot_compute_pending_list only grows between idles): their learnt store ranges
+ * join the pending GPU writes (each program once per idle; narrowed to the pages compute has stored to, boot_ds_pend_compute). A
+ * program whose ranges overflowed ("wide") is never deferred (boot_compute_can_defer), so it completed before anything later. */
+static void boot_ds_compute_sync_nvn(void) {
+    if (boot_compute_pending < boot_ds_cp_synced) { boot_ds_cp_synced = 0; boot_ds_cp_nseen = 0; }   /* (the idle resets both) */
+    for (unsigned k = boot_ds_cp_synced; k < boot_compute_pending; ++k) {
+        const BootComputeWrites *w = boot_compute_pending_list[k];
+        unsigned j = 0; while (j < boot_ds_cp_nseen && boot_ds_cp_seen[j] != (const void *)w) ++j;
+        if (j < boot_ds_cp_nseen) continue;
+        if (boot_ds_cp_nseen < 64) boot_ds_cp_seen[boot_ds_cp_nseen++] = w;
+        if (w->wide) { boot_ds_pend_over(&boot_ds_pend, BOOT_DS_P_COMPUTE, BOOT_DS_OVF_WIDE); continue; }
+        for (uint32_t i = 0; i < w->count; ++i) boot_ds_pend_compute(w->va[i], w->size[i]);
+    }
+    boot_ds_cp_synced = boot_compute_pending;
+}
+/* After a page-table rebuild of the native path (boot_nvn_exec_memory, queue idle): the class of every GPU mapping of the
+ * address space from the NVN memory pool holding its CPU address, the executor's block, and the copy arena behind the driver
+ * buffer in that block. */
+static inline void boot_ds_remapped(BootRender *r, BootWindow *w, uint32_t as_fd, uint8_t *block, uint64_t block_va, uint64_t block_bytes) {
+    if (!boot_ds_on()) return;
+    boot_ds_compute_sync = boot_ds_compute_sync_nvn; boot_ds_cp_count = &boot_compute_pending;   /* (pend_sync calls it only when that moved) */
+    if (boot_ds_map_begin(r)) {
+        uint32_t n = 0; BootDsPool *sorted = boot_ds_pools_sorted(&n);
+        for (unsigned i = 0; i < BOOT_GPU_MAPPING_CAPACITY; ++i) {
+            const BootGpuMapping *m = &w->gpu_mappings.entries[i];
+            if (!m->size || m->as_fd != as_fd || !m->cpu) continue;
+            const uint64_t backing = boot_gpu_mapping_backing_size(m);
+            if (backing) boot_ds_map_class(m->gpu, m->cpu, backing, sorted, n);
+        }
+        free(sorted);
+    }
+    boot_ds_map_done(block, block_va, block_bytes, BOOT_NVN_NATIVE_BLOCK);
+}
+/* End of a submit call (host_nvn.h boot_nvn_queue_submit): the detector's check under the window lock. */
+static inline void boot_ds_call_end(BootContext *c) {
+    if (!boot_ds_on()) return;
+    BootWindow *w = (BootWindow *)(uintptr_t)c->window_native;
+    if (!w) return;
+    AcquireSRWLockExclusive(&w->lock);
+    if (w->render) boot_ds_call_done(w->render);
+    ReleaseSRWLockExclusive(&w->lock);
+}
 static inline int boot_nvn_exec_memory(BootContext *c, BootWindow *w, BootNvnExec *e) {
+    const int gr = boot_gr_mode();   /* gpu-resident: the section copy first (it may take the kernel lock, as the pack below) */
+    if (gr) { boot_nvn_gr_refresh(c, w); boot_nvn_gr_n = 0; }
     BootRender *r = w->render;
     static BootNvnMap maps[BOOT_NVN_MAPS]; unsigned count = 0;
     uint64_t lo = UINT64_MAX, hi = 0; uint32_t as_fd = UINT32_MAX;
@@ -275,7 +803,7 @@ static inline int boot_nvn_exec_memory(BootContext *c, BootWindow *w, BootNvnExe
         if (!packed) { boot_draw_log("nvn native: GPU arena allocation failed%s %llu %llu", "", lo, hi); return 0; }
     }
     if (!e->block) {
-        e->block = VirtualAlloc(NULL, BOOT_NVN_NATIVE_BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        e->block = VirtualAlloc(NULL, boot_nvn_block_bytes(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   /* data-snapshot: + the copy arena */
         if (!e->block) return 0;
     }
     uint64_t block_va = (hi + 0xffff) & ~UINT64_C(0xffff);
@@ -301,32 +829,44 @@ static inline int boot_nvn_exec_memory(BootContext *c, BootWindow *w, BootNvnExe
         const Region *g = &c->regions[k];
         uint8_t *blk = g->data; uint64_t blk_size = g->size;
         if (g->reserved != 3 && !(g->reserved == 1 && boot_gpu_block(g->data, g->size, &blk, &blk_size))) continue;   /* not GPU-shareable */
-        int idx = boot_render_region(r, blk, blk_size);
-        if (idx < 0) { boot_draw_log("nvn native: region %s %llu %llu", r->error, g->base, g->size); return 0; }
+        const int gs = gr ? boot_nvn_gr_find(blk, blk_size) : -1;   /* gpu-resident: a section block's region is assigned after the loop */
+        int idx = gs >= 0 && gr == 1 ? BOOT_NVN_GR_DEFER : boot_render_region(r, blk, blk_size);
+        if (idx < 0 && idx != BOOT_NVN_GR_DEFER) { boot_draw_log("nvn native: region %s %llu %llu", r->error, g->base, g->size); return 0; }
         uint64_t off = (uint64_t)(g->data - blk) + (m->cpu - g->base);
         if (backing > g->size - (m->cpu - g->base)) backing = g->size - (m->cpu - g->base);
         if (count == BOOT_NVN_MAPS) { boot_draw_log("nvn native: too many GPU mappings%s %llu %llu", "", count, 0); return 0; }
+        if (gs >= 0) {   /* gpu-resident: its section bytes */
+            BootNvnGrEnt *ge = &boot_nvn_gr_ent[boot_nvn_gr_n++];
+            ge->so = (uint64_t)(blk - boot_nvn_gr_sec[gs].host) + off; ge->len = backing ? backing : 1; ge->blk = blk; ge->blk_size = blk_size;
+            ge->sec = (uint32_t)gs; ge->map = count;
+        }
+        if (boot_sd_on()) boot_sd_map_note(count, g->data + (m->cpu - g->base));   /* suspect-diag S3: the mapping's canonical host bytes */
         maps[count++] = (BootNvnMap){m->gpu, off, backing, idx};
+        if (idx == BOOT_NVN_GR_DEFER) continue;   /* folded into sig once assigned */
         sig = (sig ^ m->gpu) * UINT64_C(1099511628211); sig = (sig ^ off) * UINT64_C(1099511628211);
         sig = (sig ^ backing) * UINT64_C(1099511628211); sig = (sig ^ (uint64_t)idx) * UINT64_C(1099511628211);
     }
-    int idx = boot_render_region(r, e->block, BOOT_NVN_NATIVE_BLOCK);
+    if (gr == 1 && boot_nvn_gr_n && !boot_nvn_gr_assign(r, maps, &sig)) return 0;   /* gpu-resident: views of the GPU-mapped spans */
+    int idx = boot_render_region(r, e->block, boot_nvn_block_bytes());
     if (idx < 0) { boot_draw_log("nvn native: native block%s %llu %llu", r->error, 0, 0); return 0; }
     sig = (sig ^ (uint64_t)idx) * UINT64_C(1099511628211);
-    if (e->mapped && sig == e->map_sig && r->ptable_cpu) return 1;
+    if (e->mapped && sig == e->map_sig && r->ptable_cpu) { if (boot_sd_on()) boot_sd_gr_check(r, maps, count); return 1; }   /* suspect-diag S3 */
     if (e->mapped && !boot_render_idle(r)) return 0;   /* earlier submissions read the old table */
     e->mapped = 0; ++e->remaps;
     e->block_va = block_va;
-    if (!boot_render_ptable(r, lo & ~UINT64_C(0xfff), e->block_va + BOOT_NVN_NATIVE_BLOCK)) { boot_draw_log("nvn native: page table %s %llu %llu", r->error, lo, hi); return 0; }
+    if (!boot_render_ptable(r, lo & ~UINT64_C(0xfff), e->block_va + boot_nvn_block_bytes())) { boot_draw_log("nvn native: page table %s %llu %llu", r->error, lo, hi); return 0; }
     memset(boot_render_region_used, 0, sizeof boot_render_region_used);
     for (unsigned i = 0; i < count; ++i) {
         boot_render_region_used[maps[i].region] = 1;
         if (!boot_render_map(r, maps[i].gpu, (unsigned)maps[i].region, maps[i].off, maps[i].size)) return 0;
     }
     boot_render_region_used[idx] = 1;
-    if (!boot_render_map(r, e->block_va, (unsigned)idx, 0, BOOT_NVN_NATIVE_BLOCK)) { boot_draw_log("nvn native: native block%s %llu %llu", r->error, 0, 0); return 0; }
+    if (!boot_render_map(r, e->block_va, (unsigned)idx, 0, boot_nvn_block_bytes())) { boot_draw_log("nvn native: native block%s %llu %llu", r->error, 0, 0); return 0; }
+    if (gr) boot_nvn_gr_rebuilt(r, maps, count, gr);   /* gpu-resident: views no mapping uses are released (the queue is idle), perf3 numbers */
     e->block_region = idx;
     e->map_sig = sig; e->mapped = 1;
+    boot_ds_remapped(r, w, as_fd, e->block, e->block_va, boot_nvn_block_bytes());   /* data-snapshot: pool classes, the copy arena */
+    if (boot_sd_on()) boot_sd_gr_check(r, maps, count);   /* suspect-diag S3 */
     return 1;
 }
 
@@ -498,7 +1038,7 @@ typedef struct BootNvnStateMemo {
     const BootDrawState *s; const BootCbufBinding *cb; int valid, clipped;
     BootNvnProgram prog; int has_prog;
     BootColorTarget rt[8]; uint32_t rt_count, channel_mask; BootDepthTarget zt;
-    int32_t vp[16][4]; float depth_range[16][2]; int32_t scissor[16][4]; uint32_t origin_upper_left, depth_mode;
+    float vp[16][4]; float depth_range[16][2]; int32_t scissor[16][4]; uint32_t origin_upper_left, depth_mode;
     uint64_t tex_pool, smp_pool; uint32_t tex_count, smp_count;
     uint32_t vattr[16], n_vattr, vstride[16], vdivisor[16], n_vstream; uint64_t vbuf[16], vbuf_size[16];
     uint8_t ds[8]; uint32_t stencil_ref, stencil_mask, stencil_vmask, polygon; float poly_offset[3]; uint32_t color;
@@ -528,6 +1068,9 @@ static inline void boot_nvn_st_targets(const BootNvnExec *e, BootDrawState *s) {
     }
     s->zt = e->zt;
 }
+/* batch-3 N10: a viewport coordinate (float: SetViewports keeps fractions) as the nearest integer for the integer copies;
+ * exact for the integral values SetViewport and TOTK_VIEWPORT_FLOAT=0 store. */
+static inline uint32_t boot_nvn_vp_int(float f) { return (uint32_t)(int32_t)(f < 0 ? f - 0.5f : f + 0.5f); }
 static inline void boot_nvn_st_viewports(const BootNvnExec *e, BootDrawState *s) {
     /* viewports, scissors (NVN window origin upper left: window y grows down, scale_y negative) */
     for (unsigned j = 0; j < 16; ++j) {
@@ -537,7 +1080,7 @@ static inline void boot_nvn_st_viewports(const BootNvnExec *e, BootDrawState *s)
         v->scale[0] = w / 2; v->offset[0] = x + w / 2;
         v->scale[1] = e->origin_upper_left ? -h / 2 : h / 2; v->offset[1] = y + h / 2;
         if (e->depth_mode) { v->scale[2] = f - n; v->offset[2] = n; } else { v->scale[2] = (f - n) / 2; v->offset[2] = (n + f) / 2; }
-        v->x = (uint32_t)e->vp[j][0]; v->y = (uint32_t)e->vp[j][1]; v->w = (uint32_t)e->vp[j][2]; v->h = (uint32_t)e->vp[j][3];
+        v->x = boot_nvn_vp_int(e->vp[j][0]); v->y = boot_nvn_vp_int(e->vp[j][1]); v->w = boot_nvn_vp_int(e->vp[j][2]); v->h = boot_nvn_vp_int(e->vp[j][3]);
         v->min_z = n < f ? n : f; v->max_z = n < f ? f : n;
         BootScissor *sc = &s->scissor[j];
         sc->enabled = 1; sc->x0 = (uint32_t)e->scissor[j][0]; sc->y0 = (uint32_t)e->scissor[j][1];
@@ -565,7 +1108,9 @@ static inline void boot_nvn_st_vertex(const BootNvnExec *e, BootDrawState *s) {
         if (i >= e->n_vattr) { a->inactive = 1; continue; }
         uint32_t wv = e->vattr[i], size = 0, type = 0;
         a->stream = wv & 31; a->offset = (wv >> 7) & 0x3fff;
-        if (!boot_nvn_vertex_format(wv >> 21, &size, &type)) { a->inactive = 1; continue; }
+        int known = boot_nvn_vertex_format(wv >> 21, &size, &type);
+        boot_nvn_vertex_format_note(wv >> 21, i, known);   /* batch-3 K3 diagnostic */
+        if (!known) { a->inactive = 1; continue; }
         a->size = size; a->type = type;
     }
 }
@@ -602,6 +1147,7 @@ static inline int boot_nvn_st_fixed(const BootNvnExec *e, BootDrawState *s) {
 static inline void boot_nvn_st_buffers(BootCbufBinding cbufs[5][18], const BootNvnExec *e, const BootNvnProgramStage *vs, const BootNvnProgramStage *ps) {
     /* constant buffers per bind group */
     boot_nvn_zero(cbufs, sizeof(BootCbufBinding) * 5 * 18);
+    boot_ds_bind_of = cbufs; ++boot_ds_bind_gen;   /* data-snapshot v2fix: the plan re-reads the rows only after a rebuild (boot_ds_cb_plan) */
     for (unsigned stage = 0; stage < 2; ++stage) {
         const BootNvnProgramStage *ps2 = stage ? ps : vs;
         if (!ps2) continue;
@@ -678,5 +1224,103 @@ static inline int boot_nvn_exec_state(BootNvnExec *e, BootDrawState *s, BootCbuf
 }
 #undef BOOT_NVN_SAME
 #undef BOOT_NVN_KEEP
+/* batch-3 N10: nvnCommandBufferSetViewports takes float rectangles. The hardware viewport transform is float and so is
+ * D3D12's (boot_render_viewport_map, from the float scale and offset of boot_nvn_st_viewports), so they are kept as
+ * given and only the integer copies (BootViewport x/y/w/h) are rounded. Before, (int32_t) truncated them: a size such as
+ * 959.9999 from float maths lost a pixel. nxport (MIT, crates/engine/src/nvn/cmd.rs:518-536) rounds them.
+ * TOTK_VIEWPORT_FLOAT=0: truncated, as before. */
+static inline void boot_nvn_viewport_store(BootNvnExec *e, uint32_t j, const float f[4]) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD n = GetEnvironmentVariableA("TOTK_VIEWPORT_FLOAT", v, sizeof v); on = !(n && n < sizeof v && v[0] == '0'); }
+    int frac = 0;
+    for (unsigned k = 0; k < 4; ++k) { float t = (float)(int32_t)f[k]; frac |= f[k] != t; e->vp[j][k] = on ? f[k] : t; }
+    if (frac && boot_render_state_diag_on()) {
+        static unsigned logged; ++boot_state_diag.viewport_fractional;
+        if (logged < 8) { ++logged; boot_gp_log("nvn native: N10 fractional viewport %u: %.4f %.4f %.4f %.4f (%s)", j, f[0], f[1], f[2], f[3], on ? "kept" : "truncated, TOTK_VIEWPORT_FLOAT=0"); }
+    }
+}
+/* batch-3 N6 (host_nvn.h boot_nvn_observe_flush_texels): TOTK_FLUSH_TEXELS=0 leaves nvnTextureFlushTexels to the driver,
+ * unobserved, as before. */
+static inline int boot_nvn_flush_texels_on(void) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD n = GetEnvironmentVariableA("TOTK_FLUSH_TEXELS", v, sizeof v); on = !(n && n < sizeof v && v[0] == '0'); }
+    return on;
+}
+/* batch-3 N4/G7 and N11/G9 diagnostics (TOTK_STATE_DIAG; log only), per draw after its state build (host_nvn_play.h
+ * boot_nvn_exec_draw).
+ * N4/G7: the state applies the front stencil ops, ref and masks to both faces (boot_nvn_st_fixed reads ds[4..5] and
+ * stencil_*[0]; boot_render_pso_fixed99 sets BackFace = FrontFace). The driver's depth-stencil state holds the back ops
+ * in ds[6..7], and SetStencilRef / Mask / ValueMask store a back value ([1]); nxport (MIT) applies both faces
+ * (crates/engine/src/metal/translated.rs:2663-2690). Counted: stencil draws whose back state differs, and of those the
+ * ones that draw back faces (no back-face culling), where the difference shows. The first 16 of those are logged.
+ * N11/G9: polygon offset goes to D3D12 as DepthBias = (INT)units for every primitive (boot_render_pso_fixed99); NVN
+ * offsets only filled polygons (OFFSET_FILL) with float units (nxport: translated.rs:5609-5626). Each distinct
+ * (units, factor, clamp, polygon word, draw primitive) is logged once, 64 at most. */
+typedef struct BootNvnBiasSeen { float units, factor, clamp; uint32_t polygon, mode; } BootNvnBiasSeen;
+static BootNvnBiasSeen boot_nvn_bias_seen[64]; static unsigned boot_nvn_bias_seen_n;
+static inline void boot_nvn_state_diag_draw(const BootNvnExec *e, const BootDrawState *s, uint32_t mode) {
+    if (!boot_render_state_diag_on()) return;
+    BootStateDiag *g = &boot_state_diag;
+    if ((e->ds[0] & 4) && s->zt.address) {
+        ++g->stencil_draws;
+        int ops = e->ds[6] != e->ds[4] || e->ds[7] != e->ds[5];
+        int vals = e->stencil_ref[1] != e->stencil_ref[0] || e->stencil_mask[1] != e->stencil_mask[0] || e->stencil_vmask[1] != e->stencil_vmask[0];
+        g->stencil_back_ops += (uint64_t)ops; g->stencil_back_values += (uint64_t)vals;
+        if ((ops || vals) && !(s->cull_enable && s->cull_face == 0x405)) {   /* 0x405: back faces culled */
+            static unsigned logged; ++g->stencil_back_drawn;
+            if (logged < 16) {
+                ++logged;
+                boot_gp_log("nvn native: N4 two-sided stencil (back faces drawn): ds %02x %02x %02x %02x %02x %02x %02x %02x, ref %x/%x, write mask %x/%x, "
+                            "value mask %x/%x (front/back), polygon %x, depth target format %x, draw primitive %u, program %llx (draw %llu)",
+                            e->ds[0], e->ds[1], e->ds[2], e->ds[3], e->ds[4], e->ds[5], e->ds[6], e->ds[7], e->stencil_ref[0], e->stencil_ref[1],
+                            e->stencil_mask[0], e->stencil_mask[1], e->stencil_vmask[0], e->stencil_vmask[1], e->polygon, s->zt.format, mode,
+                            (unsigned long long)e->prog.program, (unsigned long long)e->draws);
+            }
+        }
+    }
+    if (s->depth_bias_fill) {
+        ++g->bias_draws;
+        int lines_points = mode <= 3 || mode == 10 || mode == 11;   /* NVN POINTS, LINES, LINE_LOOP, LINE_STRIP, LINES(_STRIP)_ADJACENCY */
+        float u = e->poly_offset[1];
+        int frac = u > -1e9f && u < 1e9f && u != (float)(int32_t)u;
+        g->bias_not_triangles += (uint64_t)lines_points; g->bias_fractional += (uint64_t)frac;
+        BootNvnBiasSeen b = {u, e->poly_offset[0], e->poly_offset[2], e->polygon, mode};
+        unsigned i = 0;
+        while (i < boot_nvn_bias_seen_n && memcmp(&boot_nvn_bias_seen[i], &b, sizeof b)) ++i;
+        if (i == boot_nvn_bias_seen_n && i < 64) {
+            boot_nvn_bias_seen[boot_nvn_bias_seen_n++] = b;
+            boot_gp_log("nvn native: N11 depth bias %u: units %g factor %g clamp %g, polygon %x, draw primitive %u%s%s (D3D12 DepthBias %d)", i,
+                        (double)b.units, (double)b.factor, (double)b.clamp, b.polygon, mode, lines_points ? ", points/lines (NVN offsets filled polygons only)" : "",
+                        frac ? ", fractional units" : "", (int)s->depth_bias);
+        }
+    }
+}
+/* batch-3: every present (host_nvn_play.h boot_nvn_exec_present): the N5 compare of the registrations queued before the
+ * last present (host_nvn.h), the K1 scan budget, and every 300 presents one draw-path.log line with the non-zero
+ * counters of host_gpu_render_draw.h BootStateDiag (last 300, total). */
+static inline void boot_nvn_tic_diag_check(BootWindow *w);
+static const char *const boot_state_diag_names[] = {"restart_list_draws", "restart_scanned", "restart_hits", "restart_unscanned", "int_blend_off",
+    "vfmt_new", "vfmt_unsupported", "stencil_draws", "stencil_back_ops", "stencil_back_values", "stencil_back_drawn", "bias_draws",
+    "bias_not_triangles", "bias_fractional", "viewport_fractional", "flush_texels", "flush_pushed", "tic_checked", "tic_same", "tic_source_bad",
+    "tic_compose", "tic_neither", "tic_replace", "tic_other_bad", "tic_unreadable", "tic_dropped"};
+_Static_assert(sizeof boot_state_diag_names / sizeof boot_state_diag_names[0] == sizeof(BootStateDiag) / sizeof(uint64_t), "one name per counter");
+static inline void boot_nvn_state_diag_present(BootWindow *w) {
+    if (!boot_render_state_diag_on()) return;
+    boot_nvn_tic_diag_check(w);
+    boot_render_restart_budget = 0;
+    boot_render_vb_budget = 0;   /* vbounds diagnostic budget */
+    static uint32_t presents; static BootStateDiag last;
+    if (++presents % 300) return;
+    char line[2048]; size_t n = 0; line[0] = 0;
+    const uint64_t *now = (const uint64_t *)&boot_state_diag, *was = (const uint64_t *)&last;
+    for (size_t i = 0; i < sizeof boot_state_diag / sizeof(uint64_t); ++i) {
+        if (!now[i]) continue;
+        int k = snprintf(line + n, sizeof line - n, " %s %llu (%llu)", boot_state_diag_names[i], (unsigned long long)(now[i] - was[i]), (unsigned long long)now[i]);
+        if (k < 0 || (size_t)k >= sizeof line - n) break;
+        n += (size_t)k;
+    }
+    boot_gp_log("nvn native: batch-3 state diag after %u presents, last 300 (total):%s", presents, n ? line : " nothing counted");
+    last = boot_state_diag;
+}
 
 #endif

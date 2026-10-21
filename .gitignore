@@ -61,6 +61,9 @@ startup/entry-points-static.json.tmp
 # ===== shaders: game programs, translations, manifests, pipeline caches =====
 startup/shader-programs/
 startup/shader-hlsl*/
+startup/shader-gs/
+startup/bc7-cache/
+*.bc7
 startup/shader-manifest*.tsv
 startup/shader-early-z.tsv
 startup/early-z-*.tsv

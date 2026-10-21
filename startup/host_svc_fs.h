@@ -438,10 +438,23 @@ static inline int svc_fs_is_adapter(const BootContext *c, uint64_t self_object) 
     uint64_t vptr = 0;
     return c->code_bases[3] && svc_fs_peek_u64(c, self_object, &vptr) && vptr == c->code_bases[3] + SVC_FS_SDK_VT_ADAPTER + 16;
 }
+/* svc-S5: play builds (TOTK_PLAY) write romfs-reads.log only with TOTK_ROMFS_READ_LOG=1 (any value but 0); other
+ * builds unless =0, as before. Each logged read takes the exclusive lock and a fprintf + fflush on the streaming
+ * thread (romfs-reads.log, appended by every boot, had 77,763 lines); off, a read costs one unlocked test. state: 0
+ * unknown, 1 log, 2 off. */
 static inline void svc_fs_read_log(uint64_t offset, uint64_t size) {
-    static FILE *log; static volatile LONG tried; static SRWLOCK lock = SRWLOCK_INIT;
+    static FILE *log; static volatile LONG state; static SRWLOCK lock = SRWLOCK_INIT;
+    if (state == 2) return;
     AcquireSRWLockExclusive(&lock);
-    if (!tried) { tried = 1; const char *e = getenv("TOTK_ROMFS_READ_LOG"); if (!e || *e != '0') log = fopen("romfs-reads.log", "a"); }
+    if (!state) {
+        const char *e = getenv("TOTK_ROMFS_READ_LOG");
+#if defined(TOTK_PLAY) && TOTK_PLAY
+        if (e && *e != '0') log = fopen("romfs-reads.log", "a");
+#else
+        if (!e || *e != '0') log = fopen("romfs-reads.log", "a");
+#endif
+        InterlockedExchange(&state, log ? 1 : 2);
+    }
     if (log) { fprintf(log, "%#llx %#llx\n", (unsigned long long)offset, (unsigned long long)size); fflush(log); }
     ReleaseSRWLockExclusive(&lock);
 }

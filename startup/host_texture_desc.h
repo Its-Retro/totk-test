@@ -29,7 +29,7 @@ typedef struct BootTic {
     uint32_t width, height, depth, max_mip, srgb, normalized, depth_texture;
     uint32_t view_min_mip, view_max_mip;
     uint32_t pitch;   /* pitch-linear headers (versions 1/2): bytes per row, 32-byte aligned; 0 = block-linear */
-    uint32_t base_layer;   /* first array layer of the view (suyu TICEntry::BaseLayer) */
+    uint32_t base_layer;   /* first array layer of the view (deko3d TextureImageControl view_layer_base_*) */
 } BootTic;
 
 /* Header versions (TEXHEAD_*): 0 1D buffer, 1 pitch + colour key, 2 pitch, 3 block-linear,
@@ -52,6 +52,8 @@ static inline int boot_tic_decode(const uint32_t w[8], BootTic *t) {
         t->srgb = boot_bits256(w, 150, 1);
         return t->texture_type == BOOT_TEX_1D_BUFFER;
     }
+    /* view layer base bits 0-2 / 3-7 / 8-10: deko3d (zlib) source/maxwell/texture_image_control_block.h
+     * view_layer_base_0_2 / 3_7 / 8_10; clb097tex.h lists the same bits as RESERVED4A / RESERVED_ADDRESS / RESERVED2A */
     t->base_layer = boot_bits256(w, 144, 3) | (boot_bits256(w, 80, 5) << 3) | (boot_bits256(w, 93, 3) << 8);
     t->log_gob_h = boot_bits256(w, 99, 3);
     t->log_gob_d = boot_bits256(w, 102, 3);
@@ -66,10 +68,11 @@ static inline int boot_tic_decode(const uint32_t w[8], BootTic *t) {
     t->normalized = boot_bits256(w, 191, 1);
     t->view_min_mip = boot_bits256(w, 224, 4);
     t->view_max_mip = boot_bits256(w, 228, 4);
-    /* Pitch-linear (with or without colour key): word 3 bits 0..15 hold pitch >> 5 (suyu
-     * TICEntry::Pitch). Block-linear: GOB heights/depths. 1D buffer views are not handled yet. */
+    /* Pitch-linear (with or without colour key): word 3 bits 0..15 hold pitch >> 5 (clb097tex.h
+     * NVB097_TEXHEAD_PITCH_PITCH_BITS20TO5). Block-linear: GOB heights/depths. 1D buffer views are not handled yet. */
     if (t->header_version == 1 || t->header_version == 2) {
-        /* pitch addresses are 32-byte aligned (suyu TICEntry::Address uses the whole low word) */
+        /* pitch addresses are 32-byte aligned (clb097tex.h NVB097_TEXHEAD_PITCH_ADDRESS_BITS31TO5); the whole
+         * low word is read, as deko3d keeps it in TextureImageControl::address_low */
         t->address = (uint64_t)w[1] | ((uint64_t)boot_bits256(w, 64, 16) << 32);
         t->pitch = boot_bits256(w, 96, 16) << 5; t->log_gob_h = t->log_gob_d = 0; t->tile_width = 0;
         return t->pitch != 0;
@@ -178,8 +181,9 @@ static inline uint64_t boot_tex_layout(const BootTic *t, const BootTexFormat *f,
         uint32_t d = t->texture_type == BOOT_TEX_3D ? t->depth : 1; v->depth = d >> l ? d >> l : 1;
         v->width_bytes = boot_div_up(v->width, f->block_w) * f->bytes; v->rows = boot_div_up(v->height, f->block_h);
         v->log_gob_h = boot_mip_log_gob_h(v->rows, t->log_gob_h);
-        /* 3D: a single-level texture keeps the header's block depth (suyu TileShift); with mips every
-         * level, the base included, shrinks it to the level's depth (AdjustMipBlockSize). The one 3D
+        /* 3D: a single-level texture keeps the header's GOBS_PER_BLOCK_DEPTH as written (no game data covers
+         * this case; Ryujinx SizeCalculator shrinks it there too); with mips every level, the base included,
+         * shrinks it to the level's depth (Ryujinx SizeCalculator.GetBlockLinearTextureSize). The one 3D
          * BNTX texture in the game (TexToGo/3DWorleyPerlinNoise_Fi, 64^3 BC4, 7 mips) matches. */
         v->log_gob_d = (t->texture_type == BOOT_TEX_3D && count == 1) ? t->log_gob_d : boot_mip_log_gob_d(v->depth, t->log_gob_d);
         uint64_t gx = boot_div_up(v->width_bytes, 64), gy = boot_div_up(v->rows, 8u << v->log_gob_h), gz = boot_div_up(v->depth, 1u << v->log_gob_d);
@@ -189,8 +193,8 @@ static inline uint64_t boot_tex_layout(const BootTic *t, const BootTexFormat *f,
     }
     uint64_t layers = t->texture_type == BOOT_TEX_2D_ARRAY || t->texture_type == BOOT_TEX_CUBE || t->texture_type == BOOT_TEX_CUBE_ARRAY ||
                       t->texture_type == BOOT_TEX_1D_ARRAY;
-    /* render-28: layers align to the base level's block height after it is shrunk to the image (suyu AlignLayerSize:
-     * AdjustTileSize of the header's block height to the aligned height), not to the header's block height. A tiny
+    /* render-28: layers align to the base level's block height after it is shrunk to the image (Ryujinx
+     * SizeCalculator.AlignLayerSize: the header's GOB height shrunk to the image height), not to the header's block height. A tiny
      * layered texture with a taller header block (TOTK's per-light 3x3 R8 occlusion cubes, 0xC00 apart = six 0x200
      * faces) otherwise got 8 KiB faces: faces 1-5 were read from the next lights' cubes, so each torch's light range
      * (cube sample x radius) was cut short in most directions - the warm torch light barely left the flame. */

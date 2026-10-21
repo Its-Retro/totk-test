@@ -104,6 +104,125 @@ static inline int boot_render_fail(BootRender *r, int code, const char *what) {
     snprintf(r->error, sizeof r->error, "%s", what); return code;
 }
 
+/* ---------------------------------------------------------------- suspect-diag (play-work/suspect-diag, 2026-10-21)
+ * TOTK_SUSPECT_DIAG=1 (=2: suspect 1 hashes only ranges of draws whose vertex shader is a 'material' shader; unset or 0: off,
+ * every hook is one cached branch and nothing else runs or changes). "Detect, don't bisect": one play session counts, for
+ * each suspect of the sky-island vertex explosion that came back in play-99..102, the events that suspect would have to
+ * cause, so the first skydive names the change instead of a bisect:
+ *  S1 re-record versioning (play-98, TOTK_RERECORD_VERSION): guest threads run during the submit call. The CPU-side reads of
+ *     guest memory of the call's translation (constant-buffer snapshot copies, 8-bit / quad index expansion, guest texture
+ *     builds) and the ranges the GPU reads later in place (direct CBVs, the first 4 KiB of each vertex stream of the draw)
+ *     are hashed when read; at the end of the call (under the renderer lock) the same bytes are hashed again: a range that
+ *     changed was written by a guest thread while the call ran. Calls that kept a re-recorded version (threads released
+ *     without the wait) and calls that did not are counted apart. Budget: TOTK_SUSPECT_DIAG_MB (default 4) MiB hashed per kind
+ *     per call (beyond it ranges are counted as unsampled).
+ *  S2 K2 (play-97 batch 4, TOTK_INSTANCE_ID_ZERO_BASED): draws where the rule changes the result: base instance != 0 and the
+ *     vertex shader (translated with K2) reads InstanceId, or has a per-instance attribute with divisor > 1 or frequency 0
+ *     (from the shader's .hlsl next to its DXIL, read once per vertex shader).
+ *  S3 gpu-resident span views (play-101, TOTK_GPU_RESIDENT): every TOTK_SUSPECT_DIAG_GR_EVERY (30) presents, sampled pages
+ *     of the GPU mappings (within ~0.4 ms): the page-table entry (CPU table and the GPU's copy) against the mapping's
+ *     region and offset, and the bytes behind the entry against the canonical host view of the guest memory; plus a page of
+ *     a few open span views against the section's host view.
+ *  S4 live texture trim (play-99, TOTK_TEX_LIVE_TRIM / TOTK_TEX_MIN_AGE): evictions of texture slots a vertex shader bound
+ *     in the last TOTK_SUSPECT_DIAG_TEX_N (600) presents, and rebuilds of such slots (same guest address: the same image).
+ * Output: frames\suspect-diag.log (previous run: suspect-diag.prev.log): a header with the switches, one line per suspect
+ * every 300 presents (also written to draw-path.log), and the first TOTK_SUSPECT_DIAG_EVENTS (40) events of each suspect (S1: of each kind)
+ * with the frame number (frame-N.bmp / frames\glitch.log "GLITCH present N" numbering), submission, draw, vertex shader id
+ * (first 8 bytes, as in shader-manifest.tsv), its family from startup\shader-labels.tsv and the draw-census key. With the
+ * switch on, every draw-path.log line also ends in " [frame N]". */
+enum { BOOT_SD_K_CB, BOOT_SD_K_DIRECT, BOOT_SD_K_INDEX, BOOT_SD_K_TEX, BOOT_SD_K_VERTEX,
+       BOOT_SD_K_CBSNAP, BOOT_SD_K_VSNAP, BOOT_SD_K_IZC, BOOT_SD_K_ISNAP,   /* data-snapshot: its copies (hash of the copy, re-hash of the
+                                                                         * guest range: changed = written after the capture, harmless) and the
+                                                                         * zero-copy index buffers the GPU reads later */
+       BOOT_SD_K_N };
+static int boot_sd_mode = -1;   /* -1 not read yet, 0 off, 1 on, 2 on with suspect 1 sampled on 'material' draws */
+static inline __attribute__((noinline)) void boot_sd_mode_init(void) {
+    char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_SUSPECT_DIAG", v, sizeof v);
+    boot_sd_mode = (k && k < sizeof v && v[0] >= '1' && v[0] <= '9') ? (v[0] == '2' ? 2 : 1) : 0;
+}
+static inline int boot_sd_on(void) {
+    if (__builtin_expect(boot_sd_mode < 0, 0)) boot_sd_mode_init();
+    return __builtin_expect(boot_sd_mode > 0, 0);
+}
+/* 64-bit hash of n bytes in four lanes (a changed word always changes its lane; ~memory speed). */
+static inline uint64_t boot_sd_hash(const uint8_t *p, uint64_t n) {
+    const uint64_t P = UINT64_C(0x100000001b3) | (UINT64_C(0x9e3779b9) << 40);
+    uint64_t a = n ^ UINT64_C(0x243f6a8885a308d3), b = UINT64_C(0x13198a2e03707344), c = UINT64_C(0xa4093822299f31d0), d = UINT64_C(0x082efa98ec4e6c89), i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4]; memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * P; b = (b ^ w[1]) * P; c = (c ^ w[2]) * P; d = (d ^ w[3]) * P;
+    }
+    for (; i < n; ++i) a = (a ^ p[i]) * P;
+    uint64_t h = a ^ ((b << 17) | (b >> 47)) ^ ((c << 31) | (c >> 33)) ^ ((d << 47) | (d >> 17));
+    h ^= h >> 33; h *= UINT64_C(0xff51afd7ed558ccd); h ^= h >> 33;
+    return h;
+}
+#define BOOT_SD_RECS 32768u
+#define BOOT_SD_SEEN 65536u
+#define BOOT_SD_LABELS 65536u
+#define BOOT_SD_VS 16384u
+#define BOOT_SD_TIC 65536u
+/* One range read during the call: guest GPU VA, the region it was read through (index, host base, byte offset, the span
+ * view's section offset and generation when the region is a view), its hash, and the draw it belongs to. */
+typedef struct BootSdRec { const uint8_t *base; uint64_t va, off, hash, vs8, key, lo, gen, epoch, big; uint32_t n, reg, kind, draw, exec, frame; } BootSdRec;
+typedef struct BootSdLabel { uint64_t key; const char *family; } BootSdLabel;
+typedef struct BootSdVs { uint64_t key; uint32_t attr_mask, flags; } BootSdVs;   /* flags: 1 scanned, 2 reads InstanceId, 4 K2 prologue, 8 no .hlsl */
+typedef struct BootSdCount {
+    /* S1 */
+    uint64_t calls, calls_kept, kept, rerecords, checked[BOOT_SD_K_N], ch_kept[BOOT_SD_K_N], ch_plain[BOOT_SD_K_N], gone[BOOT_SD_K_N],
+             unsampled[BOOT_SD_K_N], dup[BOOT_SD_K_N], bytes[BOOT_SD_K_N], hostw[BOOT_SD_K_N], draws, draws_copy, draws_mat, draws_mat_copy, draws_direct, recheck_qpc;
+    /* S2 */
+    uint64_t k2_draws, k2_base, k2_indirect, k2_changed, k2_changed_mat, k2_iid, k2_div, k2_freq0, k2_pre, k2_unknown;
+    /* S3 */
+    uint64_t gr_checks, gr_pages, gr_bytes, gr_views, gr_mismatch, gr_ptcopy, gr_ptother, gr_ptother_eq, gr_unmapped, gr_unreadable, gr_nosec, gr_qpc, gr_maxq;
+    /* S4 */
+    uint64_t tx_evict, tx_evict_live, tx_evict_vs, tx_builds, tx_rebuild_vs, tx_rebuild_vs_ev, tx_reuse_vs;
+} BootSdCount;
+typedef struct BootSdState {
+    FILE *log; int dirty;
+    uint64_t frame, presents, budget, qpf;   /* frame: frame-N.bmp / glitch.log number of the frame being built */
+    uint32_t events_max, tex_n, gr_every, gr_pages_max;
+    unsigned ev_s1[BOOT_SD_K_N], ev_s2, ev_s3, ev_s4;   /* events written (S1: per kind) */
+    /* draw in flight */
+    int in_draw, material; uint64_t vs8, key, exec_last; uint32_t draw, draw_copies, draw_direct; const char *fam;
+    /* S1 records of the running call */
+    BootSdRec *rec; uint32_t nrec, stamp; uint64_t call_bytes, kind_bytes[BOOT_SD_K_N]; uint64_t *seen; uint32_t *seen_stamp;
+    uint64_t last_kept, last_rerecords;
+    /* S2: shader families and vertex shader facts */
+    char *labels_text; BootSdLabel *labels; uint32_t nlabels; BootSdVs *vs;
+    /* S3 */
+    int gr_due; uint32_t gr_cursor, gr_vcursor;
+    /* S4: per TIC slot, frame + 1 of the last vertex-shader binding (0: never), the slot's guest address then, evicted since */
+    uint32_t *vs_tex; uint64_t *vs_tex_va; uint8_t *evicted;
+    BootSdCount c, l;   /* totals and the totals at the last summary */
+} BootSdState;
+static BootSdState *boot_sd_st;
+static inline BootSdState *boot_sd_state(void);   /* below (with the gpu-resident view table) */
+static inline void boot_sd_note(BootRender *r, unsigned kind, uint64_t va, const uint8_t *p, const uint8_t *hp, uint64_t n);
+static inline void boot_sd_tex_build(BootRender *r, uint32_t index, uint64_t va, const uint8_t *src, uint64_t n, uint64_t sum);
+static inline void boot_sd_tex_evict(uint32_t index, int live);
+static inline void boot_sd_vs_scan(const uint8_t id[32], const char *dxil_path);
+/* ---------------------------------------------------------------- data-snapshot (play-work/data-snapshot, 2026-10-21)
+ * TOTK_DATA_SNAPSHOT (default 1; 0 = the zero-copy behaviour of play-103 exactly). The design note and the code are before
+ * host_gpu_render_draw.h at the end of this header; here what the code above that point calls. */
+static int boot_ds_mode_v = -1;   /* -1 not read yet, 0 off, 1 learned ranges (default), 2 every range the CPU may write */
+static inline __attribute__((noinline)) void boot_ds_mode_init(void);
+static inline int boot_ds_mode(void) {
+    if (__builtin_expect(boot_ds_mode_v < 0, 0)) boot_ds_mode_init();
+    return boot_ds_mode_v;
+}
+static inline int boot_ds_on(void) { return __builtin_expect(boot_ds_mode() > 0, 1); }
+static int boot_ds_cb_now;              /* 1 while boot_render_cbv_ex copies a binding the snapshot took (S1 kind cb-snap) */
+static uint8_t boot_ds_cbt[2][18];      /* the draw in flight: constant-buffer slots (vertex, pixel) read from a copy */
+static uint32_t boot_ds_vmask;          /* the draw in flight: vertex streams read from a copy ... */
+static uint8_t *boot_ds_vcopy_cpu[16];  /* ... and the copy's host bytes (S1 vertex-snap hashes what the GPU reads) */
+static uint64_t boot_ds_bind_gen;       /* v2fix: moves whenever the native executor rebuilds a draw's constant-buffer rows ... */
+static const void *boot_ds_bind_of;     /* ... in this table (host_nvn_exec.h boot_nvn_st_buffers): the plan then compares no rows */
+static inline int boot_ds_fill_wanted(uint64_t va, uint64_t n);
+static inline void boot_ds_fill(BootRender *r, uint8_t *dst, uint64_t va, const uint8_t *live, uint64_t n);
+static inline void boot_ds_idle(void);
+static inline void boot_ds_s1_changed(BootRender *r, uint64_t va, uint64_t n, unsigned kind);
+
 /* ---------------------------------------------------------------- persistent pipeline library (play (73))
  * Pipelines are compiled by the driver the first time they are created (hundreds of ms for a large pixel
  * shader: the "pso" phase of the hitch lines in draw-path.log, 0.4-2.5 s for a handful of new pipelines).
@@ -328,6 +447,7 @@ static inline HRESULT boot_psoc_create_graphics(const BootRender *r, ID3D12Devic
         boot_psoc_chain(h, &rh, 8); boot_psoc_chain(h, key, klen); boot_psoc_chain(h, &nrt, 4);
         boot_psoc_chain(h, d->VS.pShaderBytecode, d->VS.BytecodeLength);
         if (d->PS.pShaderBytecode) boot_psoc_chain(h, d->PS.pShaderBytecode, d->PS.BytecodeLength);
+        if (d->GS.pShaderBytecode) boot_psoc_chain(h, d->GS.pShaderBytecode, d->GS.BytecodeLength);   /* G2 point sprites (batch-4) */
         boot_psoc_name(name, h);
         HRESULT hr = E_FAIL;
         AcquireSRWLockExclusive(&boot_psoc.lock);
@@ -632,6 +752,40 @@ static inline int boot_render_sv_apply(BootRender *r, int full);
 static uint64_t boot_render_slot_rec[BOOT_RENDER_TEX_SLOTS];   /* list id of the last recorded draw / dispatch that bound the index (0: none) */
 static uint64_t boot_render_sv_wg[4];   /* such writes: [0] read by the open list (executed first), [1] by an executed list still running,
                                            [2] by the open list after the index was staged (two versions in one list), [3] left in place (versioning off) */
+/* blacktex-work (play-104/105, versioning off: environment objects and the floor black for a moment, sprites / cards /
+ * decals black squares). The writes "left in place" above are that hazard: when the open list executes, the draws
+ * recorded in it before the write read the NEW descriptors (play-105: 97956 writes = ~10900 rewrites of an index, ~0.7
+ * per present). ~90% of the sampled ones are the scene depth (529a00000 1024x576 ZF32, its TIC a ring index): a draw that
+ * does not write depth makes the index a view of the depth target (the slot not valid), the next draw that writes depth
+ * and samples it rebuilds it as a copy (boot_render_texture_from_target: not valid, so no slot_free) and its descriptors
+ * replace the view in place, so every earlier draw of the list samples the copy's texture before the copy commands ran
+ * (a pooled image of that shape, or a new zero-filled one: black); the next draw that does not write depth makes it a
+ * view again through slot_free (a valid slot: a submission and a full GPU wait, play-105 9791). The rest are colour target
+ * views rewritten after the target table changed. (A guard line shows the slot as it was before the write: "valid 0
+ * resource no size 0" is a target view, not an empty slot; what is written is a view or a texture.) TOTK_TEX_KEEP (default on;
+ * =0: exactly as before) protects those writes with versioning off as with versioning on: the reading open list is
+ * executed first without a wait and the writes are staged, copied in place right before the next list executes once
+ * the lists that read the old ones completed (boot_render_sv_apply), so every recorded draw keeps the descriptors it was
+ * recorded with; and the depth copy is refreshed in place instead of turning back into a view (TOTK_DFB_KEEP_COPY, so far
+ * only with versioning), which removes the copy -> view switches and their full waits. boot_render_slot_free itself is
+ * unchanged (versioning off: submit and wait). A write while no list is open whose index a list still running bound
+ * (the guard never sees it; the "not recording means idle" invariant says it cannot happen) is waited for and counted. */
+static inline int boot_render_tex_keep_on(void) {
+    static int v = -1; if (v < 0) { char t[8]; DWORD n = GetEnvironmentVariableA("TOTK_TEX_KEEP", t, sizeof t); v = !(n && n < sizeof t && t[0] == '0'); }
+    return v;
+}
+static uint16_t boot_render_slot_rec_n[BOOT_RENDER_TEX_SLOTS];   /* bindings of the index by draws / dispatches recorded in list boot_render_slot_rec[i] (saturating) */
+static uint64_t boot_render_tk_events[2], boot_render_tk_draws[2], boot_render_tk_idle_waits;   /* [0] kept on the old descriptors, [1] slipped through (in place):
+    rewrites (one per index and reading list), the recorded bindings that read the index; writes with no open list while a reading list ran (waited for) */
+static inline void boot_render_slot_rec_mark(uint32_t index) {   /* the index is bound by a draw / dispatch recorded in the open list */
+    boot_render_slot_rec_n[index] = boot_render_slot_rec[index] == boot_render_list_id ? (uint16_t)(boot_render_slot_rec_n[index] + (boot_render_slot_rec_n[index] < 0xffffu)) : (uint16_t)1;
+    boot_render_slot_rec[index] = boot_render_list_id;
+}
+static inline void boot_render_tk_note(unsigned slipped, uint32_t index, uint64_t used) {   /* once per index and reading list (in place: one per write) */
+    static uint32_t li = UINT32_MAX; static uint64_t ll;
+    if (index == li && used == ll) return;
+    li = index; ll = used; ++boot_render_tk_events[slipped]; boot_render_tk_draws[slipped] += boot_render_slot_rec_n[index];
+}
 static inline int boot_render_flush(BootRender *r);
 static inline int boot_render_wait_fence_at(BootGpu *g, uint64_t value, int line);
 static inline int boot_render_sv_mark(BootRender *r, uint32_t index, uint64_t fence);
@@ -648,8 +802,9 @@ static inline void boot_render_sv_write_guard(BootRender *r, unsigned dim, uint3
         if (ID3D12Fence_GetCompletedValue(r->gpu->fence) >= f) return;
     }
     const unsigned kind = open ? (boot_render_sv_flag[index] ? 2u : 0u) : 1u;
-    if (!boot_render_sv_on()) { ++boot_render_sv_wg[3]; boot_render_sv_wg_log(r, dim, index, kind, used, f, 0); return; }
-    ++boot_render_sv_wg[kind];
+    if (!boot_render_sv_on() && !boot_render_tex_keep_on()) {   /* blacktex-work: TOTK_TEX_KEEP=0, as before */
+        ++boot_render_sv_wg[3]; boot_render_tk_note(1, index, used); boot_render_sv_wg_log(r, dim, index, kind, used, f, 0); return; }
+    ++boot_render_sv_wg[kind]; boot_render_tk_note(0, index, used);   /* blacktex-work: its readers keep the old descriptors (either mode) */
     if (open) {   /* its draws read the current contents: executed first (without a wait), recording goes on in the next list */
         const uint64_t lid = boot_render_list_id;
         if (!boot_render_flush(r)) return;   /* failed: the queue was waited for, in place is safe */
@@ -657,12 +812,23 @@ static inline void boot_render_sv_write_guard(BootRender *r, unsigned dim, uint3
     }
     const int staged = boot_render_sv_mark(r, index, f);
     if (!staged) { ++boot_render_sv_fallbacks; boot_render_wait_fence_at(r->gpu, f, __LINE__); }   /* no staging heap: a wait, as before versioning */
-    boot_render_sv_wg_log(r, dim, index, kind, used, f, staged ? 1 : 2);
+    boot_render_sv_wg_log(r, dim, index, kind, used, f, staged ? (boot_render_sv_on() ? 1 : 3) : 2);
+}
+/* blacktex-work: a descriptor write with no open list, the index bound by an executed list still running: waited for. */
+static inline void boot_render_tk_idle_write(BootRender *r, uint32_t index) {
+    const uint64_t used = boot_render_slot_rec[index];
+    if (index >= BOOT_RENDER_TEX_SLOTS - 256u || boot_render_list_fence[used & 65535].id != used) return;   /* feedback slots; never executed, or long complete */
+    const uint64_t f = boot_render_list_fence[used & 65535].fence;
+    if (ID3D12Fence_GetCompletedValue(r->gpu->fence) >= f) return;
+    ++boot_render_tk_idle_waits; boot_render_wait_fence_at(r->gpu, f, __LINE__);
 }
 /* Where a descriptor of texture table `dim` at TIC index `index` is written: in place, or (the index versioned) into the
  * staging heap, copied in place by boot_render_sv_apply in the order written. */
 static inline D3D12_CPU_DESCRIPTOR_HANDLE boot_render_tex_dst(BootRender *r, unsigned dim, uint32_t index) {
-    if (index < BOOT_RENDER_TEX_SLOTS && boot_render_slot_rec[index] && r->recording) boot_render_sv_write_guard(r, dim, index);   /* drain2-work */
+    if (index < BOOT_RENDER_TEX_SLOTS && boot_render_slot_rec[index]) {
+        if (r->recording) boot_render_sv_write_guard(r, dim, index);   /* drain2-work */
+        else if (boot_render_tex_keep_on()) boot_render_tk_idle_write(r, index);   /* blacktex-work: no open list, so no guard */
+    }
     if (index < BOOT_RENDER_TEX_SLOTS && boot_render_sv_flag[index]) {
         if (boot_render_sv_n == BOOT_RENDER_SV_STAGE) boot_render_sv_apply(r, 1);   /* full: wait for the old lists, everything in place */
         if (boot_render_sv_flag[index] && boot_render_sv_heap) {
@@ -672,6 +838,10 @@ static inline D3D12_CPU_DESCRIPTOR_HANDLE boot_render_tex_dst(BootRender *r, uns
             return c;
         }
     }
+    /* blacktex review: the real 'slipped through' check (boot_render_tk_note(1) above only runs with TOTK_TEX_KEEP off): an
+     * in-place write of an index the open list's recorded draws read (after the guard, which executes that list first). */
+    if (boot_render_tex_keep_on() && r->recording && index < BOOT_RENDER_TEX_SLOTS - 256u && boot_render_slot_rec[index] == boot_render_list_id)
+        boot_render_tk_note(1, index, boot_render_list_id);
     return boot_render_cpu(r, r->srv_heap, r->srv_inc, BOOT_RENDER_HEAP_TEX0 + dim * BOOT_RENDER_TEX_SLOTS + index);
 }
 /* Null SRV in texture table `dim` at TIC index `index`: sampling returns 0, GetDimensions 0. */
@@ -850,6 +1020,7 @@ static struct { uint64_t va, end, fence; } boot_render_gt_pending[BOOT_RENDER_GT
  * sends a guard to the full path), and the last completed fence value read */
 #define BOOT_RENDER_GT_CHUNK_TABLE 65536u
 static uint64_t boot_render_gt_chunk_fence[BOOT_RENDER_GT_CHUNK_TABLE], boot_render_gt_done_seen, boot_render_gt_fast, boot_render_gt_slow;
+static uint64_t boot_render_gt_newest, boot_render_gt_gen;   /* data-snapshot v2fix: the newest pending list's fence; moves with every one (boot_ds_gt_state) */
 static inline void boot_render_gt_guard(BootRender *r, uint64_t va, uint64_t size);
 /* Guest GPU VA -> host pointer through the page table. The range must be contiguous within one
  * region (NVMap objects are contiguous guest allocations), otherwise NULL. */
@@ -983,6 +1154,139 @@ static inline int boot_render_region(BootRender *r, void *cpu, uint64_t size) {
     if (found < 0) found = boot_render_region_slot(r, cpu, size);
     if (found >= 0) boot_render_region_used[found] = 1;
     return found;
+}
+/* gpu-resident (TOTK_GPU_RESIDENT; play-work/gpu-resident/README.md): zero-copy GPU views of only the guest memory the GPU
+ * maps. OpenExistingHeapFromAddress makes every page of the allocation it opens resident and locks it for the heap's lifetime,
+ * touched or not (probe, RTX 4070 Laptop: a 512 MiB SEC_COMMIT view nobody had touched: +512 MiB non-local, -498 MiB available
+ * RAM at once; trimming the working set drops the locked pages from it, but they stay in RAM until the heap is released), and
+ * it takes only an allocation base (an interior address: E_INVALIDARG). Opening whole blocks locked the 3 GiB heap view (the
+ * heap's maximum, more than its size) and every 256 MiB pool arena (their free ranges too): 4.6 GiB of play-99's 5.5 GiB
+ * non-local. The native path (boot_nvn_exec_memory) instead maps a second view of just the GPU-mapped span of a fastmem
+ * section (MapViewOfFile at a 64 KiB aligned section offset, any 4 KiB multiple in size) and opens that: only the span is
+ * locked (a 64 MiB view of a 1 GiB section: +64 MiB non-local, the other pages untouched). The view shares the section's
+ * pages with the guest and host views (GPU reads of CPU writes and CPU reads of GPU writes matched, both ways) and keeps the
+ * section alive by itself. Cost: ~0.34 ms per MiB to open (page locking), ~0.07 ms per MiB to release, ~0.5 ms per heap;
+ * 256 heaps alive changed a 256-copy submission by 0.01-0.14 ms. Views are recorded here by region slot. boot_render_region and
+ * boot_render_forget never match them (their key, a block address, is never a view address). */
+typedef struct BootGrView { const BootRender *r; ID3D12Resource *res; uint8_t *cpu; uint64_t lo, size, gen; uint32_t stale, pad; } BootGrView;
+static BootGrView boot_gr_view[BOOT_RENDER_MAX_REGIONS];   /* by region slot; cpu != NULL: the slot holds a view this module mapped */
+static uint8_t boot_gr_hole[BOOT_RENDER_MAX_REGIONS];      /* slots released at an idle page-table rebuild: no recorded work names them */
+static uint64_t boot_gr_vgen = 1;                          /* bumped at every change of the view table (assignment cache key) */
+static struct {
+    uint64_t opened, opened_bytes, open_qpc, released, released_bytes, wholes_released, wholes_released_bytes, reused, fallbacks,
+             failures, dropped, stale, refreshes, coarsened, tex_views_dropped, rebuilds, reclaims;
+    /* at the last page-table rebuild */
+    uint32_t mode, views, wholes, mappings, deferred, sections, spans, budget;
+    uint64_t granule, view_bytes, whole_bytes, resident_bytes, mapped_bytes, today_bytes, would_bytes, stale_bytes;
+} boot_gr_st;
+/* TOTK_GPU_RESIDENT: 1 (default) = views; 0 = every GPU-mapped block opened whole, exactly as before (no perf3 part either);
+ * 2 = dry run: blocks opened whole as with 0, and the perf3 part says what 1 would open. */
+static inline int boot_gr_mode(void) {
+    static int v = -1;
+    if (v < 0) { char e[8]; DWORD n = GetEnvironmentVariableA("TOTK_GPU_RESIDENT", e, sizeof e); v = (n && n < sizeof e) ? (e[0] == '0' ? 0 : e[0] == '2' ? 2 : 1) : 1; }
+    return v;
+}
+/* TOTK_GPU_RESIDENT_KB: smallest span granule (rounded to 64 KiB, default 2048): mappings closer than this share a view */
+static inline uint64_t boot_gr_granule(void) {
+    static uint64_t v;
+    if (!v) {
+        char e[16]; DWORD n = GetEnvironmentVariableA("TOTK_GPU_RESIDENT_KB", e, sizeof e);
+        uint64_t k = (n && n < sizeof e) ? strtoull(e, NULL, 10) : 2048;
+        k = k < 64 ? 64 : k > (UINT64_C(1) << 22) ? (UINT64_C(1) << 22) : k;
+        v = ((k + 63) / 64 * 64) << 10;
+    }
+    return v;
+}
+static inline void boot_gr_tex_forget(BootRender *r, ID3D12Resource *res);   /* with the texture slots below */
+/* Maps section bytes [lo, lo + size) (lo 64 KiB aligned) as a view and opens it as a region in a free slot; slot or -1. */
+static inline int boot_gr_view_open(BootRender *r, HANDLE section, uint64_t lo, uint64_t size, uint64_t gen) {
+    unsigned j = 0;
+    while (j < r->region_count && !(boot_gr_hole[j] && !r->region_cpu[j] && !r->region[j] && !r->region_heap[j])) ++j;
+    if (j == BOOT_RENDER_MAX_REGIONS) { ++boot_gr_st.failures; return -1; }
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    uint8_t *v = (uint8_t *)MapViewOfFile(section, FILE_MAP_ALL_ACCESS, (DWORD)(lo >> 32), (DWORD)lo, (SIZE_T)size);
+    if (!v) { ++boot_gr_st.failures; return -1; }
+    ID3D12Device3 *d3 = NULL; ID3D12Heap *heap = NULL; ID3D12Resource *res = NULL;
+    if (SUCCEEDED(ID3D12Device_QueryInterface(r->gpu->device, &IID_ID3D12Device3, (void **)&d3))) {
+        if (FAILED(ID3D12Device3_OpenExistingHeapFromAddress(d3, v, &IID_ID3D12Heap, (void **)&heap))) heap = NULL;
+        ID3D12Device3_Release(d3);
+    }
+    if (heap) {
+        D3D12_RESOURCE_DESC d = {0};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = size; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(ID3D12Device_CreatePlacedResource(r->gpu->device, heap, 0, &d, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&res))) res = NULL;
+    }
+    if (!res) { if (heap) ID3D12Heap_Release(heap); UnmapViewOfFile(v); ++boot_gr_st.failures; return -1; }
+    ++boot_render_created_regions;
+    r->region_heap[j] = heap; r->region[j] = res; r->region_cpu[j] = v; r->region_size[j] = size;
+    boot_render_region_views(r, j);
+    if (j == r->region_count) ++r->region_count;
+    boot_gr_hole[j] = 0; boot_render_region_used[j] = 1;
+    boot_gr_view[j].r = r; boot_gr_view[j].res = res; boot_gr_view[j].cpu = v; boot_gr_view[j].lo = lo; boot_gr_view[j].size = size;
+    boot_gr_view[j].gen = gen; boot_gr_view[j].stale = 0;
+    ++boot_gr_vgen;
+    QueryPerformanceCounter(&t1);
+    ++boot_gr_st.opened; boot_gr_st.opened_bytes += size; boot_gr_st.open_qpc += (uint64_t)(t1.QuadPart - t0.QuadPart);
+    if (boot_gr_st.opened <= 64) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        FILE *lf = fopen("draw-path.log", "a");
+        if (lf) { fprintf(lf, "gpu-resident: view opened in slot %u: section gen %llu bytes [%llx, %llx) (%llu KiB) in %.2f ms\n", j, (unsigned long long)gen,
+                          (unsigned long long)lo, (unsigned long long)(lo + size), (unsigned long long)(size >> 10), (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart); fclose(lf); }
+    }
+    return (int)j;
+}
+/* Releases region slot j (a view of this module, or a whole-block region nothing uses); the queue is idle. */
+static inline void boot_gr_slot_release(BootRender *r, unsigned j) {
+    BootGrView *v = &boot_gr_view[j];
+    const int view = v->cpu && v->r == r && r->region_cpu[j] == v->cpu;
+    if (r->region[j]) { boot_gr_tex_forget(r, r->region[j]); ID3D12Resource_Release(r->region[j]); }
+    if (r->region_heap[j]) ID3D12Heap_Release(r->region_heap[j]);
+    if (view) { ++boot_gr_st.released; boot_gr_st.released_bytes += r->region_size[j]; UnmapViewOfFile(v->cpu); }
+    else { ++boot_gr_st.wholes_released; boot_gr_st.wholes_released_bytes += r->region_size[j]; }
+    r->region[j] = NULL; r->region_heap[j] = NULL; r->region_cpu[j] = NULL; r->region_size[j] = 0;
+    boot_render_region_views(r, j);   /* null views */
+    boot_render_region_used[j] = 0;
+    memset(v, 0, sizeof *v); boot_gr_hole[j] = 1; ++boot_gr_vgen;
+}
+/* Forgets entries whose slot was changed elsewhere (boot_render_region_slot eviction, a replaced render object). */
+static inline void boot_gr_check(BootRender *r) {
+    static const BootRender *last;
+    if (last != r) { memset(boot_gr_hole, 0, sizeof boot_gr_hole); last = r; }   /* holes are known only for the render object they were made in */
+    for (unsigned j = 0; j < BOOT_RENDER_MAX_REGIONS; ++j) {
+        BootGrView *v = &boot_gr_view[j];
+        if (!v->cpu) continue;
+        if (v->r == r && j < r->region_count && r->region_cpu[j] == v->cpu && r->region[j] == v->res) continue;
+        if (v->r == r) UnmapViewOfFile(v->cpu);   /* released by its evictor; the mapping is this module's */
+        memset(v, 0, sizeof *v); ++boot_gr_st.dropped; ++boot_gr_vgen;   /* another render object: its objects went with it */
+    }
+}
+/* perf3 part (TOTK_GPU_RESIDENT 1 or 2, after the first page-table rebuild of the native path). */
+static inline void boot_gr_log(FILE *f) {
+    if (!boot_gr_mode() || !boot_gr_st.rebuilds) return;
+    LARGE_INTEGER q; QueryPerformanceFrequency(&q);
+    if (boot_gr_mode() == 2)
+        fprintf(f, "; guest heaps (TOTK_GPU_RESIDENT 2, dry run, granule %llu KiB): regions %u (whole blocks %u, %llu MiB opened, %llu MiB resident), GPU-mapped %llu MiB "
+                   "(%u mappings, %u in %u fastmem sections), views would open %u spans %llu MiB",
+                (unsigned long long)(boot_gr_st.granule >> 10), boot_gr_st.wholes, boot_gr_st.wholes, (unsigned long long)(boot_gr_st.whole_bytes >> 20),
+                (unsigned long long)(boot_gr_st.resident_bytes >> 20), (unsigned long long)(boot_gr_st.mapped_bytes >> 20), boot_gr_st.mappings,
+                boot_gr_st.deferred, boot_gr_st.sections, boot_gr_st.spans, (unsigned long long)(boot_gr_st.would_bytes >> 20));
+    else
+        fprintf(f, "; guest heaps (TOTK_GPU_RESIDENT 1, granule %llu KiB): regions %u (views %u %llu MiB, whole blocks %u %llu MiB), opened %llu MiB, resident %llu MiB, "
+                   "GPU-mapped %llu MiB (%u mappings, %u in %u fastmem sections, %u spans, budget %u), whole-block opening would pin %llu MiB; "
+                   "views opened %llu (%llu MiB, %.0f ms), released %llu (%llu MiB), whole blocks released %llu (%llu MiB), reused %llu, fallbacks %llu, failures %llu, "
+                   "dropped %llu, stale %llu (%llu MiB alive), span gaps bridged %llu, texture views dropped %llu, section refreshes %llu, table reclaims %llu",
+                (unsigned long long)(boot_gr_st.granule >> 10), boot_gr_st.views + boot_gr_st.wholes, boot_gr_st.views, (unsigned long long)(boot_gr_st.view_bytes >> 20),
+                boot_gr_st.wholes, (unsigned long long)(boot_gr_st.whole_bytes >> 20), (unsigned long long)((boot_gr_st.view_bytes + boot_gr_st.whole_bytes) >> 20),
+                (unsigned long long)(boot_gr_st.resident_bytes >> 20), (unsigned long long)(boot_gr_st.mapped_bytes >> 20), boot_gr_st.mappings, boot_gr_st.deferred,
+                boot_gr_st.sections, boot_gr_st.spans, boot_gr_st.budget, (unsigned long long)(boot_gr_st.today_bytes >> 20),
+                (unsigned long long)boot_gr_st.opened, (unsigned long long)(boot_gr_st.opened_bytes >> 20), (double)boot_gr_st.open_qpc * 1000.0 / (double)q.QuadPart,
+                (unsigned long long)boot_gr_st.released, (unsigned long long)(boot_gr_st.released_bytes >> 20), (unsigned long long)boot_gr_st.wholes_released,
+                (unsigned long long)(boot_gr_st.wholes_released_bytes >> 20), (unsigned long long)boot_gr_st.reused, (unsigned long long)boot_gr_st.fallbacks,
+                (unsigned long long)boot_gr_st.failures, (unsigned long long)boot_gr_st.dropped, (unsigned long long)boot_gr_st.stale,
+                (unsigned long long)(boot_gr_st.stale_bytes >> 20), (unsigned long long)boot_gr_st.coarsened,
+                (unsigned long long)boot_gr_st.tex_views_dropped, (unsigned long long)boot_gr_st.refreshes, (unsigned long long)boot_gr_st.reclaims);
 }
 /* ---------------------------------------------------------------- shaders */
 /* batch-b: n-byte equality 8 bytes at a time, and a zero fill as one rep stosb (the memcmp / memset the DLL links work
@@ -1197,10 +1501,66 @@ static inline void boot_manifest_load_locked(const char *path) {
         if (!dup) boot_manifest.slot[k] = i + 1;
     }
 }
+/* water-work (2026-10-21): TOTK_SHADER_DENY (unset = off). Manifest rows it names are treated as absent, so those programs
+ * miss and their draws / dispatches are skipped exactly as before the rows existed: the run-time A/B of a staged shader
+ * install without editing shader-manifest.tsv (an edit would also drop the PSO cache, whose file carries the manifest's
+ * content hash). Value: a comma list of <hex id prefix, 8-64 digits>[:<variant>] (variant = a pixel row's VS output mask in
+ * hex, or a compute row's launch string such as 32x1x1s896l0; none = every row of that id; vertex rows ignore it), and
+ * 'water' = the 7 programs play-work/water-work installs (the compute one only in its new 32x1x1s896l0 variant). The first
+ * 32 denied lookups are logged to draw-path.log. Cost: lookups happen on shader-cache misses only; one parse per run. */
+static inline int boot_manifest_denied(const uint8_t id[32], char kind, uint32_t mask, const char *var) {
+    static volatile LONG state; static unsigned count, logged;
+    static struct { uint8_t nib[64]; unsigned len; char var[24]; } deny[32];
+    if (state != 2) {
+        if (InterlockedCompareExchange(&state, 1, 0) == 0) {
+            char e[1024]; DWORD k = GetEnvironmentVariableA("TOTK_SHADER_DENY", e, sizeof e);
+            static const char water[] = "fffb1d80c0da1918:1,65455ad2f8ba3f19:1,7cf7f4c86641501d:1,7f194afcf0714900:0,"
+                                        "3b084d77987ed6db,c33061b840068972,5dac95a2886b3669:32x1x1s896l0";
+            char list[1400]; size_t o = 0; list[0] = 0;
+            if (k && k < sizeof e)
+                for (const char *t = e; *t; ) {   /* expand 'water' */
+                    const char *end = strchr(t, ','); size_t n = end ? (size_t)(end - t) : strlen(t);
+                    const char *add = (n == 5 && !_strnicmp(t, "water", 5)) ? water : t; size_t an = add == water ? sizeof water - 1 : n;
+                    if (o + an + 2 < sizeof list) { if (o) list[o++] = ','; memcpy(list + o, add, an); o += an; list[o] = 0; }
+                    t += n; if (*t == ',') ++t;
+                }
+            for (const char *t = list; *t && count < 32; ) {
+                const char *end = strchr(t, ','); size_t n = end ? (size_t)(end - t) : strlen(t);
+                unsigned len = 0; size_t j = 0;
+                for (; j < n && len < 64; ++j) {
+                    char ch = t[j]; int v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+                    if (v < 0) break;
+                    deny[count].nib[len++] = (uint8_t)v;
+                }
+                deny[count].var[0] = 0;
+                if (j < n && t[j] == ':') { size_t vn = n - j - 1; if (vn >= sizeof deny[count].var) vn = sizeof deny[count].var - 1; memcpy(deny[count].var, t + j + 1, vn); deny[count].var[vn] = 0; }
+                if (len >= 8) { deny[count].len = len; ++count; }
+                t += n; if (*t == ',') ++t;
+            }
+            if (count) { FILE *lf = fopen("draw-path.log", "a"); if (lf) { fprintf(lf, "shader deny (TOTK_SHADER_DENY): %u entries: %s\n", count, list); fclose(lf); } }
+            MemoryBarrier(); state = 2;
+        } else while (state != 2) Sleep(0);
+    }
+    for (unsigned d = 0; d < count; ++d) {
+        unsigned i = 0;
+        for (; i < deny[d].len; ++i) if (((id[i / 2] >> ((i & 1) ? 0 : 4)) & 15) != deny[d].nib[i]) break;
+        if (i < deny[d].len) continue;
+        if (deny[d].var[0] && kind == 'p' && strtoul(deny[d].var, NULL, 16) != mask) continue;
+        if (deny[d].var[0] && kind == 'c' && (!var || strcmp(deny[d].var, var))) continue;
+        if (logged < 32) {
+            FILE *lf = fopen("draw-path.log", "a");
+            if (lf) { fprintf(lf, "shader deny: %c %02x%02x%02x%02x%02x%02x%02x%02x %s treated as not in the manifest\n", kind, id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+                              kind == 'c' && var ? var : ""); fclose(lf); ++logged; }
+        }
+        return 1;
+    }
+    return 0;
+}
 /* Copies the entry's texture list and DXIL path; 0 when the manifest has none. */
 static inline int boot_manifest_find(const char *manifest_path, const uint8_t id[32], char kind, uint32_t mask, const char *var,
                                      char *tex, size_t tex_cap, char *path, size_t path_cap) {
     const char *file = boot_manifest_file(manifest_path);
+    if (boot_manifest_denied(id, kind, mask, var)) return 0;   /* water-work: TOTK_SHADER_DENY (off when unset) */
     for (int attempt = 0; attempt < 2; ++attempt) {
         int found = 0;
         AcquireSRWLockShared(&boot_manifest.lock);
@@ -1261,11 +1621,26 @@ static inline void boot_render_ldc_fix_path(char *path, size_t cap) {
     if (k <= 0 || (size_t)k >= sizeof alt || (size_t)k >= cap) return;
     if (GetFileAttributesA(alt) != INVALID_FILE_ATTRIBUTES) memcpy(path, alt, (size_t)k + 1);
 }
+/* nxport gap batch 4 (p96: K2 instance ID, K4 IADD3.RS carry, shd-S2 TMML order, L3 ATOM after KIL; play-work/p96/
+ * shader-batch): the retranslated DXIL replaced manifest files in place and swap.py kept the files before it in
+ * startup\shader-pre-p96 (same relative paths). TOTK_SHADER_BATCH4=0 loads those instead (A/B, off switch); a row without
+ * a kept file loads its manifest file as before. TOTK_LDC_FIX=0 (shader-hlsl-pre-ldc) wins over it. */
+static inline void boot_render_batch4_path(char *path, size_t cap) {
+    static int off = -1;
+    if (off < 0) { char v[8]; DWORD n = GetEnvironmentVariableA("TOTK_SHADER_BATCH4", v, sizeof v); off = n && n < sizeof v && v[0] == '0'; }
+    if (!off) return;
+    const char *at = strstr(path, "\\shader-hlsl-gis\\"); if (!at) at = strstr(path, "\\shader-hlsl\\");
+    if (!at) return;
+    char alt[900]; int k = snprintf(alt, sizeof alt, "%.*s\\shader-pre-p96%s", (int)(at - path), path, at);
+    if (k <= 0 || (size_t)k >= sizeof alt || (size_t)k >= cap) return;
+    if (GetFileAttributesA(alt) != INVALID_FILE_ATTRIBUTES) memcpy(path, alt, (size_t)k + 1);
+}
 static inline BootRenderShader *boot_render_shader_load(BootRender *r, const uint8_t id[32], uint32_t stage, uint32_t vs_mask) {
     /* play (47): the entry from the manifest index (the probe's startup\shader-manifest.tsv fallback included) */
     char tex[512], path[900]; BootRenderShader *found = NULL;
     if (!boot_manifest_find(r->manifest_path, id, stage ? 'p' : 'v', vs_mask, NULL, tex, sizeof tex, path, sizeof path)) return NULL;
     boot_render_ldc_fix_path(path, sizeof path);   /* batch-d: TOTK_LDC_FIX=0 -> shader-hlsl-pre-ldc */
+    boot_render_batch4_path(path, sizeof path);    /* nxport gap batch 4 (p96): TOTK_SHADER_BATCH4=0 -> shader-pre-p96 */
     do {
         FILE *b = fopen(path, "rb"); if (!b) break;
         fseek(b, 0, SEEK_END); long n = ftell(b); fseek(b, 0, SEEK_SET);
@@ -1281,6 +1656,7 @@ static inline BootRenderShader *boot_render_shader_load(BootRender *r, const uin
         } else free(data);
         fclose(b);
     } while (0);
+    if (found && !stage && boot_sd_on()) boot_sd_vs_scan(id, path);   /* suspect-diag S2: what the vertex shader's .hlsl says */
     return found;
 }
 
@@ -1338,7 +1714,7 @@ static inline int boot_render_shader_stores(BootRender *r, const BootRenderShade
 }
 
 /* ---------------------------------------------------------------- render targets */
-/* NVB197_SET_COLOR_TARGET_FORMAT_V_* (suyu RenderTargetFormat) -> DXGI. X (padding) channels use the
+/* NVB197_SET_COLOR_TARGET_FORMAT_V_* (open-gpu-doc clb197.h) -> DXGI. X (padding) channels use the
  * format with alpha: the guest never reads them. A2R10G10B10 has no DXGI equivalent. */
 static inline int boot_render_ct_format(uint32_t ct, DXGI_FORMAT *out) {
     DXGI_FORMAT f;
@@ -1510,7 +1886,7 @@ static inline uint8_t *boot_render_upload_alloc(BootRender *r, uint64_t bytes, I
 }
 
 /* Pitch-linear colour targets (SET_COLOR_TARGET_MEMORY.LAYOUT = PITCH): the WIDTH register holds the
- * row pitch in bytes (suyu ImageInfo: width = pitch / bytes per pixel). They render into a host texture
+ * row pitch in bytes (Ryujinx RtColorState.WidthOrStride: width = pitch / bytes per pixel). They render into a host texture
  * like block-linear targets (cache format | 0x20000) and, because the source GPU writes them straight
  * to memory where the CPU, the copy engine and compute read them, are written back to guest memory
  * (boot_render_flush_pitch) before anything else reads guest memory and when a submission ends. */
@@ -3606,6 +3982,7 @@ static inline void boot_render_idle_cleanup(BootRender *r) {
     boot_render_release_deferred();
     boot_render_sv_apply(r, 0); boot_render_sv_retire_poll(r, 1); boot_render_sv_hold = NULL;   /* drain-work: idle: nothing staged or held is in use */
     boot_render_gmem_pending = 0;   /* every guest-memory store recorded so far has completed */
+    boot_ds_idle();   /* data-snapshot: storing draws' and dispatches' storage buffers have completed too (v2fix: before the GPU-write table empties) */
     boot_render_gw_count = 0; boot_render_gw_all = 0;
     if (boot_render_idle_hook) boot_render_idle_hook(r);
     boot_render_uav_pending = 0;
@@ -3760,6 +4137,8 @@ static inline void boot_render_gt_pend(BootRender *r, uint64_t va, uint64_t size
         if (n == BOOT_RENDER_GT_CHUNK_TABLE) { for (unsigned j = 0; j < BOOT_RENDER_GT_CHUNK_TABLE; ++j) if (boot_render_gt_chunk_fence[j] < fence) boot_render_gt_chunk_fence[j] = fence; break; }
         uint64_t *t = &boot_render_gt_chunk_fence[c & (BOOT_RENDER_GT_CHUNK_TABLE - 1)]; if (*t < fence) *t = fence;
     }
+    if (fence > boot_render_gt_newest) boot_render_gt_newest = fence;
+    ++boot_render_gt_gen;
     boot_render_gt_pending[boot_render_gt_npending].va = va; boot_render_gt_pending[boot_render_gt_npending].end = va + size;
     boot_render_gt_pending[boot_render_gt_npending++].fence = fence;
 }
@@ -4109,7 +4488,11 @@ static inline int boot_render_cbv_ex(BootRender *r, uint64_t va, uint32_t size, 
     uint32_t cbv_tap_flags=mine?BOOT_CBV_TAP_FLAG_PATCHED:0;
     if (n) {
         uint8_t *src = boot_render_guest(r, va, n);
-        if (src) { memcpy(dst, src, n); boot_render_cb_copied += n; }
+        if (src) {
+            if (boot_ds_cb_now || boot_ds_fill_wanted(va, n)) boot_ds_fill(r, dst, va, src, n);   /* data-snapshot: the bytes at the submit call where it has them */
+            else memcpy(dst, src, n);
+            boot_render_cb_copied += n; if (boot_sd_on()) boot_sd_note(r, boot_ds_cb_now ? BOOT_SD_K_CBSNAP : BOOT_SD_K_CB, va, src, dst, n);   /* suspect-diag S1 */
+        }
         else {
             /* Games bind constant buffers larger than the memory behind them (up to 64 KiB) and read
              * only the used part: copy the mapped pages, zero the rest. The first page must map. */
@@ -4240,6 +4623,19 @@ typedef struct BootRenderTexTable { char magic[8]; uint32_t entry_size, count; B
 static BootRenderTexSlot *boot_render_tex_slots;
 /* One past the highest slot this module made valid: boot_render_invalidate scans [0, high). */
 static uint32_t boot_render_tex_high;
+/* gpu-resident: a released guest view (boot_gr_slot_release, queue idle) must not stay behind a zero-copy buffer texture: its
+ * revalidation compares the region resource pointer (boot_render_texture), which a new view could get again. Such slots are
+ * rebuilt at their next use; their descriptor reads zero meanwhile. */
+static inline void boot_gr_tex_forget(BootRender *r, ID3D12Resource *res) {
+    if (!boot_render_tex_slots || !res) return;
+    for (uint32_t i = 0; i < boot_render_tex_high && i < BOOT_RENDER_TEX_SLOTS; ++i) {
+        BootRenderTexSlot *s = &boot_render_tex_slots[i];
+        if (s->view_of != res) continue;
+        s->valid = 0; s->view_of = NULL; s->size = 0; boot_render_texmemo[i] = 0;
+        boot_render_null_srv(r, BOOT_DIM_BUFFER, i);
+        ++boot_gr_st.tex_views_dropped;
+    }
+}
 /* render-39: a slot is marked for a rebuild ("poisoned") by flipping a bit of its stored TIC word 0, so the
  * next lookup mismatches. Flipping twice before the rebuild restored the word and the stale texture was
  * reused (e.g. a CPU texel drain then the verifier in one submission, or two verifier passes over an unused
@@ -4259,9 +4655,9 @@ static inline int boot_render_dfb_on(void) {
     return v;
 }
 static uint64_t boot_render_dfb_kept;   /* drain2-work: target views not taken, the slot's depth copy refreshed in place instead */
-static inline int boot_render_dfb_keep_on(void) {   /* TOTK_DFB_KEEP_COPY (default on, only with TOTK_SLOT_VERSIONING) */
+static inline int boot_render_dfb_keep_on(void) {   /* TOTK_DFB_KEEP_COPY (default on, with TOTK_SLOT_VERSIONING or TOTK_TEX_KEEP: blacktex-work) */
     static int v = -1;
-    if (v < 0) { char e[8]; DWORD n = GetEnvironmentVariableA("TOTK_DFB_KEEP_COPY", e, sizeof e); v = boot_render_sv_on() && !(n && n < sizeof e && e[0] == '0'); }
+    if (v < 0) { char e[8]; DWORD n = GetEnvironmentVariableA("TOTK_DFB_KEEP_COPY", e, sizeof e); v = (boot_render_sv_on() || boot_render_tex_keep_on()) && !(n && n < sizeof e && e[0] == '0'); }
     return v;
 }
 /* render-39: CPU-written textures checked at use (boot_render_tex_watch_check below); entry + 1 per slot */
@@ -4278,13 +4674,25 @@ static inline void boot_render_tex_watch_forget(uint32_t index);
  * again), so the list always holds every valid slot and the scans find exactly what the full loops found. */
 static uint32_t boot_render_tex_live[BOOT_RENDER_TEX_SLOTS], boot_render_tex_live_n;
 static uint8_t boot_render_tex_live_in[BOOT_RENDER_TEX_SLOTS];
+/* mem-work (texture census, TOTK_TEX_CENSUS): non-zero while the slot's resource holds ASTC decoded to RGBA8 (set by the
+ * guest build after boot_render_tex_mark, which clears it for every other build path): bit 0 ASTC, bits 1-4 the memory
+ * components the TIC swizzle reads (R, G, B, A), bit 5 sRGB view, bit 6 blocks larger than 4x4. Diagnostic only. */
+static uint8_t boot_render_tex_astc[BOOT_RENDER_TEX_SLOTS];
+static uint64_t boot_render_tex_marks;   /* mem-work: builds so far (every path that makes a slot valid ends in tex_mark) */
+/* bc7-work (host_bc7.h): build serial per slot (every build path ends in boot_render_tex_mark), checked by queued encodes;
+ * TIC format of the last guest build (0x80 | components, 0 unknown), for the reinterpretation check; whether the slot
+ * holds a BC7 texture (set by host_bc7.h, 0 after every build) for the vertex-stage rule */
+static uint32_t boot_render_tex_serial[BOOT_RENDER_TEX_SLOTS];
+static uint8_t boot_render_tex_tic_fmt[BOOT_RENDER_TEX_SLOTS], boot_render_tex_bc7[BOOT_RENDER_TEX_SLOTS];
 static inline void boot_render_tex_mark(uint32_t index) {
+    ++boot_render_tex_serial[index]; boot_render_tex_tic_fmt[index] = 0; boot_render_tex_bc7[index] = 0;   /* bc7-work */
     boot_render_texmemo[index] = 0;   /* nvnpar-work: rebuilt */
     if (index >= boot_render_tex_high) boot_render_tex_high = index + 1;
     if (!boot_render_tex_live_in[index]) { boot_render_tex_live_in[index] = 1; boot_render_tex_live[boot_render_tex_live_n++] = index; }   /* t2-B */
     boot_render_tex_poisoned[index] = 0;
     boot_render_tex_subres[index] = 0;   /* wb-02 */
     boot_render_dfb_slot[index] = 0;     /* batch-b: set again by boot_render_dfb_note after a depth-feedback copy */
+    boot_render_tex_astc[index] = 0; ++boot_render_tex_marks;   /* mem-work: census flag (set again by an ASTC guest build), build count */
     if (boot_render_tex_watch_of[index]) boot_render_tex_watch_forget(index);   /* a guest build registers it again */
 }
 static inline void boot_render_tex_poison(uint32_t index) {
@@ -4359,11 +4767,11 @@ static inline void boot_render_tex_pend(uint32_t index) {
     if (index >= BOOT_RENDER_TEX_SLOTS) return;
     boot_render_slot_list[index] = boot_render_list_id;
     if (boot_render_tex_pending_n < 256) boot_render_tex_pending[boot_render_tex_pending_n++] = index;
-    else { boot_render_tex_pending_over = 1; boot_render_slot_rec[index] = boot_render_list_id; }   /* drain2-work: not listed, counted as recorded now */
+    else { boot_render_tex_pending_over = 1; boot_render_slot_rec_mark(index); }   /* drain2-work: not listed, counted as recorded now */
 }
 /* The draw / dispatch is being recorded now: its slots belong to the open list. */
 static inline void boot_render_tex_commit(void) {
-    for (unsigned i = 0; i < boot_render_tex_pending_n; ++i) boot_render_slot_list[boot_render_tex_pending[i]] = boot_render_slot_rec[boot_render_tex_pending[i]] = boot_render_list_id;   /* drain2-work: + recorded */
+    for (unsigned i = 0; i < boot_render_tex_pending_n; ++i) { boot_render_slot_list[boot_render_tex_pending[i]] = boot_render_list_id; boot_render_slot_rec_mark(boot_render_tex_pending[i]); }   /* drain2-work: + recorded (blacktex-work: + counted) */
     boot_render_tex_pending_n = 0; boot_render_tex_pending_over = 0;
 }
 /* nvnpar-work (diagnostic, draw-path.log): a slot rewritten while the open list uses it closes the list and waits for the
@@ -4412,15 +4820,16 @@ static inline void boot_render_sv_wg_log(BootRender *r, unsigned dim, uint32_t i
     static uint64_t n;
     if (++n > 32 && n % 1024) return;
     static const char *const why[3] = {"the open list", "an executed list still running", "the open list, the index already staged (two versions in one list)"};
-    static const char *const act[3] = {"written in place (TOTK_SLOT_VERSIONING=0, as before)", "staged (a reading open list was executed first, without a wait)", "waited for (no staging heap)"};
+    static const char *const act[4] = {"written in place (TOTK_SLOT_VERSIONING=0, as before)", "staged (a reading open list was executed first, without a wait)", "waited for (no staging heap)",
+                                       "staged with TOTK_SLOT_VERSIONING=0 (TOTK_TEX_KEEP: a reading open list was executed first, without a wait)"};
     const BootRenderTexSlot *s = boot_render_tex_slots && index < BOOT_RENDER_TEX_SLOTS ? &boot_render_tex_slots[index] : NULL;
     FILE *lf = fopen("draw-path.log", "a"); if (!lf) return;
     fprintf(lf, "drain2 descriptor guard #%llu: TIC %u table %u rewritten while %s may read it; slot valid %u resource %s dim %u va %llx size %llu feedback view %u;"
-                " last recorded use list %llu (list now %llu), its fence %llu (completed %llu); %s\n",
+                " last recorded use list %llu (list now %llu, %u bindings by its draws / dispatches), its fence %llu (completed %llu); %s (slot fields: before this write)\n",
             (unsigned long long)n, index, dim, why[kind < 3 ? kind : 0], s ? s->valid : 0u, s && s->res ? "yes" : "no", s ? s->dim : 0u,
             (unsigned long long)(s ? s->va : 0), (unsigned long long)(s ? s->size : 0), index < BOOT_RENDER_TEX_SLOTS ? (unsigned)boot_render_fb_on[index] : 0u,
-            (unsigned long long)used, (unsigned long long)boot_render_list_id, (unsigned long long)fence,
-            (unsigned long long)ID3D12Fence_GetCompletedValue(r->gpu->fence), act[how >= 0 && how < 3 ? how : 0]);
+            (unsigned long long)used, (unsigned long long)boot_render_list_id, index < BOOT_RENDER_TEX_SLOTS ? (unsigned)boot_render_slot_rec_n[index] : 0u, (unsigned long long)fence,
+            (unsigned long long)ID3D12Fence_GetCompletedValue(r->gpu->fence), act[how >= 0 && how < 4 ? how : 0]);
     fclose(lf);
 }
 /* Before slot `index`'s descriptors or resource change: 1 when no list that may still run uses them (drain-work, with
@@ -4491,8 +4900,8 @@ static uint64_t boot_render_tex_reused;                      /* rebuilds that re
 
 
 /* sun-work3: TIC swizzle of the depth formats. NVN's format table gives Z16 (0x3a) and Z24S8 (0x29) the default
- * swizzle (G, 0, 0, 1): Maxwell holds their depth in the G lane (Z24S8: R = stencil uint, G = depth unorm), as
- * suyu/yuzu's depth views show (vk_texture_cache.cpp ConvertGreenRed: G -> R on every depth/stencil view). The
+ * swizzle (G, 0, 0, 1): Maxwell holds their depth in the G lane (Z24S8: R = stencil uint, G = depth unorm), which is
+ * why NVN's table reads G for them. The
  * D3D12 views of these formats (R16_UNORM, R24_UNORM_X8_TYPELESS; boot_tex_format) hold the depth in component 0
  * and have no component 1, so the mapping FROM_MEMORY_COMPONENT_1 read 0: every sample and every depth compare of
  * a Z16 / Z24S8 texture returned 0. TOTK's sun-shadow cascades are Z16 (720x720x4 at 523e70000, sampled by ps
@@ -4635,6 +5044,7 @@ static inline int boot_render_cbv_direct(BootRender *r, uint64_t va, uint32_t si
     if(boot_cbv_tap_active()) boot_cbv_tap_resolved(cv.BufferLocation,cv.SizeInBytes,r->region[reg],off,r->region_size[reg],
         BOOT_CBV_TAP_DIRECT_REGION,(uint32_t)reg,boot_render_cb_scope,boot_render_list_id,boot_render_map_gen,0,NULL,0);
     boot_render_cbv_put(r, &cv, descriptor);
+    if (boot_sd_on()) boot_sd_note(r, BOOT_SD_K_DIRECT, va, r->region_cpu[reg] ? r->region_cpu[reg] + off : NULL, NULL, span);   /* suspect-diag S1 */
     ++boot_render_cb_direct;
     return 1;
 }
@@ -6103,6 +6513,7 @@ static inline void boot_render_tex_watch_check(BootRender *r, uint32_t index) {
                           (unsigned long long)boot_render_tex_watch_refreshes); fclose(lf); }
     }
 }
+#include "host_bc7.h"   /* bc7-work: ASTC textures held as BC7 (TOTK_BC7=1) */
 static inline int boot_render_fb_game_tic(BootRender *r, uint32_t index);   /*99: defined in draw header*/
 /* Creates the host texture for TIC index `index` (guest TIC pool at `pool`) and writes its SRV into
  * the table of its type: 1D, 1D array, 2D, 2D array, 3D, cube, cube array or 1D buffer. */
@@ -6190,7 +6601,8 @@ static inline int boot_render_texture_resolve(BootRender *r, uint64_t pool, uint
     }
     /* Table, layer count and memory layout. A 1D/2D/cube header with depth > 1 or a base layer views
      * one image (one or six layers) of a layered resource, which is laid out as the array type
-     * (suyu ImageInfo(TICEntry)). The view starts at the base layer. */
+     * (base layer: the TIC view_layer_base fields, deko3d source/maxwell/texture_image_control_block.h). The view
+     * starts at the base layer. */
     unsigned dim; uint32_t layers = 1, depth = 1; BootTic lt = t;
     int layered = t.depth > 1 || t.base_layer != 0;
     switch (t.texture_type) {
@@ -6330,14 +6742,23 @@ static inline int boot_render_texture_resolve(BootRender *r, uint64_t pool, uint
      * build saw the same guest bytes already holds this image: share its resource. */
     DXGI_FORMAT fmt = (t.srgb && f.srgb != DXGI_FORMAT_UNKNOWN) ? f.srgb : f.unorm;
     uint64_t sum_now = boot_render_tex_checksum(src, stride * layers); ID3D12Resource *tex = NULL; HRESULT hr = S_OK;
+    if (boot_sd_on()) boot_sd_tex_build(r, index, data_va, src, stride * layers, sum_now);   /* suspect-diag S1 / S4 */
+    BootBc7Pre bc7pre = {0};   /* bc7-work */
     {   int o = boot_render_tex_same(index, words, dim, sum_now, stride * layers);
-        if (o >= 0) {
+        if (o >= 0 && boot_bc7_share_ok(o)) {   /* bc7-work: a vertex-stage binding never shares a BC7 image */
             tex = boot_render_tex_slots[o].res; ID3D12Resource_AddRef(tex);
+            fmt = boot_bc7_view_format(tex, fmt);   /* bc7-work: a slot switched to BC7 is viewed as BC7 */
             if (previous) { boot_render_tex_pool_put(previous); previous = NULL; }
             ++boot_render_tex_shared;
             goto view;
         }
     }
+    /* bc7-work: exclusions, content key and the BC7 disk cache (a hit is uploaded as BC7: no ASTC decode, no RGBA8). The
+     * later stages plug in at host_bc7.h boot_bc7_choose_producer: GPU ASTC decode (stage 2) and direct ASTC 4x4 -> BC7
+     * block transcoding (stage 3) replace the CPU decode below for the textures they take. */
+    {   int bc7 = boot_bc7_try_cached(r, index, &t, &f, dim, levels, layers, stride, data_va, src, &previous, &tex, &fmt, &bc7pre);
+        if (bc7 > 0) goto view;
+        if (bc7 < 0) return BOOT_RENDER_E_FORMAT; }
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0}; D3D12_RESOURCE_DESC d = {0};
     int one_d = dim == BOOT_DIM_1D || dim == BOOT_DIM_1D_ARRAY;
     d.Dimension = one_d ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : dim == BOOT_DIM_3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -6443,7 +6864,7 @@ static inline int boot_render_texture_resolve(BootRender *r, uint64_t pool, uint
         return BOOT_RENDER_E_FORMAT;
     }
 view:;
-    /* View: the header's mip range (TEXHEAD res_min/max_mip_level, suyu ImageViewInfo) within the levels uploaded. */
+    /* View: the header's mip range (clb097tex.h NVB097_TEXHEAD_BL_RES_VIEW_MIN/MAX_MIP_LEVEL) within the levels uploaded. */
     UINT first_mip = t.view_min_mip < levels ? t.view_min_mip : levels - 1;
     UINT view_mips = t.view_max_mip >= first_mip ? t.view_max_mip - first_mip + 1 : 1;
     if (first_mip + view_mips > levels) view_mips = levels - first_mip;
@@ -6462,9 +6883,14 @@ view:;
     boot_render_tex_isolate_srv(r, index, dim, tex, &sv);
     memcpy(slot->words, words, 32); slot->res = tex; slot->valid = 1; slot->dim = dim; boot_render_tex_mark(index);
     slot->va = data_va; slot->size = stride * layers;
+    if (f.decode == BOOT_TEX_DECODE_ASTC) {   /* mem-work: census only */
+        unsigned cm = 0; for (unsigned c = 0; c < 4; ++c) if (t.source[c] >= 2 && t.source[c] <= 5) cm |= 1u << (t.source[c] - 2);
+        boot_render_tex_astc[index] = (uint8_t)(1u | cm << 1 | (fmt == f.srgb && f.srgb != DXGI_FORMAT_UNKNOWN ? 32u : 0u) | (f.block_w * f.block_h > 16 ? 64u : 0u));
+    } else boot_render_tex_astc[index] = 0;
     boot_render_tex_sum[index] = sum_now; boot_render_tex_dedup_note(index);
     boot_render_rt_copies_forget(index);   /* wb-01: a copy's registrations no longer describe this build (range invalidation does) */
     boot_render_tex_watch_note(index, &t, &f, lv, levels, layers, dim, fmt, src);   /* render-39 */
+    boot_bc7_built(r, index, t.components, &bc7pre, &sv);   /* bc7-work: a cache miss queues its BC7 encode */
     if (dim != BOOT_DIM_2D && dim != BOOT_DIM_2D_ARRAY && boot_render_tex_created[dim] < 4) boot_render_tex_log(&t, index, words, "created");
     ++boot_render_tex_created[dim];
     return BOOT_RENDER_OK;
@@ -6554,13 +6980,204 @@ static inline unsigned boot_render_tex_trim(BootRender *r, uint64_t budget) {
             if (dim != BOOT_DIM_BUFFER) boot_render_tex_pool_put(res);   /* shader-resource state, idle */
             else ID3D12Resource_Release(res);
             resident -= bytes; --count; ++evicted; boot_render_tex_evicted_bytes += bytes;
+            if (boot_sd_on()) boot_sd_tex_evict(i, 0);   /* suspect-diag S4 */
         }
         boot_render_tex_evictions += evicted;
     }
     free(cand);
     boot_render_tex_resident = resident; boot_render_tex_resident_count = count;
     if (resident > boot_render_tex_resident_peak) boot_render_tex_resident_peak = resident;
+    boot_bc7_idle(r);   /* bc7-work: queue idle: finished encodes switch their slots to BC7; new encodes within the frame budget */
     ++boot_render_tex_clock;
+    return evicted;
+}
+
+/* mem-work (texture lane): the texture budget between idle points. boot_render_tex_trim runs only with the queue idle
+ * and no list open. On the native path with frame overlap that is rare: play-96 (island fall) went 1500 submissions
+ * without one while the textures grew from 4883 to 7531 MiB against TOTK_TEX_BUDGET_MB=4096, past the 7180 MiB local
+ * budget DXGI gives an 8 GB GPU (beyond it Windows demotes allocations to system RAM), and its clock (one tick per trim)
+ * made "not used in the last two clocks" protect everything used since the trim before last. Every D3D12 texture is
+ * also charged 1:1 to process private bytes and system commit (measured: +256 MiB DEFAULT-heap texture = +256 MiB
+ * private, +0 working set).
+ * TOTK_TEX_LIVE_TRIM=1: at the end of every native submission (after the kick, the new list open and still empty) the
+ * valid slots are recounted from the live slot list (a resource shared by several slots once) and, beyond the budget,
+ * the least recently used slot textures are released down to 7/8 of it as boot_render_tex_trim releases them (the
+ * descriptor nulled, the slot rebuilt from guest memory at its next use; the texture kept by the pool when it has a
+ * free entry, else released by a worker thread, see boot_render_rel_queue), but only a slot
+ * whose last binding list (bound and recorded) completed on the GPU, that the open list does not use (nothing pending),
+ * that is no feedback slot or view, not versioned, and not used in the last TOTK_TEX_MIN_AGE clock ticks (default 4).
+ * The clock then ticks once per submission (~one per present in play), so the age is in frames, not in idle points.
+ * The 2D-array view a 2D slot also carries (boot_render_tex_isolate_srv) is nulled with it. Unset / 0: nothing below
+ * runs; boot_render_tex_trim at the idle points only, as before. */
+static inline int boot_render_tex_env_flag(const char *name) {
+    char e[8]; DWORD n = GetEnvironmentVariableA(name, e, sizeof e);
+    return n && n < sizeof e && e[0] == '1';
+}
+static inline int boot_render_tex_live_trim_on(void) { static int v = -1; if (v < 0) v = boot_render_tex_env_flag("TOTK_TEX_LIVE_TRIM"); return v; }
+static inline int boot_render_tex_census_on(void) { static int v = -1; if (v < 0) v = boot_render_tex_env_flag("TOTK_TEX_CENSUS"); return v; }
+static inline uint64_t boot_render_tex_budget(void) {   /* TOTK_TEX_BUDGET_MB, parsed as the idle trims parse it */
+    static uint64_t budget;
+    if (!budget) {
+        char v[32]; DWORD n = GetEnvironmentVariableA("TOTK_TEX_BUDGET_MB", v, sizeof v);
+        unsigned long long mb = (n && n < sizeof v) ? strtoull(v, NULL, 10) : 0;
+        budget = mb >= 256 ? (uint64_t)mb << 20 : BOOT_RENDER_TEX_BUDGET;
+    }
+    return budget;
+}
+static inline uint32_t boot_render_tex_min_age(void) {
+    static uint32_t a;
+    if (!a) {
+        char v[16]; DWORD n = GetEnvironmentVariableA("TOTK_TEX_MIN_AGE", v, sizeof v);
+        unsigned long x = (n && n < sizeof v) ? strtoul(v, NULL, 10) : 0;
+        a = x >= 2 && x <= 1000000 ? (uint32_t)x : 4;
+    }
+    return a;
+}
+/* Bytes of slot i's resource from the size cache, else estimated (no device call: the census runs without a BootRender). */
+static inline uint64_t boot_render_tex_bytes_cached(uint32_t i, ID3D12Resource *res) {
+    D3D12_RESOURCE_DESC d; res->lpVtbl->GetDesc(res, &d);
+    if (boot_render_tex_sized[i].res == res && boot_render_tex_sized[i].width == d.Width && boot_render_tex_sized[i].height == d.Height &&
+        boot_render_tex_sized[i].depth == d.DepthOrArraySize && boot_render_tex_sized[i].mips == d.MipLevels && boot_render_tex_sized[i].format == (uint32_t)d.Format)
+        return boot_render_tex_sized[i].bytes;
+    return d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? (uint64_t)d.Width : boot_render_tex_estimate(&d);
+}
+/* The unique resources of the valid slots: an open-addressed table keyed by the resource pointer (the texture dedup
+ * shares one resource between slots), rebuilt by every fill. age: clock ticks since the youngest holder's last use. */
+typedef struct BootRenderTexSeen { ID3D12Resource *res; uint64_t bytes, va, size; uint32_t age, holders; uint8_t astc; } BootRenderTexSeen;
+static BootRenderTexSeen *boot_render_tex_seen; static uint32_t boot_render_tex_seen_cap, boot_render_tex_seen_used, boot_render_tex_seen_n;
+/* Fills the table from the live slot list (an invalid entry leaves the list, as in the range scans: the list keeps every
+ * valid slot) and returns the resident bytes, each resource once (UINT64_MAX: no memory for the table); *count: slots
+ * holding a resource. r NULL: cached or estimated sizes only. */
+static inline uint64_t boot_render_tex_seen_fill(BootRender *r, uint64_t *count) {
+    uint64_t resident = 0, slots = 0; uint32_t want = 1024;
+    *count = 0; boot_render_tex_seen_n = 0;
+    while (want < 2u * boot_render_tex_live_n + 2u) want <<= 1;
+    if (want > boot_render_tex_seen_cap) {
+        BootRenderTexSeen *t = (BootRenderTexSeen *)realloc(boot_render_tex_seen, (size_t)want * sizeof *t);
+        if (!t) return UINT64_MAX;
+        boot_render_tex_seen = t; boot_render_tex_seen_cap = want;
+    }
+    boot_render_tex_seen_used = want; memset(boot_render_tex_seen, 0, (size_t)want * sizeof *boot_render_tex_seen);
+    const uint32_t mask = want - 1;
+    for (uint32_t k = 0; k < boot_render_tex_live_n; ) {
+        uint32_t i = boot_render_tex_live[k]; const BootRenderTexSlot *s = &boot_render_tex_slots[i];
+        if (!s->valid) { boot_render_tex_live_in[i] = 0; boot_render_tex_live[k] = boot_render_tex_live[--boot_render_tex_live_n]; continue; }
+        ++k;
+        if (!s->res) continue;
+        ++slots;
+        const uint32_t age = boot_render_tex_clock - boot_render_tex_last[i];
+        uint32_t h = (uint32_t)((((uint64_t)(uintptr_t)s->res >> 4) * UINT64_C(0x9E3779B97F4A7C15)) >> 40) & mask;
+        while (boot_render_tex_seen[h].res && boot_render_tex_seen[h].res != s->res) h = (h + 1) & mask;
+        BootRenderTexSeen *e = &boot_render_tex_seen[h];
+        if (e->res) { ++e->holders; if (age < e->age) e->age = age; continue; }
+        e->res = s->res; e->bytes = r ? boot_render_tex_slot_bytes(r, i, s->res) : boot_render_tex_bytes_cached(i, s->res);
+        e->va = s->va; e->size = s->size; e->age = age; e->holders = 1; e->astc = boot_render_tex_astc[i];
+        ++boot_render_tex_seen_n; resident += e->bytes;
+    }
+    *count = slots;
+    return resident;
+}
+/* Texture releases off the render thread. A committed texture's Release costs 0.2-0.5 ms here (measured on this
+ * RTX 4070 Laptop, game closed: 64x64 0.23 ms, 2048x2048 0.51 ms; the trim test: 375 evictions, 110 ms on the calling
+ * thread, nearly all of it in the pool's releases of what it could not keep). The live trim hands a texture whose last
+ * list completed and whose descriptors are nulled to a below-normal-priority worker (D3D12 objects are free-threaded);
+ * ring full or no worker: released on the spot. */
+#define BOOT_RENDER_REL_RING 16384u
+static struct { SRWLOCK lock; HANDLE event; int ok, tried; uint32_t head, tail; uint64_t queued, released, inline_releases; ID3D12Resource *ring[BOOT_RENDER_REL_RING]; } boot_render_rel;
+static DWORD WINAPI boot_render_rel_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (WaitForSingleObject(boot_render_rel.event, INFINITE) != WAIT_OBJECT_0) return 0;
+        for (;;) {
+            ID3D12Resource *t = NULL;
+            AcquireSRWLockExclusive(&boot_render_rel.lock);
+            if (boot_render_rel.tail != boot_render_rel.head) { t = boot_render_rel.ring[boot_render_rel.tail % BOOT_RENDER_REL_RING]; ++boot_render_rel.tail; }
+            ReleaseSRWLockExclusive(&boot_render_rel.lock);
+            if (!t) break;
+            ID3D12Resource_Release(t);
+            AcquireSRWLockExclusive(&boot_render_rel.lock); ++boot_render_rel.released; ReleaseSRWLockExclusive(&boot_render_rel.lock);
+        }
+    }
+}
+static inline void boot_render_rel_queue(ID3D12Resource *t) {   /* t: idle, no descriptor left; one reference handed over */
+    if (!boot_render_rel.tried) {
+        boot_render_rel.tried = 1;   /* the static SRWLOCK is zero: initialised */
+        boot_render_rel.event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        HANDLE th = boot_render_rel.event ? CreateThread(NULL, 0, boot_render_rel_main, NULL, 0, NULL) : NULL;
+        if (th) { SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(th); boot_render_rel.ok = 1; }
+    }
+    int queued = 0;
+    if (boot_render_rel.ok) {
+        AcquireSRWLockExclusive(&boot_render_rel.lock);
+        if (boot_render_rel.head - boot_render_rel.tail < BOOT_RENDER_REL_RING) { boot_render_rel.ring[boot_render_rel.head % BOOT_RENDER_REL_RING] = t; ++boot_render_rel.head; queued = 1; }
+        ReleaseSRWLockExclusive(&boot_render_rel.lock);
+    }
+    if (queued) ++boot_render_rel.queued; else { ID3D12Resource_Release(t); ++boot_render_rel.inline_releases; }
+}
+/* The texture pool without its drops: kept only when an entry is free and the bytes fit (pool_put would release the oldest
+ * entries on this thread to make room). 1: kept. */
+static inline int boot_render_tex_pool_keep(ID3D12Resource *t) {
+    D3D12_RESOURCE_DESC d; t->lpVtbl->GetDesc(t, &d);
+    const uint64_t bytes = boot_render_tex_estimate(&d);
+    if (bytes > BOOT_RENDER_TEX_POOL_BYTES / 4 || boot_render_tex_pool_bytes + bytes > BOOT_RENDER_TEX_POOL_BYTES) return 0;
+    for (unsigned k = 0; k < BOOT_RENDER_TEX_POOL; ++k) if (!boot_render_tex_pool[k].res) {
+        boot_render_tex_pool[k].res = t; boot_render_tex_pool[k].bytes = bytes; boot_render_tex_pool[k].age = ++boot_render_tex_pool_clock;
+        boot_render_tex_pool_bytes += bytes; return 1;
+    }
+    return 0;
+}
+static uint64_t boot_render_tex_lt_runs, boot_render_tex_lt_skips, boot_render_tex_lt_evictions, boot_render_tex_lt_bytes, boot_render_tex_lt_short, boot_render_tex_lt_qpc, boot_render_tex_lt_max_qpc;
+static uint64_t boot_render_tex_lt_marks = UINT64_MAX;
+static uint32_t *boot_render_tex_lt_cand; static uint32_t boot_render_tex_lt_cap;
+/* End of a native submission with TOTK_TEX_LIVE_TRIM=1 (see above). No slot built since the last call and the resident
+ * bytes within the budget: only the clock ticks (nothing can have grown). Returns the number of evicted slots. */
+static inline unsigned boot_render_tex_trim_live(BootRender *r, uint64_t budget) {
+    if (!boot_render_tex_slots) return 0;
+    if (boot_render_tex_lt_marks == boot_render_tex_marks && boot_render_tex_resident <= budget) { ++boot_render_tex_lt_skips; ++boot_render_tex_clock; return 0; }
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    ++boot_render_tex_lt_runs; boot_render_tex_lt_marks = boot_render_tex_marks;
+    uint64_t count = 0; const uint64_t found = boot_render_tex_seen_fill(r, &count); uint64_t resident = found; unsigned evicted = 0, queued = 0;
+    if (found == UINT64_MAX) { boot_render_tex_lt_marks = UINT64_MAX; ++boot_render_tex_clock; return 0; }   /* no memory for the table: nothing decided */
+    if (found > boot_render_tex_resident_peak) boot_render_tex_resident_peak = found;   /* before evictions: the bytes that existed */
+    if (found > budget && !boot_render_tex_pending_n && !boot_render_tex_pending_over) {
+        if (boot_render_tex_lt_cap < boot_render_tex_live_n) {
+            uint32_t *c = (uint32_t *)realloc(boot_render_tex_lt_cand, (size_t)boot_render_tex_live_n * sizeof *c);
+            if (c) { boot_render_tex_lt_cand = c; boot_render_tex_lt_cap = boot_render_tex_live_n; }
+        }
+        uint32_t n = 0; const uint32_t min_age = boot_render_tex_min_age();
+        for (uint32_t k = 0; k < boot_render_tex_live_n && n < boot_render_tex_lt_cap; ++k) {
+            const uint32_t i = boot_render_tex_live[k]; const BootRenderTexSlot *s = &boot_render_tex_slots[i];
+            if (!s->valid || !s->res || i >= BOOT_RENDER_TEX_SLOTS - 256u || boot_render_fb_on[i] || boot_render_sv_flag[i]) continue;
+            if (boot_render_tex_clock - boot_render_tex_last[i] < min_age) continue;
+            if (!boot_render_list_done(r, boot_render_slot_list[i]) || !boot_render_list_done(r, boot_render_slot_rec[i])) continue;
+            boot_render_tex_lt_cand[n++] = i;
+        }
+        if (n) qsort(boot_render_tex_lt_cand, n, sizeof *boot_render_tex_lt_cand, boot_render_tex_age_cmp);
+        const uint64_t target = budget - budget / 8;
+        for (uint32_t k = 0; k < n && resident > target; ++k) {
+            const uint32_t i = boot_render_tex_lt_cand[k]; BootRenderTexSlot *s = &boot_render_tex_slots[i];
+            const int shared = boot_render_res_refs(s->res) > 1;
+            uint64_t bytes = shared ? 0 : boot_render_tex_slot_bytes(r, i, s->res);   /* shared: freed with its last holder */
+            ID3D12Resource *res = s->res; unsigned dim = s->dim;
+            s->res = NULL; s->valid = 0; s->view_of = NULL; s->size = 0;
+            boot_render_texmemo[i] = 0;
+            boot_render_tex_sized[i].res = NULL;
+            if (dim < BOOT_RENDER_DIMS) boot_render_null_srv(r, dim, i);
+            if (dim == BOOT_DIM_2D) boot_render_null_srv(r, BOOT_DIM_2D_ARRAY, i);
+            if (shared) ID3D12Resource_Release(res);   /* another slot's image: only this slot's reference */
+            else if (dim == BOOT_DIM_BUFFER || !boot_render_tex_pool_keep(res)) { boot_render_rel_queue(res); ++queued; }
+            resident = bytes < resident ? resident - bytes : 0; if (count) --count;
+            ++evicted; boot_render_tex_evicted_bytes += bytes; boot_render_tex_lt_bytes += bytes;
+            if (boot_sd_on()) boot_sd_tex_evict(i, 1);   /* suspect-diag S4 */
+        }
+        if (queued && boot_render_rel.ok) SetEvent(boot_render_rel.event);
+        if (resident > target) ++boot_render_tex_lt_short;   /* the recent working set alone is over 7/8 of the budget */
+        boot_render_tex_evictions += evicted; boot_render_tex_lt_evictions += evicted;
+    }
+    boot_render_tex_resident = resident; boot_render_tex_resident_count = count;
+    ++boot_render_tex_clock;
+    QueryPerformanceCounter(&q1);
+    const uint64_t dq = (uint64_t)(q1.QuadPart - q0.QuadPart); boot_render_tex_lt_qpc += dq; if (dq > boot_render_tex_lt_max_qpc) boot_render_tex_lt_max_qpc = dq;
     return evicted;
 }
 
@@ -7120,6 +7737,1698 @@ static inline int boot_render_ind_ib(BootRender *r, uint64_t va, uint32_t idx_by
     ib->BufferLocation = c[i].gpu; ib->SizeInBytes = (UINT)(c[i].span & ~(uint64_t)(idx_bytes - 1));
     ib->Format = idx_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
     return 1;
+}
+
+/* ---------------------------------------------------------------- suspect-diag (see the top of this header) */
+static const char *const boot_sd_kind_name[BOOT_SD_K_N] = {"cb-copy", "cb-direct", "index", "texture", "vertex", "cb-snap", "vertex-snap", "index-zc", "index-snap"};
+static inline uint32_t boot_sd_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi) {
+    char v[16]; DWORD k = GetEnvironmentVariableA(name, v, sizeof v);
+    if (!k || k >= sizeof v) return def;
+    unsigned long x = strtoul(v, NULL, 10);
+    return x < lo ? lo : x > hi ? hi : (uint32_t)x;
+}
+static inline const char *boot_sd_env_raw(const char *name, char *buf, DWORD cap) {
+    DWORD k = GetEnvironmentVariableA(name, buf, cap);
+    return k && k < cap ? buf : "(unset)";
+}
+static inline int boot_sd_hexval(char ch) {
+    return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+/* shader-labels.tsv: <canonical id hex>\t<kind>\t<variant>\t<stem>\t<family>\t... ; key = the id's first 8 bytes as memcpy'd */
+static inline void boot_sd_labels_load(BootSdState *S) {
+    char path[600]; DWORD k = GetEnvironmentVariableA("TOTK_SHADER_LABELS", path, sizeof path);
+    const char *tries[3] = {k && k < sizeof path ? path : NULL, "startup\\shader-labels.tsv", "shader-labels.tsv"};
+    FILE *f = NULL;
+    for (unsigned t = 0; t < 3 && !f; ++t) if (tries[t]) f = fopen(tries[t], "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = n > 0 && n < (64L << 20) ? (char *)malloc((size_t)n + 1) : NULL;
+    BootSdLabel *tab = text ? (BootSdLabel *)calloc(BOOT_SD_LABELS, sizeof *tab) : NULL;
+    if (!tab || fread(text, 1, (size_t)n, f) != (size_t)n) { free(text); free(tab); fclose(f); return; }
+    fclose(f); text[n] = 0;
+    uint32_t count = 0;
+    for (char *line = text; *line; ) {
+        char *end = strchr(line, '\n'); char *next = end ? end + 1 : line + strlen(line);
+        if (end) { *end = 0; if (end > line && end[-1] == '\r') end[-1] = 0; }
+        if (line[0] != '#') {
+            char *field[5] = {line, NULL, NULL, NULL, NULL}; unsigned nf = 1;
+            for (char *q = line; *q && nf < 5; ++q) if (*q == '\t') { *q = 0; field[nf++] = q + 1; }
+            if (nf == 5) { char *t = strchr(field[4], '\t'); if (t) *t = 0; }
+            uint8_t b[8]; int ok = nf == 5 && strlen(field[0]) >= 16;
+            for (unsigned i = 0; ok && i < 8; ++i) {
+                int hi = boot_sd_hexval(field[0][2 * i]), lo = boot_sd_hexval(field[0][2 * i + 1]);
+                if (hi < 0 || lo < 0) ok = 0; else b[i] = (uint8_t)(hi << 4 | lo);
+            }
+            if (ok && count < BOOT_SD_LABELS / 2) {
+                uint64_t key; memcpy(&key, b, 8); if (!key) key = 1;
+                uint32_t h = (uint32_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 48) & (BOOT_SD_LABELS - 1);
+                while (tab[h].key && tab[h].key != key) h = (h + 1) & (BOOT_SD_LABELS - 1);
+                if (!tab[h].key) { tab[h].key = key; tab[h].family = field[4]; ++count; }
+                else if (field[1][0] == 'v') tab[h].family = field[4];   /* a vertex shader row wins */
+            }
+        }
+        line = next;
+    }
+    S->labels_text = text; S->labels = tab; S->nlabels = count;
+}
+static inline const char *boot_sd_family(const BootSdState *S, uint64_t key) {
+    if (!S->labels) return "?";
+    if (!key) key = 1;
+    for (uint32_t h = (uint32_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 48) & (BOOT_SD_LABELS - 1), n = 0; n < BOOT_SD_LABELS && S->labels[h].key; ++n, h = (h + 1) & (BOOT_SD_LABELS - 1))
+        if (S->labels[h].key == key) return S->labels[h].family;
+    return "?";
+}
+static inline void boot_sd_event(BootSdState *S, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static inline void boot_sd_event(BootSdState *S, const char *fmt, ...) {
+    if (!S->log) return;
+    va_list ap; va_start(ap, fmt); vfprintf(S->log, fmt, ap); va_end(ap);
+    fputc('\n', S->log); S->dirty = 1;
+}
+/* State on first use (always under the renderer lock: draw path, submit-call end, present). NULL: no memory (switch off). */
+static inline __attribute__((noinline)) BootSdState *boot_sd_init(void) {
+    BootSdState *S = (BootSdState *)calloc(1, sizeof *S);
+    if (S) {
+        S->rec = (BootSdRec *)calloc(BOOT_SD_RECS, sizeof *S->rec);
+        S->seen = (uint64_t *)calloc(BOOT_SD_SEEN, sizeof *S->seen); S->seen_stamp = (uint32_t *)calloc(BOOT_SD_SEEN, sizeof *S->seen_stamp);
+        S->vs = (BootSdVs *)calloc(BOOT_SD_VS, sizeof *S->vs);
+        S->vs_tex = (uint32_t *)calloc(BOOT_SD_TIC, sizeof *S->vs_tex); S->vs_tex_va = (uint64_t *)calloc(BOOT_SD_TIC, sizeof *S->vs_tex_va);
+        S->evicted = (uint8_t *)calloc(BOOT_SD_TIC, 1);
+    }
+    if (!S || !S->rec || !S->seen || !S->seen_stamp || !S->vs || !S->vs_tex || !S->vs_tex_va || !S->evicted) {
+        if (S) { free(S->rec); free(S->seen); free(S->seen_stamp); free(S->vs); free(S->vs_tex); free(S->vs_tex_va); free(S->evicted); free(S); }
+        boot_sd_mode = 0; return NULL;
+    }
+    S->stamp = 1;
+    S->budget = (uint64_t)boot_sd_env_u32("TOTK_SUSPECT_DIAG_MB", 4, 1, 1024) << 20;
+    S->events_max = boot_sd_env_u32("TOTK_SUSPECT_DIAG_EVENTS", 40, 0, 100000);
+    S->tex_n = boot_sd_env_u32("TOTK_SUSPECT_DIAG_TEX_N", 600, 1, 1000000);
+    S->gr_every = boot_sd_env_u32("TOTK_SUSPECT_DIAG_GR_EVERY", 30, 1, 100000);
+    S->gr_pages_max = boot_sd_env_u32("TOTK_SUSPECT_DIAG_GR_PAGES", 48, 1, 4096);
+    { LARGE_INTEGER q; QueryPerformanceFrequency(&q); S->qpf = q.QuadPart > 0 ? (uint64_t)q.QuadPart : 1; }
+    boot_sd_labels_load(S);
+    CreateDirectoryA("frames", NULL);
+    MoveFileExA("frames\\suspect-diag.log", "frames\\suspect-diag.prev.log", MOVEFILE_REPLACE_EXISTING);
+    S->log = fopen("frames\\suspect-diag.log", "w");
+    if (S->log) {
+        setvbuf(S->log, NULL, _IOFBF, 1 << 16);
+        char a[32], b[32], c[32], d[32], e[32], f[32], g[32];
+        SYSTEMTIME t; GetLocalTime(&t);
+        boot_sd_event(S, "# suspect-diag v1 %02u:%02u:%02u (TOTK_SUSPECT_DIAG=%d%s): TOTK_RERECORD_VERSION=%s TOTK_INSTANCE_ID_ZERO_BASED=%s TOTK_GPU_RESIDENT=%s "
+                         "TOTK_TEX_LIVE_TRIM=%s TOTK_TEX_MIN_AGE=%s TOTK_SHADER_BATCH4=%s TOTK_OVERLAP=%s; budget %llu MiB per kind and call, %u events per suspect, "
+                         "S4 window %u presents, S3 every %u presents (%u pages); shader labels %u",
+                       t.wHour, t.wMinute, t.wSecond, boot_sd_mode, boot_sd_mode == 2 ? ": S1 on material draws only" : "",
+                       boot_sd_env_raw("TOTK_RERECORD_VERSION", a, sizeof a), boot_sd_env_raw("TOTK_INSTANCE_ID_ZERO_BASED", b, sizeof b),
+                       boot_sd_env_raw("TOTK_GPU_RESIDENT", c, sizeof c), boot_sd_env_raw("TOTK_TEX_LIVE_TRIM", d, sizeof d), boot_sd_env_raw("TOTK_TEX_MIN_AGE", e, sizeof e),
+                       boot_sd_env_raw("TOTK_SHADER_BATCH4", f, sizeof f), boot_sd_env_raw("TOTK_OVERLAP", g, sizeof g),
+                       (unsigned long long)(S->budget >> 20), S->events_max, S->tex_n, S->gr_every, S->gr_pages_max, S->nlabels);
+        boot_sd_event(S, "# frame = frame-N.bmp / glitch.log 'GLITCH present N' number of the frame being built; sub = submission (boot_render_exec_id); "
+                         "draw = draw number within the submission; vs = first 8 bytes of the vertex shader id; key = draw-census key (frames\\draw-census.log)");
+        fflush(S->log);
+    }
+    boot_sd_st = S;
+    return S;
+}
+static inline BootSdState *boot_sd_state(void) { return boot_sd_st ? boot_sd_st : boot_sd_mode > 0 ? boot_sd_init() : NULL; }
+/* S2: what a vertex shader's .hlsl (next to its .vs.dxil) says: the attributes it fetches (vin_attr4(g...)), whether it reads
+ * InstanceId (the token iid outside the prologue and the attribute fetches) and whether it was translated with K2 (its prologue
+ * adds host_iid_offset()). Once per vertex shader, at its load. */
+static inline void boot_sd_vs_scan(const uint8_t id[32], const char *dxil_path) {
+    BootSdState *S = boot_sd_state(); if (!S || !dxil_path) return;
+    uint64_t key; memcpy(&key, id, 8); if (!key) key = 1;
+    uint32_t h = (uint32_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 50) & (BOOT_SD_VS - 1), n = 0;
+    while (S->vs[h].key && S->vs[h].key != key && n < BOOT_SD_VS) { h = (h + 1) & (BOOT_SD_VS - 1); ++n; }
+    if (n == BOOT_SD_VS || S->vs[h].key == key) return;
+    BootSdVs *v = &S->vs[h]; v->key = key; v->flags = 1; v->attr_mask = 0;
+    char hp[960]; const char *dot = strstr(dxil_path, ".vs.dxil"); size_t stem = dot ? (size_t)(dot - dxil_path) : 0;
+    if (!dot || stem + 6 > sizeof hp) { v->flags |= 8; return; }
+    memcpy(hp, dxil_path, stem); memcpy(hp + stem, ".hlsl", 6);
+    FILE *f = fopen(hp, "rb"); if (!f) { v->flags |= 8; return; }
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = len > 0 && len < (16L << 20) ? (char *)malloc((size_t)len + 1) : NULL;
+    if (!t || fread(t, 1, (size_t)len, f) != (size_t)len) { free(t); fclose(f); v->flags |= 8; return; }
+    fclose(f); t[len] = 0;
+    for (char *line = t; *line; ) {
+        char *end = strchr(line, '\n'); char *next = end ? end + 1 : line + strlen(line);
+        if (end) *end = 0;
+        if (strstr(line, "host_iid_offset()")) v->flags |= 4;
+        const char *fa = strstr(line, "vin_attr4(");
+        if (fa) { unsigned g = (unsigned)strtoul(fa + 10, NULL, 10); if (g < 32) v->attr_mask |= 1u << g; }
+        else if (!strstr(line, "iid_")) {
+            for (const char *q = strstr(line, "iid"); q; q = strstr(q + 3, "iid")) {
+                char before = q > line ? q[-1] : ' ', after = q[3];
+                int idb = (before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') || (before >= '0' && before <= '9') || before == '_';
+                int ida = (after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') || (after >= '0' && after <= '9') || after == '_';
+                if (!idb && !ida) { v->flags |= 2; break; }
+            }
+        }
+        line = next;
+    }
+    free(t);
+}
+static inline const BootSdVs *boot_sd_vs_info(const BootSdState *S, uint64_t key) {
+    if (!key) key = 1;
+    for (uint32_t h = (uint32_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 50) & (BOOT_SD_VS - 1), n = 0; n < BOOT_SD_VS && S->vs[h].key; ++n, h = (h + 1) & (BOOT_SD_VS - 1))
+        if (S->vs[h].key == key) return &S->vs[h];
+    return NULL;
+}
+/* Guest GPU VA -> host pointer through the CPU page table, as boot_render_guest but without its GPU-write guard (no wait). */
+static inline const uint8_t *boot_sd_guest(const BootRender *r, uint64_t va, uint64_t size, uint32_t *reg) {
+    if ((va >> 12) < r->va_base_page || !size) return NULL;
+    uint64_t page = (va >> 12) - r->va_base_page;
+    if (page >= r->ptable_pages) return NULL;
+    uint32_t e = r->ptable_cpu[page];
+    if (e == 0xffffffffu || (e >> 24) >= r->region_count || !r->region_cpu[e >> 24]) return NULL;
+    uint64_t off = ((uint64_t)(e & 0xffffff) << 12) | (va & 0xfff);
+    if (off > r->region_size[e >> 24] || size > r->region_size[e >> 24] - off) return NULL;
+    uint64_t last = ((va & 0xfff) + size - 1) >> 12;
+    for (uint64_t q = 1; q <= last; ++q) if (page + q >= r->ptable_pages || r->ptable_cpu[page + q] != e + (uint32_t)q) return NULL;
+    if (reg) *reg = e >> 24;
+    return r->region_cpu[e >> 24] + off;
+}
+/* S1: a range read during the call (p: where it was read; hp: the bytes to hash now, p if NULL; a texture build passes its
+ * build checksum instead, see boot_sd_tex_build). Duplicates within the call, budget overflow and ranges not in one region
+ * are counted, not recorded. */
+static inline void boot_sd_record(BootRender *r, unsigned kind, uint64_t va, const uint8_t *p, const uint8_t *hp, uint64_t n, int hashed, uint64_t hash) {
+    BootSdState *S = boot_sd_state(); if (!S || !p || !n || kind >= BOOT_SD_K_N) return;
+    if (S->in_draw) { if (kind == BOOT_SD_K_CB) ++S->draw_copies; else if (kind == BOOT_SD_K_DIRECT) ++S->draw_direct; }
+    if (boot_sd_mode == 2 && !S->material) return;
+    const uint64_t dk = (uint64_t)(uintptr_t)p ^ ((n > 0xffff ? 0xffff : n) << 48) ^ ((uint64_t)kind << 44);
+    for (uint32_t h = (uint32_t)((dk * UINT64_C(0x9E3779B97F4A7C15)) >> 48) & (BOOT_SD_SEEN - 1), probe = 0; ; h = (h + 1) & (BOOT_SD_SEEN - 1), ++probe) {
+        if (S->seen_stamp[h] != S->stamp) { S->seen_stamp[h] = S->stamp; S->seen[h] = dk; break; }
+        if (S->seen[h] == dk) { ++S->c.dup[kind]; return; }
+        if (probe >= 16) break;   /* crowded: record it anyway */
+    }
+    if (S->nrec >= BOOT_SD_RECS || S->kind_bytes[kind] + n > S->budget) { ++S->c.unsampled[kind]; return; }
+    uint32_t reg = 0;
+    const uint8_t *q = boot_sd_guest(r, va, n, &reg);
+    if (q != p) { ++S->c.unsampled[kind]; return; }   /* not where the page table says (or not contiguous): not re-checkable */
+    BootSdRec *e = &S->rec[S->nrec++];
+    e->base = r->region_cpu[reg]; e->reg = reg; e->off = (uint64_t)(p - e->base); e->va = va; e->n = (uint32_t)n; e->kind = kind;
+    const BootGrView *v = &boot_gr_view[reg];
+    if (v->cpu && v->cpu == e->base) { e->lo = v->lo; e->gen = v->gen; } else { e->lo = 0; e->gen = 0; }
+    e->hash = hashed ? hash : boot_sd_hash(hp ? hp : p, n);
+    e->vs8 = S->in_draw ? S->vs8 : 0; e->key = S->in_draw ? S->key : 0; e->draw = S->in_draw ? S->draw : 0;
+    e->exec = (uint32_t)boot_render_exec_id; e->frame = (uint32_t)S->frame;
+    e->epoch = boot_render_cb_epoch; e->big = boot_render_big_writes;   /* host writes after this are told apart (boot_render_cb_written) */
+    S->call_bytes += n; S->kind_bytes[kind] += n; S->c.bytes[kind] += n;
+}
+static inline void boot_sd_note(BootRender *r, unsigned kind, uint64_t va, const uint8_t *p, const uint8_t *hp, uint64_t n) {
+    if (n > 0xffffffffu) { BootSdState *S = boot_sd_state(); if (S && kind < BOOT_SD_K_N) ++S->c.unsampled[kind]; return; }
+    boot_sd_record(r, kind, va, p, hp, n, 0, 0);
+}
+/* S1 at the end of a submit call (renderer lock held): every recorded range hashed again. kept: versions kept without a wait
+ * during the call (boot_nvn_rv), rerecords: recordings replaced during it. */
+static inline void boot_sd_recheck(BootRender *r, uint64_t kept, uint64_t rerecords) {
+    BootSdState *S = boot_sd_state(); if (!S) return;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    ++S->c.calls; S->c.rerecords += rerecords;
+    if (kept) { ++S->c.calls_kept; S->c.kept += kept; }
+    unsigned changed = 0;
+    for (uint32_t i = 0; i < S->nrec; ++i) {
+        const BootSdRec *e = &S->rec[i];
+        int ok = e->reg < r->region_count && r->region_cpu[e->reg] == e->base && e->off + e->n <= r->region_size[e->reg];
+        if (ok) {
+            const BootGrView *v = &boot_gr_view[e->reg];
+            const int view_now = v->cpu && v->cpu == e->base;
+            ok = e->gen ? (view_now && v->lo == e->lo && v->gen == e->gen && !v->stale) : !view_now;
+        }
+        if (!ok) { ++S->c.gone[e->kind]; continue; }
+        const uint8_t *p = e->base + e->off;
+        const uint64_t h = e->kind == BOOT_SD_K_TEX ? boot_render_tex_checksum(p, e->n) : boot_sd_hash(p, e->n);
+        ++S->c.checked[e->kind];
+        if (h == e->hash) continue;
+        /* written by the host itself since (executor CPU writes, boot_render_invalidate; GPU-ordered writes, boot_render_gpu_write): expected */
+        int host = !boot_render_cb_clean(e->va, e->n, e->epoch + 1) || boot_render_big_writes != e->big || boot_render_gw_all;
+        for (unsigned g = 0; !host && g < boot_render_gw_count; ++g) host = boot_render_gw[g].va < e->va + e->n && e->va < boot_render_gw[g].va + boot_render_gw[g].size;
+        if (host) { ++S->c.hostw[e->kind]; continue; }
+        ++changed;
+        if (kept) ++S->c.ch_kept[e->kind]; else ++S->c.ch_plain[e->kind];
+        if (e->kind == BOOT_SD_K_DIRECT || e->kind == BOOT_SD_K_VERTEX || e->kind == BOOT_SD_K_IZC)   /* data-snapshot: copy it from now on */
+            boot_ds_s1_changed(r, e->va, e->n, e->kind == BOOT_SD_K_DIRECT ? 0u : e->kind == BOOT_SD_K_VERTEX ? 1u : 2u);
+        if (S->ev_s1[e->kind] < S->events_max) {
+            ++S->ev_s1[e->kind];
+            boot_sd_event(S, "S1 CHANGED during the call: frame %u sub %u draw %u kind %s va %llx size %u vs %016llx family %s key %016llx; call: versions kept %llu, "
+                             "re-records %llu, ranges %u (%llu KiB)%s",
+                           e->frame, e->exec, e->draw, boot_sd_kind_name[e->kind], (unsigned long long)e->va, e->n, (unsigned long long)__builtin_bswap64(e->vs8),
+                           e->vs8 ? boot_sd_family(S, e->vs8) : "-", (unsigned long long)e->key, (unsigned long long)kept, (unsigned long long)rerecords,
+                           S->nrec, (unsigned long long)(S->call_bytes >> 10), e->gen ? " (span view)" : "");
+        }
+    }
+    (void)changed;
+    S->nrec = 0; S->call_bytes = 0; memset(S->kind_bytes, 0, sizeof S->kind_bytes);
+    if (++S->stamp == 0) { memset(S->seen_stamp, 0, BOOT_SD_SEEN * sizeof *S->seen_stamp); S->stamp = 1; }
+    QueryPerformanceCounter(&q1); S->c.recheck_qpc += (uint64_t)(q1.QuadPart - q0.QuadPart);
+}
+/* S4: a slot evicted by the idle trim (live 0) or the live trim (live 1). */
+static inline void boot_sd_tex_evict(uint32_t index, int live) {
+    BootSdState *S = boot_sd_state(); if (!S) return;
+    ++S->c.tx_evict; if (live) ++S->c.tx_evict_live;
+    if (index >= BOOT_SD_TIC) return;
+    S->evicted[index] = 1;
+    const uint32_t f = S->vs_tex[index];
+    if (!f || (uint32_t)S->frame + 1 - f > S->tex_n) return;
+    ++S->c.tx_evict_vs;
+    if (S->ev_s4 < S->events_max) {
+        ++S->ev_s4;
+        boot_sd_event(S, "S4 EVICT frame %llu sub %llu: TIC slot %u (va %llx) by the %s trim, last bound by a vertex shader %u presents ago",
+                       (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, index, (unsigned long long)S->vs_tex_va[index],
+                       live ? "live" : "idle", (uint32_t)S->frame + 1 - f);
+    }
+}
+/* A guest texture build of slot `index` from [va, va + n) (src), build checksum `sum` (boot_render_tex_checksum): S1 range,
+ * and S4 when a vertex shader bound the slot recently. */
+static inline void boot_sd_tex_build(BootRender *r, uint32_t index, uint64_t va, const uint8_t *src, uint64_t n, uint64_t sum) {
+    BootSdState *S = boot_sd_state(); if (!S) return;
+    ++S->c.tx_builds;
+    if (n <= 0xffffffffu) boot_sd_record(r, BOOT_SD_K_TEX, va, src, NULL, n, 1, sum); else ++S->c.unsampled[BOOT_SD_K_TEX];
+    if (index >= BOOT_SD_TIC) return;
+    const uint32_t f = S->vs_tex[index]; const int ev = S->evicted[index]; S->evicted[index] = 0;
+    if (!f || (uint32_t)S->frame + 1 - f > S->tex_n) return;
+    if (S->vs_tex_va[index] != va) { ++S->c.tx_reuse_vs; return; }   /* the slot now holds another image */
+    ++S->c.tx_rebuild_vs; if (ev) ++S->c.tx_rebuild_vs_ev;
+    if (S->ev_s4 < S->events_max) {
+        ++S->ev_s4;
+        boot_sd_event(S, "S4 REBUILD frame %llu sub %llu draw %u: TIC slot %u (va %llx, %llu KiB) built again %s, last bound by a vertex shader %u presents ago; "
+                         "building draw vs %016llx family %s key %016llx",
+                       (unsigned long long)S->frame, (unsigned long long)boot_render_exec_id, S->in_draw ? S->draw : 0, index, (unsigned long long)va,
+                       (unsigned long long)(n >> 10), ev ? "after a trim eviction" : "(not evicted: re-hash, TIC or format change)", (uint32_t)S->frame + 1 - f,
+                       (unsigned long long)__builtin_bswap64(S->in_draw ? S->vs8 : 0), S->in_draw ? S->fam : "-", (unsigned long long)(S->in_draw ? S->key : 0));
+    }
+}
+
+/* data-snapshot core (pure: no renderer state, no D3D12; tests/test_ds.c runs it offline). The learned-chunk table, the
+ * class byte table, the detector's sampling rule and windows, the call-start copy (shadow) and the per-segment copy arena,
+ * the pending GPU writes, the stored-page history and the constant-buffer plan (v2fix: play-work/data-snapshot/v2fix).
+ * Chunks are 64 KiB of guest GPU VA; a chunk is "dynamic" once the detector (or S1) saw the game rewrite a range in it while
+ * a submit call was being translated. */
+#define BOOT_DS_CHUNK_SHIFT 16
+#define BOOT_DS_CHUNK_BYTES (UINT64_C(1) << BOOT_DS_CHUNK_SHIFT)
+#define BOOT_DS_PARTS 16   /* arena parts: one per ring segment (BOOT_RENDER_SEGMENTS) */
+/* class bits of a chunk (OR of everything that maps into it) */
+enum { BOOT_DS_C_DYN = 1,      /* learned: the game rewrites ranges here while a submit is translated */
+       BOOT_DS_C_CPU = 2,      /* NVN memory pool with CPU access (CPU_UNCACHED / CPU_CACHED) */
+       BOOT_DS_C_GPU = 4,      /* NVN memory pool with CPU_NO_ACCESS: the game's CPU never writes it */
+       BOOT_DS_C_NOPOOL = 8,   /* GPU-mapped, no pool seen for its CPU address */
+       BOOT_DS_C_HOST = 16,    /* the executor's own block (driver buffer, copy arena): never taken, never sampled */
+       BOOT_DS_C_CODE = 32 };  /* NVN memory pool with SHADER_CODE (0x40): program constants, written at load only */
+enum { BOOT_DS_K_CB, BOOT_DS_K_VERTEX, BOOT_DS_K_INDEX, BOOT_DS_K_N };
+/* take decisions */
+enum { BOOT_DS_T_NO = 0, BOOT_DS_T_LEARNED = 1, BOOT_DS_T_ALL = 2, BOOT_DS_T_INSTANCE = 3, BOOT_DS_T_EAGER = 4, BOOT_DS_T_N = 5 };
+typedef struct BootDsChunk {
+    uint64_t key;                                   /* chunk number + 1; 0 = empty slot */
+    uint64_t learned, last_change, last_use;        /* call ids */
+    uint64_t shadow_call, shadow_epoch, shadow_big, shadow_gen;
+    uint32_t changes, kinds, shadow_mask, shadow_off;   /* shadow_mask: 4 KiB pages copied at the call start */
+} BootDsChunk;
+typedef struct BootDsCore {
+    BootDsChunk *chunk; uint32_t cap, n;            /* open addressing, cap a power of two, at most 3/4 full */
+    uint32_t *occ;                                  /* v2fix: the n occupied slots (the call-start copy visits n, not 2 x cap: 16384) */
+    uint8_t *cls; uint64_t cls_base; uint32_t cls_n, cls_cap;   /* class byte of chunk cls_base + i */
+    uint8_t *shadow; uint32_t shadow_cap, shadow_used; uint64_t shadow_call;
+    uint64_t *shadow_chunks; uint32_t shadow_nchunks;   /* v2fix: the chunks this call's shadow holds (boot_ds_shadow_drop) */
+    uint64_t call;                                  /* submit calls so far (the current one) */
+} BootDsCore;
+static inline uint32_t boot_ds_hash32(uint64_t k) {
+    k ^= k >> 33; k *= UINT64_C(0xff51afd7ed558ccd); k ^= k >> 33; k *= UINT64_C(0xc4ceb9fe1a85ec53); k ^= k >> 33;
+    return (uint32_t)k;
+}
+/* 64-bit hash of n bytes (the suspect-diag hash: a changed word always changes its lane). */
+static inline uint64_t boot_ds_hash(const uint8_t *p, uint64_t n, uint64_t h0) {
+    const uint64_t P = UINT64_C(0x100000001b3) | (UINT64_C(0x9e3779b9) << 40);
+    uint64_t a = h0 ^ n ^ UINT64_C(0x243f6a8885a308d3), b = UINT64_C(0x13198a2e03707344), c = UINT64_C(0xa4093822299f31d0), d = UINT64_C(0x082efa98ec4e6c89), i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4]; memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * P; b = (b ^ w[1]) * P; c = (c ^ w[2]) * P; d = (d ^ w[3]) * P;
+    }
+    for (; i < n; ++i) a = (a ^ p[i]) * P;
+    uint64_t h = a ^ ((b << 17) | (b >> 47)) ^ ((c << 31) | (c >> 33)) ^ ((d << 47) | (d >> 17));
+    h ^= h >> 33; h *= UINT64_C(0xff51afd7ed558ccd); h ^= h >> 33;
+    return h;
+}
+/* ---- class table */
+static inline uint8_t boot_ds_cls_at(const BootDsCore *d, uint64_t va) {
+    const uint64_t c = (va >> BOOT_DS_CHUNK_SHIFT) - d->cls_base;
+    return d->cls && c < d->cls_n ? d->cls[c] : 0;
+}
+/* OR of the classes of the chunks [va, va + n) touches (n >= 1, va + n without wrap); chunks outside the table add nothing.
+ * At most 256 chunks (16 MiB) are looked at: callers never take larger ranges. */
+static inline unsigned boot_ds_cls_span(const BootDsCore *d, uint64_t va, uint64_t n) {
+    if (!d->cls || !n) return 0;
+    const uint64_t i0 = (va >> BOOT_DS_CHUNK_SHIFT) - d->cls_base, i1 = ((va + n - 1) >> BOOT_DS_CHUNK_SHIFT) - d->cls_base;
+    if (i0 < d->cls_n && i1 < d->cls_n && i1 - i0 <= 1) return (unsigned)(d->cls[i0] | d->cls[i1]);   /* constant buffers: 1-2 chunks */
+    unsigned bits = 0;
+    for (uint64_t c = va >> BOOT_DS_CHUNK_SHIFT, last = (va + n - 1) >> BOOT_DS_CHUNK_SHIFT, k = 0; c <= last && k < 256; ++c, ++k) {
+        const uint64_t i = c - d->cls_base;
+        if (i < d->cls_n) bits |= d->cls[i];
+    }
+    return bits;
+}
+/* Clears the table to cover chunks [base, base + n); 0 = no memory (the table stays empty: nothing classified). */
+static inline int boot_ds_cls_reset(BootDsCore *d, uint64_t base, uint32_t n) {
+    if (n > d->cls_cap) {
+        uint8_t *t = (uint8_t *)realloc(d->cls, n);
+        if (!t) { d->cls_n = 0; return 0; }
+        d->cls = t; d->cls_cap = n;
+    }
+    d->cls_base = base; d->cls_n = n;
+    if (n) memset(d->cls, 0, n);
+    return 1;
+}
+static inline void boot_ds_cls_mark(BootDsCore *d, uint64_t va, uint64_t n, unsigned bits) {
+    if (!d->cls || !n || va > UINT64_MAX - n) return;
+    uint64_t c0 = va >> BOOT_DS_CHUNK_SHIFT, c1 = (va + n - 1) >> BOOT_DS_CHUNK_SHIFT;
+    if (c1 < d->cls_base || c0 >= d->cls_base + d->cls_n) return;
+    if (c0 < d->cls_base) c0 = d->cls_base;
+    if (c1 >= d->cls_base + d->cls_n) c1 = d->cls_base + d->cls_n - 1;
+    for (uint64_t c = c0; c <= c1; ++c) d->cls[c - d->cls_base] |= (uint8_t)bits;
+}
+/* ---- learned chunks */
+static inline int boot_ds_core_init(BootDsCore *d, uint32_t cap, uint32_t shadow_bytes) {
+    memset(d, 0, sizeof *d);
+    uint32_t c = 64; while (c < cap) c <<= 1;
+    d->chunk = (BootDsChunk *)calloc(c, sizeof *d->chunk);
+    d->occ = (uint32_t *)calloc(c, sizeof *d->occ);
+    if (!d->chunk || !d->occ) { free(d->chunk); free(d->occ); d->chunk = NULL; d->occ = NULL; return 0; }
+    d->cap = c;
+    if (shadow_bytes) {
+        d->shadow = (uint8_t *)malloc(shadow_bytes);
+        d->shadow_chunks = (uint64_t *)calloc(shadow_bytes / BOOT_DS_CHUNK_BYTES + 1, sizeof *d->shadow_chunks);
+        if (d->shadow && d->shadow_chunks) d->shadow_cap = shadow_bytes;
+        else { free(d->shadow); free(d->shadow_chunks); d->shadow = NULL; d->shadow_chunks = NULL; }
+    }
+    return 1;
+}
+static inline BootDsChunk *boot_ds_chunk(BootDsCore *d, uint64_t chunk, int create) {
+    if (!d->chunk) return NULL;
+    const uint64_t key = chunk + 1; const uint32_t m = d->cap - 1;
+    for (uint32_t i = boot_ds_hash32(key) & m, probe = 0; probe < d->cap; ++probe, i = (i + 1) & m) {
+        BootDsChunk *e = &d->chunk[i];
+        if (e->key == key) return e;
+        if (!e->key) {
+            if (!create || (uint64_t)d->n * 4 >= (uint64_t)d->cap * 3) return NULL;
+            memset(e, 0, sizeof *e); e->key = key; d->occ[d->n++] = i;
+            return e;
+        }
+    }
+    return NULL;
+}
+/* The occupied slots, j < boot_ds_scan_n: entries are only added between rebuilds (boot_ds_age_core rebuilds the list too). */
+static inline uint32_t boot_ds_scan_n(const BootDsCore *d) { return d->chunk ? d->n : 0; }
+static inline BootDsChunk *boot_ds_scan_at(BootDsCore *d, uint32_t j) { return &d->chunk[d->occ[j]]; }
+/* The chunks of [va, va + n) become dynamic (at most 64 chunks). Returns how many were new. */
+static inline unsigned boot_ds_learn_core(BootDsCore *d, uint64_t va, uint64_t n, unsigned kind) {
+    if (!n || va > UINT64_MAX - n) return 0;
+    unsigned fresh = 0;
+    for (uint64_t c = va >> BOOT_DS_CHUNK_SHIFT, last = (va + n - 1) >> BOOT_DS_CHUNK_SHIFT, k = 0; c <= last && k < 64; ++c, ++k) {
+        BootDsChunk *e = boot_ds_chunk(d, c, 0);
+        if (!e) {
+            e = boot_ds_chunk(d, c, 1);
+            if (!e) continue;   /* table full: not learned (counted by the caller through the return) */
+            e->learned = d->call; e->last_use = d->call; ++fresh;
+        }
+        e->last_change = d->call; ++e->changes; e->kinds |= 1u << (kind & 7);
+        const uint64_t i = c - d->cls_base;
+        if (d->cls && i < d->cls_n) d->cls[i] |= BOOT_DS_C_DYN;
+    }
+    return fresh;
+}
+/* Marks the dynamic chunks in a freshly reset class table again. */
+static inline void boot_ds_cls_relearn(BootDsCore *d) {
+    for (uint32_t j = 0, n = boot_ds_scan_n(d); j < n; ++j) boot_ds_cls_mark(d, (boot_ds_scan_at(d, j)->key - 1) << BOOT_DS_CHUNK_SHIFT, 1, BOOT_DS_C_DYN);
+}
+/* Drops chunks no snapshot used for more than max_age calls (and learned more than max_age calls ago): their class bit goes
+ * too. The table is rebuilt (no tombstones). Returns the number dropped; 0 without memory for the rebuild. */
+static inline unsigned boot_ds_age_core(BootDsCore *d, uint64_t max_age) {
+    if (!d->chunk || !d->n) return 0;
+    unsigned drop = 0;
+    for (uint32_t i = 0; i < d->cap; ++i) {
+        const BootDsChunk *e = &d->chunk[i];
+        if (e->key && d->call - e->last_use > max_age && d->call - e->learned > max_age) ++drop;
+    }
+    if (!drop) return 0;
+    BootDsChunk *old = d->chunk, *t = (BootDsChunk *)calloc(d->cap, sizeof *t);
+    if (!t) return 0;
+    d->chunk = t; d->n = 0;
+    for (uint32_t i = 0; i < d->cap; ++i) {
+        const BootDsChunk *e = &old[i];
+        if (!e->key) continue;
+        if (d->call - e->last_use > max_age && d->call - e->learned > max_age) {
+            const uint64_t k = (e->key - 1) - d->cls_base;
+            if (d->cls && k < d->cls_n) d->cls[k] &= (uint8_t)~BOOT_DS_C_DYN;
+            continue;
+        }
+        BootDsChunk *f = boot_ds_chunk(d, e->key - 1, 1);
+        if (f) *f = *e;
+    }
+    free(old);
+    return drop;
+}
+/* ---- decision */
+/* Whether a range with class bits `cls` is read from a copy: mode 0 never, 1 learned chunks (and, with the per-instance rule,
+ * small per-instance streams; with the eager rule, ranges in a pool the CPU can write: eager 1 not in shader-code pools, 2 in
+ * those too), 2 everything the CPU may write. GPU-only pools and the executor's block never. The caller still keeps a range
+ * that GPU work recorded earlier may write zero-copy (GPU order). */
+static inline int boot_ds_take_core(int mode, unsigned cls, int instance_rule, int eager) {
+    if (mode <= 0) return BOOT_DS_T_NO;
+    if (cls & BOOT_DS_C_HOST) return BOOT_DS_T_NO;
+    if ((cls & BOOT_DS_C_GPU) && !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL))) return BOOT_DS_T_NO;
+    if (cls & BOOT_DS_C_DYN) return BOOT_DS_T_LEARNED;
+    if (mode >= 2) return BOOT_DS_T_ALL;
+    if (eager && (cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL)) && (eager >= 2 || !(cls & BOOT_DS_C_CODE))) return BOOT_DS_T_EAGER;
+    if (instance_rule) return BOOT_DS_T_INSTANCE;
+    return BOOT_DS_T_NO;
+}
+/* ---- detector sampling */
+/* A range is sampled in the calls where its hash phase meets the call counter: exactly once in every `period` (a power of
+ * two) consecutive calls. Two multiplies: it runs for every zero-copy binding the CPU may write. */
+static inline int boot_ds_pick(uint64_t va, uint64_t n, uint64_t call, uint32_t period) {
+    const uint32_t h = ((uint32_t)(va >> 8) ^ ((uint32_t)n * 0x85ebca6bu)) * 0x9e3779b1u;
+    return !(((h >> 16) + (uint32_t)call) & (period - 1));
+}
+/* Bytes the detector hashes of an n-byte range: all of it up to 256; else the first 128 and a 128-byte window that moves on by
+ * one step per sample through the rest (every byte is covered once in ceil((n - 128) / 128) samples). Returns the window count. */
+static inline unsigned boot_ds_windows(uint64_t n, uint64_t sample, uint32_t off[2], uint32_t len[2]) {
+    if (n <= 256) { off[0] = 0; len[0] = (uint32_t)n; off[1] = len[1] = 0; return n ? 1u : 0u; }
+    const uint64_t steps = (n - 128 + 127) / 128;
+    uint64_t o = 128 + (sample % steps) * 128;
+    if (o + 128 > n) o = n - 128;
+    off[0] = 0; len[0] = 128; off[1] = (uint32_t)o; len[1] = 128;
+    return 2;
+}
+/* Next period: doubled when the call filled the record budget, halved when it used under a quarter of it. */
+static inline uint32_t boot_ds_period_next(uint32_t period, uint32_t used, uint32_t budget) {
+    if (!budget) return period;
+    if (used >= budget && period < (1u << 20)) return period * 2;
+    if (used < budget / 4 && period > 1) return period / 2;
+    return period;
+}
+/* ---- the call-start copy */
+typedef const uint8_t *(*BootDsPageFn)(void *ctx, uint64_t va);        /* host bytes of the 4 KiB guest GPU page at va, NULL: not mapped */
+typedef int (*BootDsCleanFn)(void *ctx, uint64_t va, uint64_t n, uint64_t epoch);   /* 1: no host write to [va, va + n) at epoch or later */
+static inline void boot_ds_shadow_begin(BootDsCore *d) { d->shadow_used = 0; d->shadow_call = d->call; d->shadow_nchunks = 0; }
+/* Copies the mapped pages of chunk e into the shadow; 0 when it is full or nothing is mapped. */
+static inline int boot_ds_shadow_take(BootDsCore *d, BootDsChunk *e, BootDsPageFn page, void *ctx, uint64_t epoch, uint64_t big, uint64_t gen) {
+    if (!d->shadow || d->shadow_call != d->call || d->shadow_used > d->shadow_cap || d->shadow_cap - d->shadow_used < BOOT_DS_CHUNK_BYTES) return 0;
+    const uint64_t base = (e->key - 1) << BOOT_DS_CHUNK_SHIFT; uint8_t *dst = d->shadow + d->shadow_used; uint32_t mask = 0;
+    for (unsigned p = 0; p < BOOT_DS_CHUNK_BYTES / 4096; ++p) {
+        const uint8_t *src = page(ctx, base + (uint64_t)p * 4096);
+        if (src) { memcpy(dst + (size_t)p * 4096, src, 4096); mask |= 1u << p; }
+    }
+    if (!mask) return 0;
+    e->shadow_off = d->shadow_used; e->shadow_mask = mask; e->shadow_call = d->call;
+    e->shadow_epoch = epoch; e->shadow_big = big; e->shadow_gen = gen;
+    if (d->shadow_chunks) d->shadow_chunks[d->shadow_nchunks++] = e->key - 1;   /* (one per 64 KiB of the shadow: room by construction) */
+    d->shadow_used += (uint32_t)BOOT_DS_CHUNK_BYTES;
+    return 1;
+}
+/* Whether any of [va, va + n) can come from this call's shadow (cheap pre-test). */
+static inline int boot_ds_shadow_any(const BootDsCore *d, uint64_t va, uint64_t n) {
+    return d->shadow_used && d->shadow_call == d->call && (boot_ds_cls_span(d, va, n) & BOOT_DS_C_DYN);
+}
+/* Copies [va, va + n) into dst, chunk piece by piece: from the shadow where this call copied every page of the piece, the page
+ * table generation and the big-write count are those of the copy and no host write touched the piece since (clean), else from
+ * `live` (the contiguous host bytes of the whole range). Returns the bytes taken from the shadow. v2fix: only a dynamic chunk
+ * (class byte) can be in the shadow, so others skip the chunk-table probe (~2,400 eager CB copies a frame in play-105). */
+static inline uint64_t boot_ds_fill_core(BootDsCore *d, uint8_t *dst, uint64_t va, const uint8_t *live, uint64_t n,
+                                         uint64_t gen, uint64_t big, BootDsCleanFn clean, void *ctx) {
+    uint64_t from_shadow = 0, at = 0;
+    const int any = d->shadow_used && d->shadow_call == d->call;
+    while (at < n) {
+        const uint64_t cva = va + at, in = cva & (BOOT_DS_CHUNK_BYTES - 1);
+        uint64_t piece = BOOT_DS_CHUNK_BYTES - in; if (piece > n - at) piece = n - at;
+        const BootDsChunk *e = any && (boot_ds_cls_at(d, cva) & BOOT_DS_C_DYN) ? boot_ds_chunk(d, cva >> BOOT_DS_CHUNK_SHIFT, 0) : NULL;
+        int use = e && e->shadow_call == d->call && e->shadow_gen == gen && e->shadow_big == big;
+        if (use) {
+            const uint32_t p0 = (uint32_t)(in >> 12), p1 = (uint32_t)((in + piece - 1) >> 12);
+            const uint32_t need = ((2u << p1) - 1u) & ~((1u << p0) - 1u);
+            use = (e->shadow_mask & need) == need;
+        }
+        if (use && clean) use = clean(ctx, cva, piece, e->shadow_epoch + 1);
+        if (use) { memcpy(dst + at, d->shadow + e->shadow_off + in, (size_t)piece); from_shadow += piece; }
+        else memcpy(dst + at, live + at, (size_t)piece);
+        at += piece;
+    }
+    return from_shadow;
+}
+/* ---- copy arena (vertex copies: GPU-visible through the page table) */
+typedef struct BootDsArena {
+    uint8_t *cpu; uint64_t va; uint32_t part_bytes, used[BOOT_DS_PARTS], peak; uint64_t list[BOOT_DS_PARTS];
+} BootDsArena;
+/* bytes (256-aligned) in arena part `part` for the list `list_id` recorded in that ring segment: the part starts over when a new
+ * list opens in the segment (its previous list has completed: boot_render_begin_in waited for the segment's fence). Returns the
+ * byte offset in the arena, UINT64_MAX when the part is full. */
+static inline uint64_t boot_ds_arena_alloc(BootDsArena *a, unsigned part, uint64_t list_id, uint64_t bytes) {
+    if (!a->cpu || part >= BOOT_DS_PARTS || !bytes) return UINT64_MAX;
+    if (a->list[part] != list_id) { a->list[part] = list_id; a->used[part] = 0; }
+    const uint64_t need = (bytes + 255) & ~UINT64_C(255);
+    if (need > (uint64_t)a->part_bytes - a->used[part]) return UINT64_MAX;
+    const uint64_t off = (uint64_t)part * a->part_bytes + a->used[part];
+    a->used[part] += (uint32_t)need;
+    if (a->used[part] > a->peak) a->peak = a->used[part];
+    return off;
+}
+/* ---- NVN memory pools by CPU (storage) address */
+typedef struct BootDsPool { uint64_t obj, cpu, size; uint32_t flags, live; } BootDsPool;
+static inline int boot_ds_pool_order(const void *x, const void *y) {
+    const BootDsPool *a = (const BootDsPool *)x, *b = (const BootDsPool *)y;
+    return a->cpu < b->cpu ? -1 : a->cpu > b->cpu ? 1 : (a->size > b->size ? -1 : a->size < b->size);
+}
+/* The innermost pool of `sorted` (live pools by start, larger first at a tie) containing cpu, or NULL. Pools can nest (nxport
+ * nvn/api.rs: Kirby's shader pools inside a 1.4 GB pool): the nearest start at or below cpu may end before it, so up to 16
+ * earlier starts are looked at and the smallest containing one wins. */
+static inline const BootDsPool *boot_ds_pool_find(const BootDsPool *sorted, uint32_t n, uint64_t cpu) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) { const uint32_t mid = lo + (hi - lo) / 2; if (sorted[mid].cpu <= cpu) lo = mid + 1; else hi = mid; }
+    const BootDsPool *best = NULL;
+    for (uint32_t k = 0; k < 16 && lo > k; ++k) {
+        const BootDsPool *p = &sorted[lo - 1 - k];
+        if (cpu - p->cpu < p->size && (!best || p->size < best->size)) best = p;
+    }
+    return best;
+}
+/* Class bits of a pool's NVN_MEMORY_POOL_FLAGS (CPU_NO_ACCESS 0x1, CPU_UNCACHED 0x2, CPU_CACHED 0x4; nxport: writable = flags & 6). */
+static inline unsigned boot_ds_pool_class(const BootDsPool *p) {
+    if (!p) return BOOT_DS_C_NOPOOL;
+    if (p->flags & 6u) return BOOT_DS_C_CPU | ((p->flags & 0x40u) ? BOOT_DS_C_CODE : 0u);
+    if (p->flags & 1u) return BOOT_DS_C_GPU;
+    return BOOT_DS_C_NOPOOL;
+}
+/* ---- GPU writes recorded and not known complete, until the next queue idle (everything recorded has completed then): per 64 KiB
+ * chunk a 256-bit mask of its 256-byte blocks written (exact for constant buffers, which are 256-aligned; vertex and index ranges
+ * that share a block with a write count as pending, the safe side) and the sources that wrote there; ranges of 256 KiB and more
+ * apart; an "everything" flag for overflows. A lookup is one hash probe and a mask test per chunk (v1 scanned the whole GPU-write
+ * table per binding: 2-4 ms per frame in play-104). `ver` moves with every change; cver[] / big_ver tell which chunks a change
+ * touched since a given ver, so a memoized decision is re-checked only when its own chunks changed.
+ * v2fix: an add that changes nothing (blocks and source already there) leaves ver alone, so repeats re-check no memo; the large
+ * ranges are kept sorted and merged (overlapping ones into one range with both sources, touching ones with the same sources),
+ * looked up by binary search, and big_ver moves only when the covered bytes or their sources grow (v2 appended a range per add:
+ * the GPU-write entry growing in place re-added it whole per draw, 128 duplicates later 'all' turned the snapshot off). */
+#define BOOT_DS_PEND_MAP 8192u
+#define BOOT_DS_PEND_BIG 512u   /* distinct merged large ranges (v1 merged everything into 512 entries) */
+#define BOOT_DS_PEND_BIG_BYTES (UINT64_C(256) << 10)
+enum { BOOT_DS_P_NONE, BOOT_DS_P_GW, BOOT_DS_P_STORE, BOOT_DS_P_COMPUTE, BOOT_DS_P_TARGET, BOOT_DS_P_BOUND, BOOT_DS_P_N };
+/* BOOT_DS_P_BOUND (v2fix): the storage buffers bound to a deferred dispatch (host_nvn_play.h): its stores outside the program's learnt
+ * ranges are pending in GPU order too (the ranges grow only at the next idle). */
+enum { BOOT_DS_OVF_MAP, BOOT_DS_OVF_BIG, BOOT_DS_OVF_GW, BOOT_DS_OVF_WIDE, BOOT_DS_OVF_WRAP, BOOT_DS_OVF_N };   /* why 'all' was set */
+typedef struct BootDsPendSlot { uint64_t chunk; uint32_t gen, srcs; uint64_t blk[4]; } BootDsPendSlot;   /* srcs: bit per source */
+typedef struct BootDsPendBig { uint64_t va, end; uint32_t srcs, pad; } BootDsPendBig;                    /* srcs: bit per source */
+typedef struct BootDsPend {
+    BootDsPendSlot map[BOOT_DS_PEND_MAP];
+    BootDsPendBig big[BOOT_DS_PEND_BIG];   /* sorted by va, disjoint (touching only with different sources) */
+    uint32_t nslot, nbig, gen, all, srcs_all, pad; uint64_t ver, overflows, ovf[BOOT_DS_OVF_N];   /* srcs_all: every source added since the reset */
+    uint64_t cver[4096], big_ver, reset_ver;   /* ver of the last change touching chunks c with c & 4095 (big ranges, the all flag,
+                                                  * resets: big_ver); reset_ver: the ver of the last reset */
+} BootDsPend;
+static inline void boot_ds_pend_reset(BootDsPend *p) {
+    if (++p->gen == 0) { memset(p->map, 0, sizeof p->map); p->gen = 1; }   /* slots of older generations read as empty */
+    p->nslot = p->nbig = 0; p->all = 0; p->srcs_all = 0; p->big_ver = p->reset_ver = ++p->ver;
+}
+static inline BootDsPendSlot *boot_ds_pend_slot(BootDsPend *p, uint64_t chunk, int create) {
+    const uint32_t m = BOOT_DS_PEND_MAP - 1;
+    for (uint32_t i = boot_ds_hash32(chunk + 1) & m, k = 0; k < 64; ++k, i = (i + 1) & m) {
+        BootDsPendSlot *s = &p->map[i];
+        if (s->gen != p->gen) {
+            if (!create || p->nslot * 4 >= BOOT_DS_PEND_MAP * 3) return NULL;
+            s->gen = p->gen; s->chunk = chunk; s->srcs = 0; s->blk[0] = s->blk[1] = s->blk[2] = s->blk[3] = 0; ++p->nslot;
+            return s;
+        }
+        if (s->chunk == chunk) return s;
+    }
+    return NULL;
+}
+/* blocks [b0, b1] (0..255) of a mask: set (1 when a block was new) / any set */
+static inline uint64_t boot_ds_blk_word(unsigned w, unsigned b0, unsigned b1) {
+    const unsigned lo = w == (b0 >> 6) ? (b0 & 63) : 0, hi = w == (b1 >> 6) ? (b1 & 63) : 63;
+    return (hi == 63 ? ~UINT64_C(0) : ((UINT64_C(1) << (hi + 1)) - 1)) & ~((UINT64_C(1) << lo) - 1);
+}
+static inline int boot_ds_blk_set(uint64_t m[4], unsigned b0, unsigned b1) {
+    uint64_t grew = 0;
+    for (unsigned w = b0 >> 6; w <= b1 >> 6; ++w) { const uint64_t x = boot_ds_blk_word(w, b0, b1); grew |= x & ~m[w]; m[w] |= x; }
+    return grew != 0;
+}
+static inline int boot_ds_blk_any(const uint64_t m[4], unsigned b0, unsigned b1) {
+    for (unsigned w = b0 >> 6; w <= b1 >> 6; ++w) if (m[w] & boot_ds_blk_word(w, b0, b1)) return 1;
+    return 0;
+}
+/* Everything is pending until the next reset (`why`: BOOT_DS_OVF_*). Only the change to 'all' moves ver (nothing can change after it). */
+static inline void boot_ds_pend_over(BootDsPend *p, unsigned src, unsigned why) {
+    if (p->all) return;
+    p->all = src ? src : BOOT_DS_P_GW; p->srcs_all |= 1u << (p->all & 7); ++p->overflows; ++p->ovf[why % BOOT_DS_OVF_N];
+    p->big_ver = ++p->ver;
+}
+static inline void boot_ds_pend_all(BootDsPend *p, unsigned src) { boot_ds_pend_over(p, src, BOOT_DS_OVF_WRAP); }
+/* First large range ending after va (binary search: the ranges are sorted and disjoint, so their ends ascend too). */
+static inline uint32_t boot_ds_big_first(const BootDsPend *p, uint64_t va) {
+    uint32_t lo = 0, hi = p->nbig;
+    while (lo < hi) { const uint32_t mid = lo + (hi - lo) / 2; if (p->big[mid].end > va) hi = mid; else lo = mid + 1; }
+    return lo;
+}
+/* [va, end) pending from source bit `bit` in the large-range list: 1 when the covered bytes or their sources grew, 0 when it was all
+ * there already, -1 when the list is full. Overlapping ranges merge into one with the OR of their sources (the safe side: the sources
+ * of a merged range may claim a little more than each wrote); touching ranges merge when their sources are the same. */
+static inline int boot_ds_big_add(BootDsPend *p, uint64_t va, uint64_t end, uint32_t bit) {
+    BootDsPendBig *E = p->big; const uint32_t n = p->nbig;
+    uint32_t k0 = boot_ds_big_first(p, va), k1 = k0, srcs = bit;
+    uint64_t nva = va, nend = end, at = va; int covered = k0 < n && E[k0].va <= va;
+    for (; k1 < n && E[k1].va < end; ++k1) {   /* the ranges overlapping [va, end) */
+        if (E[k1].va > at || !(E[k1].srcs & bit)) covered = 0;   /* a gap, or a part without this source */
+        if (E[k1].end > at) at = E[k1].end;
+        srcs |= E[k1].srcs; if (E[k1].va < nva) nva = E[k1].va; if (E[k1].end > nend) nend = E[k1].end;
+    }
+    if (covered && at >= end) return 0;
+    if (k0 > 0 && E[k0 - 1].end == nva && E[k0 - 1].srcs == srcs) { --k0; nva = E[k0].va; }
+    if (k1 < n && E[k1].va == nend && E[k1].srcs == srcs) { nend = E[k1].end; ++k1; }
+    const uint32_t nn = n - (k1 - k0) + 1;
+    if (nn > BOOT_DS_PEND_BIG) return -1;
+    if (k1 != k0 + 1) memmove(&E[k0 + 1], &E[k1], (size_t)(n - k1) * sizeof *E);
+    E[k0].va = nva; E[k0].end = nend; E[k0].srcs = srcs; E[k0].pad = 0; p->nbig = nn;
+    return 1;
+}
+/* [va, va + n) may be written by GPU work of source `src` until the next reset. */
+static inline void boot_ds_pend_add(BootDsPend *p, uint64_t va, uint64_t n, unsigned src) {
+    if (!n || p->all) return;
+    if (va > UINT64_MAX - n) { boot_ds_pend_over(p, src, BOOT_DS_OVF_WRAP); return; }
+    const uint64_t end = va + n, nv = p->ver + 1; const uint32_t bit = 1u << (src & 7);
+    if (n >= BOOT_DS_PEND_BIG_BYTES) {
+        const int r = boot_ds_big_add(p, va, end, bit);
+        if (r < 0) { boot_ds_pend_over(p, src, BOOT_DS_OVF_BIG); return; }
+        if (r) { p->ver = p->big_ver = nv; p->srcs_all |= bit; }
+        return;
+    }
+    int changed = 0;
+    for (uint64_t c = va >> BOOT_DS_CHUNK_SHIFT, last = (end - 1) >> BOOT_DS_CHUNK_SHIFT; c <= last; ++c) {
+        BootDsPendSlot *s = boot_ds_pend_slot(p, c, 1);
+        if (!s) { if (changed) p->ver = nv; boot_ds_pend_over(p, src, BOOT_DS_OVF_MAP); return; }
+        const uint64_t lo = c << BOOT_DS_CHUNK_SHIFT, a = va > lo ? va : lo, z = end < lo + BOOT_DS_CHUNK_BYTES ? end : lo + BOOT_DS_CHUNK_BYTES;
+        const int grew = boot_ds_blk_set(s->blk, (unsigned)((a - lo) >> 8), (unsigned)((z - 1 - lo) >> 8));
+        if (grew || !(s->srcs & bit)) { s->srcs |= bit; p->cver[c & 4095] = nv; changed = 1; }
+    }
+    if (changed) { p->ver = nv; p->srcs_all |= bit; }
+}
+/* The last GPU-write entry (boot_render_gw) grew in place from [olo, oend) to [nlo, nend) (always a superset there): only the new
+ * bytes are added. Anything else (no old range, not a superset) adds the whole new range. */
+static inline void boot_ds_pend_grow(BootDsPend *p, uint64_t olo, uint64_t oend, uint64_t nlo, uint64_t nend, unsigned src) {
+    if (olo >= oend || nlo > olo || nend < oend) { if (nend > nlo) boot_ds_pend_add(p, nlo, nend - nlo, src); return; }
+    if (nlo < olo) boot_ds_pend_add(p, nlo, olo - nlo, src);
+    if (nend > oend) boot_ds_pend_add(p, oend, nend - oend, src);
+}
+/* Whether a change after ver `since` may concern [va, va + n): its chunks' filter entries, the big ranges, the all flag, resets.
+ * 0: a decision taken at ver `since` still holds (the filter only errs towards 1). */
+static inline int boot_ds_pend_changed(const BootDsPend *p, uint64_t va, uint64_t n, uint64_t since) {
+    if (p->big_ver > since) return 1;
+    const uint64_t c0 = va >> BOOT_DS_CHUNK_SHIFT, c1 = (va + n - 1) >> BOOT_DS_CHUNK_SHIFT;
+    if (c1 - c0 > 3) return 1;
+    for (uint64_t c = c0; c <= c1; ++c) if (p->cver[c & 4095] > since) return 1;
+    return 0;
+}
+/* The sources (bit 1 << BOOT_DS_P_*) of pending GPU writes over [va, va + n) (n >= 1, no wrap): every overlapping big range, and the
+ * sources that wrote each chunk where a written block overlaps (a chunk's sources are kept per chunk, not per block: the safe side). */
+static inline unsigned boot_ds_pend_mask(BootDsPend *p, uint64_t va, uint64_t n) {
+    if (p->all) return 1u << p->all;
+    const uint64_t end = va + n; unsigned m = 0;
+    for (uint32_t i = p->nbig ? boot_ds_big_first(p, va) : 0; i < p->nbig && p->big[i].va < end; ++i) m |= p->big[i].srcs;
+    if (!p->nslot) return m;
+    for (uint64_t c = va >> BOOT_DS_CHUNK_SHIFT, last = (end - 1) >> BOOT_DS_CHUNK_SHIFT, k = 0; c <= last; ++c, ++k) {
+        if (k >= 256) return m | (1u << BOOT_DS_P_GW);   /* (no caller asks about 16 MiB) */
+        if (p->cver[c & 4095] <= p->reset_ver) continue;   /* nothing was added to a chunk of this filter entry since the reset */
+        const BootDsPendSlot *s = boot_ds_pend_slot(p, c, 0);
+        if (!s) continue;
+        const uint64_t lo = c << BOOT_DS_CHUNK_SHIFT, a = va > lo ? va : lo, z = end < lo + BOOT_DS_CHUNK_BYTES ? end : lo + BOOT_DS_CHUNK_BYTES;
+        if (boot_ds_blk_any(s->blk, (unsigned)((a - lo) >> 8), (unsigned)((z - 1 - lo) >> 8))) m |= s->srcs;
+    }
+    return m;
+}
+/* The lowest source of a pending GPU write over [va, va + n), BOOT_DS_P_NONE when there is none. */
+static inline unsigned boot_ds_pend_hit(BootDsPend *p, uint64_t va, uint64_t n) {
+    const unsigned m = boot_ds_pend_mask(p, va, n);
+    return m ? (unsigned)__builtin_ctz(m) : BOOT_DS_P_NONE;
+}
+/* The source that keeps a range with pending-write mask m zero-copy (BOOT_DS_P_NONE: a copy may be taken): the one exception is a
+ * range under deferred compute's learnt ranges only, on pages verified CPU-written (`stored`: TOTK_DATA_SNAPSHOT_STORED, cpu_all:
+ * boot_ds_cpu_all). A deferred dispatch's bound storage buffers (BOOT_DS_P_BOUND) are never cleared by a CPU verdict: the verdict
+ * is from before the dispatch, which may store there for the first time (the GPU bit only comes at the next idle). */
+static inline unsigned boot_ds_pend_verdict(unsigned m, int stored, int cpu_all) {
+    if (!m) return BOOT_DS_P_NONE;
+    if (m == 1u << BOOT_DS_P_COMPUTE && stored && cpu_all) return BOOT_DS_P_NONE;
+    return (unsigned)__builtin_ctz(m);
+}
+/* Whether a change under pending-write mask m is judged by the compute store bitmaps after the next idle (boot_ds_attribute) instead
+ * of being put down to GPU work at once: only deferred compute (learnt ranges, bound storage buffers) may have written it. */
+static inline int boot_ds_attr_judged(unsigned m, int stored) {
+    return stored && m && !(m & ~((1u << BOOT_DS_P_COMPUTE) | (1u << BOOT_DS_P_BOUND)));
+}
+/* The marks a compute dispatch leaves (host_nvn_play.h through boot_ds_dispatch_pre / _post): `after` 0 before it is recorded, 1
+ * after; `deferred`: it stayed pending (boot_compute_deferred grew). TOTK_DATA_SNAPSHOT_STORED=0 (stored 0) is v1: every dispatch's
+ * storage buffers, before it, as storing-draw writes (a dispatch that completes at once idles before anything later is recorded). */
+static inline unsigned boot_ds_dispatch_src(int stored, int after, int deferred) {
+    if (!stored) return after ? BOOT_DS_P_NONE : BOOT_DS_P_STORE;
+    return after && deferred ? BOOT_DS_P_BOUND : BOOT_DS_P_NONE;
+}
+/* The stages whose storage buffers a storing draw marks (1 vertex, 2 pixel): the storing ones (host_gpu_render_draw.h
+ * boot_ds_store_stages); both when unknown, and always with TOTK_DATA_SNAPSHOT_STORED=0 (v1). */
+static inline unsigned boot_ds_store_stage_mask(unsigned stages, int stored) { return stored && stages ? stages & 3u : 3u; }
+/* Storage buffers (va[i], size[i]) pending from `src`, each once per reset: `seen` / `seen_gen` (`seen_n` a power of two) remember
+ * the (address, size, source) keys added since (a hash collision only adds again, which changes nothing). The key is exact only
+ * for addresses below 2^40 and sizes below 1 MiB (above that, size bits overlap the address and source bits, and (A, 3 MiB, store)
+ * once matched (A, 4 MiB, bound): the second range was skipped and its copy taken stale); other buffers are always added, and
+ * boot_ds_pend_add's big-range path ignores a covered repeat itself. Returns how many were added. */
+static inline unsigned boot_ds_mark_bufs(BootDsPend *p, uint64_t *seen, uint32_t *seen_gen, uint32_t seen_n, const uint64_t *va, const uint64_t *size, unsigned n, unsigned src) {
+    unsigned added = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const uint64_t a = va[i], s = size[i];
+        if (!a || !s || a > UINT64_MAX - s) continue;
+        const int exact = !(a >> 40) && !(s >> 20);   /* v2fix review: the key below is exact only in this range */
+        const uint64_t key = a ^ (s << 40) ^ ((uint64_t)src << 60); const uint32_t h = boot_ds_hash32(key) & (seen_n - 1);
+        if (exact && seen_gen[h] == p->gen && seen[h] == key) continue;   /* already pending since the idle */
+        if (exact) { seen[h] = key; seen_gen[h] = p->gen; }
+        boot_ds_pend_add(p, a, s, src); ++added;
+    }
+    return added;
+}
+/* ---- pages compute has stored to (the store bitmaps read at each idle, host_gpu_compute.h boot_compute_idle) and pages verified
+ * CPU-written, per chunk, kept for the session. A deferred dispatch's learnt ranges are merged across gaps of up to 64 KiB
+ * (BOOT_COMPUTE_MERGE_GAP), so they cover CPU-written bytes between its outputs. Decisions stay conservative: the whole learnt ranges
+ * of pending dispatches are pending GPU writes, except pages verified CPU-written: they changed during a call, and the store bitmaps
+ * read at the next idle (which hold that call's dispatches) showed no compute store on them. A later compute store on such a page
+ * moves it back (the GPU mask wins). Attribution of a change inside a pending compute range: GPU when compute stored a page of it
+ * before, else re-judged after the next idle (boot_ds_cpu_mark when the stores still miss it).
+ * v2fix: once the table is full (3/4) compute stores still update the chunks it holds (a verified page compute stores to later loses
+ * its verdict) and no CPU verdict is honoured any more (v2 stopped all updates and kept the verdicts: copies over pages compute now
+ * writes, for the rest of the session). */
+#define BOOT_DS_STORED 16384u
+typedef struct BootDsStoredEnt { uint64_t key; uint32_t gpu, cpu; } BootDsStoredEnt;   /* key chunk + 1; page masks */
+typedef struct BootDsStored { BootDsStoredEnt e[BOOT_DS_STORED]; uint32_t n, full; } BootDsStored;
+static inline uint32_t boot_ds_page_bits(uint64_t lo, uint64_t hi) {   /* pages touched by [lo, hi) (lo < hi, one chunk), bits 0..15 */
+    const uint32_t p0 = (uint32_t)((lo & (BOOT_DS_CHUNK_BYTES - 1)) >> 12), p1 = (uint32_t)(((hi - 1) & (BOOT_DS_CHUNK_BYTES - 1)) >> 12);
+    return ((2u << p1) - 1u) & ~((1u << p0) - 1u);
+}
+static inline BootDsStoredEnt *boot_ds_stored_slot(BootDsStored *h, uint64_t chunk, int create) {
+    const uint32_t m = BOOT_DS_STORED - 1; const uint64_t key = chunk + 1;
+    for (uint32_t i = boot_ds_hash32(key) & m, k = 0; k < BOOT_DS_STORED; ++k, i = (i + 1) & m) {
+        if (h->e[i].key == key) return &h->e[i];
+        if (!h->e[i].key) {
+            if (!create) return NULL;
+            if ((uint64_t)h->n * 4 >= (uint64_t)BOOT_DS_STORED * 3) { h->full = 1; return NULL; }
+            h->e[i].key = key; h->e[i].gpu = h->e[i].cpu = 0; ++h->n; return &h->e[i];
+        }
+    }
+    return NULL;
+}
+/* Runs `body` for each chunk piece of [va, va + n) with E = its entry (NULL: none / no room) and BITS = the piece's page bits. */
+#define BOOT_DS_STORED_EACH(h, va, n, create, body) do { \
+    const uint64_t ds_end_ = (va) + (n); \
+    for (uint64_t ds_c_ = (va) >> BOOT_DS_CHUNK_SHIFT, ds_l_ = (ds_end_ - 1) >> BOOT_DS_CHUNK_SHIFT; ds_c_ <= ds_l_; ++ds_c_) { \
+        const uint64_t ds_lo_ = ds_c_ << BOOT_DS_CHUNK_SHIFT, ds_hi_ = ds_lo_ + BOOT_DS_CHUNK_BYTES; \
+        BootDsStoredEnt *E = boot_ds_stored_slot((h), ds_c_, (create)); \
+        const uint32_t BITS = boot_ds_page_bits((va) > ds_lo_ ? (va) : ds_lo_, ds_end_ < ds_hi_ ? ds_end_ : ds_hi_); \
+        body \
+    } } while (0)
+/* compute stored to [va, va + n) (page granular; those pages are GPU-written from now on; when full, the chunks already held) */
+static inline void boot_ds_stored_add(BootDsStored *h, uint64_t va, uint64_t n) {
+    if (!n || va > UINT64_MAX - n) return;
+    BOOT_DS_STORED_EACH(h, va, n, !h->full, { if (E) { E->gpu |= BITS; E->cpu &= ~BITS; } });
+}
+/* any page of [va, va + n) compute has stored to (1 as well when the table is full: the safe side) */
+static inline int boot_ds_stored_any(BootDsStored *h, uint64_t va, uint64_t n) {
+    if (!n || va > UINT64_MAX - n || h->full) return 1;
+    BOOT_DS_STORED_EACH(h, va, n, 0, { if (E && (E->gpu & BITS)) return 1; });
+    return 0;
+}
+/* [va, va + n) verified CPU-written (pages compute has not stored to) */
+static inline void boot_ds_cpu_mark(BootDsStored *h, uint64_t va, uint64_t n) {
+    if (!n || va > UINT64_MAX - n || h->full) return;
+    BOOT_DS_STORED_EACH(h, va, n, 1, { if (!E) return; E->cpu |= BITS & ~E->gpu; });
+}
+/* every page of [va, va + n) verified CPU-written and none stored by compute: inside a pending compute range it is still a CPU copy
+ * (0 once the table is full: stores it could not record may have reached those pages) */
+static inline int boot_ds_cpu_all(BootDsStored *h, uint64_t va, uint64_t n) {
+    if (!n || va > UINT64_MAX - n || h->full) return 0;
+    BOOT_DS_STORED_EACH(h, va, n, 0, { if (!E || (E->cpu & BITS) != BITS || (E->gpu & BITS)) return 0; });
+    return 1;
+}
+/* ---- v2fix: the call-start copy after a mid-call queue idle. GPU-ordered copies (boot_render_gw: UpdateUniformBuffer, ClearBuffer,
+ * reports) and storing-draw stores never call boot_render_cb_written, so a chunk of this call's shadow they wrote while the call ran
+ * would pass the epoch test once the idle dropped their pending marks: its pre-write bytes would be copied. At the idle (before the
+ * marks are reset) such chunks leave the shadow; later copies in the call take the live bytes (complete in GPU order then). Compute
+ * stores are not in `srcbits`: boot_compute_idle bumps the epochs of the pages it stored. Returns how many chunks were dropped. */
+static inline unsigned boot_ds_shadow_drop(BootDsCore *d, BootDsPend *p, unsigned srcbits) {
+    if (!d->shadow_used || d->shadow_call != d->call || !d->shadow_chunks) return 0;
+    if (!p->all && !(p->srcs_all & srcbits)) return 0;
+    unsigned dropped = 0;
+    for (uint32_t j = 0; j < d->shadow_nchunks; ++j) {
+        BootDsChunk *e = boot_ds_chunk(d, d->shadow_chunks[j], 0);
+        if (!e || e->shadow_call != d->call) continue;
+        if (p->all || (boot_ds_pend_mask(p, d->shadow_chunks[j] << BOOT_DS_CHUNK_SHIFT, BOOT_DS_CHUNK_BYTES) & srcbits)) { e->shadow_call = 0; ++dropped; }
+    }
+    return dropped;
+}
+/* ---- v2fix: budgets and the timer sample */
+/* Whether a copy decision of `kind` (BOOT_DS_K_*) by rule t is charged to the constant-buffer budget (TOTK_DATA_SNAPSHOT_CB_MB): every
+ * constant-buffer copy (eager and learned; v2 charged learned ones to the vertex/index budget, so the CBs known to race lost their
+ * copies first when streams spent it), except with TOTK_DATA_SNAPSHOT_CB=0 (cb 0: v1's one shared budget). */
+static inline int boot_ds_uses_cb_budget(unsigned kind, int t, int cb) { (void)t; return kind == BOOT_DS_K_CB && cb > 0; }
+/* 1 for one call in 64: the copy timer runs on a sample (two QueryPerformanceCounter calls on each of ~2,400 copies a frame were
+ * ~0.1 ms of the 0.3 ms they measured). */
+static inline int boot_ds_tick64(uint64_t *n) { return !(++*n & 63); }
+/* ---- v2fix: the constant-buffer plan (boot_ds_cb_plan, host_gpu_render.h), per draw: which uniform-buffer slots (36: vertex group 0
+ * and pixel group 4, 18 each, slot bit g * 18 + slot) read a copy. A slot memo holds a binding's rule and answer (v2). The plan only
+ * visits the slots whose answer may differ from the previous draw's: all of them when the binding table, the call or class
+ * generation (stamp) or the render-target write-back state (gtok) is another; else the rows that changed (none when the producer's
+ * bind generation says it did not rewrite the table: host_nvn_exec.h boot_nvn_st_buffers), plus the copy rules when pending GPU
+ * writes moved (each re-checks its own chunks, boot_ds_pend_changed) and the taken copies when the call's budget is spent. Any other
+ * slot hits its memo with an unchanged answer (play-105: ~29 memo hits, ~1.4 misses per draw, constant-buffer rows rebuilt in 77% of
+ * the draws). The render-target state is part of the memo: v2 re-decided every copy on every draw while any write-back was pending,
+ * even long completed (boot_render_gt_npending is pruned only by slow paths). */
+#define BOOT_DS_SLOTS 36u
+typedef struct BootDsMemo { uint64_t va, stamp, pver, gtok; uint32_t size; int8_t t, take, pad[2]; } BootDsMemo;
+typedef struct BootDsPlan {   /* what a draw reads first, first: the header, then the row keys (5 cache lines), the memos */
+    uint64_t valid, tmask, take, keyok;   /* slot bits: rows read on the GPU (valid 2), copy rules (t > 0), copies taken, keys held */
+    const void *in; uint64_t bgen, stamp, pver, gtok; int primed;
+    uint64_t key[BOOT_DS_SLOTS];          /* each slot's row as last planned (boot_ds_row_key) */
+    BootDsMemo m[BOOT_DS_SLOTS];
+} BootDsPlan;
+typedef struct BootDsPlanOut { uint32_t visited, hits, rechecks, taken; } BootDsPlanOut;
+typedef int (*BootDsRuleFn)(void *ctx, unsigned slot, uint64_t va, uint64_t n);   /* a binding not memoized: its rule (counts it, samples it) */
+typedef int (*BootDsTakeFn)(void *ctx, uint64_t va, uint64_t n, int t);          /* the rule's copy may be taken now (pending writes, budget) */
+/* render-target write-back state for the memo: 0 when none is pending (or the newest one's fence has completed), else the
+ * write-back generation (moves with every one recorded) */
+static inline uint64_t boot_ds_gt_token(unsigned npending, uint64_t newest, uint64_t done_seen, uint64_t gen) {
+    return npending && newest > done_seen ? gen + 1 : 0;
+}
+/* A row (address, size, valid) as one exact word: addresses below 2^40 (the Maxwell GPU VA space), sizes below 2^22, valid < 4; 0 when
+ * it does not fit (such a row is visited on every draw). */
+static inline int boot_ds_row_key(const BootCbufBinding *b, uint64_t *k) {
+    *k = b->address | (uint64_t)b->size << 40 | (uint64_t)b->valid << 62;
+    return !((b->address >> 40) | ((uint64_t)b->size >> 22) | ((uint64_t)b->valid >> 2));
+}
+static inline uint64_t boot_ds_rows_changed(const BootDsPlan *P, const BootCbufBinding *g0, const BootCbufBinding *g4) {
+    uint64_t m = 0;
+    for (unsigned i = 0; i < BOOT_DS_SLOTS; ++i) {
+        uint64_t k; const int ok = boot_ds_row_key(i < 18 ? &g0[i] : &g4[i - 18], &k);
+        m |= (uint64_t)(!ok | (k != P->key[i])) << i;
+    }
+    return m | (~P->keyok & ((UINT64_C(1) << BOOT_DS_SLOTS) - 1));
+}
+/* One draw: rows g0 / g4 (18 each) of binding table `in`; bgen / rows_same: the producer's bind generation and whether `in` is the
+ * table it describes; stamp: call and class generation; pver: boot_ds_pend.ver; over_budget: the copies' budget is spent. cbt[g][slot]
+ * gets the rule of each slot read from a copy (0: the live range); only visited slots are written. */
+static inline BootDsPlanOut boot_ds_plan_run(BootDsPlan *P, const BootCbufBinding *g0, const BootCbufBinding *g4, const void *in, uint64_t bgen,
+                                             int rows_same, uint64_t stamp, uint64_t pver, uint64_t gtok, int over_budget, BootDsPend *pend,
+                                             BootDsRuleFn rule, BootDsTakeFn take, void *ctx, uint8_t cbt[2][18]) {
+    BootDsPlanOut o = {0, 0, 0, 0};
+    uint64_t visit;
+    if (!P->primed || P->in != in || P->stamp != stamp || P->gtok != gtok) visit = (UINT64_C(1) << BOOT_DS_SLOTS) - 1;
+    else {
+        visit = rows_same && P->bgen == bgen ? 0 : boot_ds_rows_changed(P, g0, g4);
+        if (P->pver != pver) visit |= P->tmask;
+        if (over_budget) visit |= P->take;
+    }
+    P->primed = 1; P->in = in; P->bgen = bgen; P->stamp = stamp; P->pver = pver; P->gtok = gtok;
+    o.hits = (uint32_t)__builtin_popcountll(P->valid & ~visit);
+    for (uint64_t v = visit; v; v &= v - 1) {
+        const unsigned i = (unsigned)__builtin_ctzll(v), g = i >= 18, slot = i - 18 * g;
+        const BootCbufBinding *b = g ? &g4[slot] : &g0[slot];
+        const uint64_t bit = UINT64_C(1) << i;
+        ++o.visited;
+        P->keyok = boot_ds_row_key(b, &P->key[i]) ? P->keyok | bit : P->keyok & ~bit;
+        P->valid &= ~bit; P->tmask &= ~bit; P->take &= ~bit; cbt[g][slot] = 0;
+        if (b->valid != 2 || !b->size) continue;
+        P->valid |= bit;
+        const uint32_t n = b->size < 65536 ? b->size : 65536;
+        BootDsMemo *m = &P->m[i];
+        if (m->va == b->address && m->size == n && m->stamp == stamp) {
+            ++o.hits;
+            if (m->t <= 0) continue;
+            if (m->gtok != gtok || (m->pver != pver && boot_ds_pend_changed(pend, b->address, n, m->pver))) { m->take = (int8_t)take(ctx, b->address, n, m->t); ++o.rechecks; }
+            else if (m->take && over_budget) m->take = 0;   /* nothing new over its chunks: the answer holds until the budget is spent */
+        } else {
+            const int t = rule(ctx, slot, b->address, n);
+            m->va = b->address; m->size = n; m->stamp = stamp; m->t = (int8_t)t; m->take = 0;
+            if (t > 0) m->take = (int8_t)take(ctx, b->address, n, t);
+        }
+        m->pver = pver; m->gtok = gtok;
+        if (m->t > 0) P->tmask |= bit;
+        if (m->take) { P->take |= bit; cbt[g][slot] = (uint8_t)m->t; }
+    }
+    o.taken = (uint32_t)__builtin_popcountll(P->take);
+    return o;
+}
+/* ---------------------------------------------------------------- data-snapshot (play-work/data-snapshot, 2026-10-21; v2 after play-104,
+ * v2fix after the play-105 review: play-work/data-snapshot/v2fix/README.md)
+ * TOTK_DATA_SNAPSHOT: the GPU reads the bytes the game had written when it submitted, for every guest range it may rewrite
+ * afterwards. Guest threads run while t2 translates a submit (25-40 ms) and, with frame overlap, while the GPU still executes
+ * it; on the Switch the GPU consumes a command buffer within ~1-2 ms of the submit. Ranges the GPU reads in place after the
+ * call (direct CBVs, vertex streams through gmem_load, zero-copy index buffers) then mix the next frame's bytes with this
+ * frame's draw parameters (play-103, TOTK_SUSPECT_DIAG S1: ~317 ranges per 300 presents changed during the call; 'cave' cb-direct
+ * at a1d01200 / a1dc0000, 'effect' particle vertex streams around bc00000; the sky-island slab, giant effect triangles, the
+ * overlap explosions; play-104 with v1: dark slabs off stone ruins, a CB range the first time it raced; nxport
+ * metal/fence_guard.rs saw the same on TotK: "TotK writes the next frame's per-instance data into memory the running frame still
+ * reads").
+ *   What is copied:
+ *     constant buffers (TOTK_DATA_SNAPSHOT_CB=1, default): every uniform-buffer binding (slots 3..17) in a memory pool the CPU can
+ *       write, from its first use (eager; =2 also the program-constant slot 1 and shader-code pools; =0 learned chunks only, v1);
+ *     vertex streams and index buffers: ranges in "dynamic" 64 KiB chunks (learned, below); with the per-instance rule (default
+ *       on with TOTK_OVERLAP on) also per-instance vertex streams up to TOTK_DATA_SNAPSHOT_INSTANCE_KB;
+ *     TOTK_DATA_SNAPSHOT=2 (measurement): everything the CPU may write.
+ *     Constant buffers go to the upload ring through boot_render_cbv_ex (the snapshot path of every non-direct binding, its cache
+ *     and TOTK_CB_DEDUPE), index buffers to the ring (the IB view points there), vertex streams to the copy arena:
+ *     TOTK_DATA_SNAPSHOT_ARENA_MB after the driver buffer in the native block (host_nvn_exec.h), which the page table maps, so the
+ *     attribute table's stream VA points at the copy (no shader change: vin_attr4 reads it through gmem_load; the bound size e[6]
+ *     is unchanged). The arena has a part per ring segment, reused with the segment (its fence has completed when a list opens).
+ *   What stays zero-copy: memory pools with CPU_NO_ACCESS (observed nvnMemoryPool* calls; the CPU never writes them; nxport
+ *     nvn/api.rs keeps writable = flags & 6), the executor's block, and every range GPU work recorded before may write (GPU order
+ *     must decide), kept as exact intervals until the next queue idle (boot_ds_pend): GPU-ordered copies (boot_render_gw:
+ *     UpdateUniformBuffer, ClearBuffer, reports, occlusion counts, timestamps), the storage buffers of the stage of a storing draw
+ *     that stores (nxport metal/mod.rs gpu_dirty: "a uniform buffer in such a range is bound zero-copy so it sees those writes in
+ *     GPU order"), the learnt store ranges of pending deferred dispatches (merged across 64 KiB gaps; pages verified CPU-written
+ *     are the exception: they changed during a call and the store bitmaps of the next idle showed no compute store there), the
+ *     storage buffers bound to pending deferred dispatches (v2fix, BOOT_DS_P_BOUND: their stores outside the learnt ranges, which
+ *     grow only at the next idle, 'compute ranges grown'; no CPU verdict clears them), pending render-target write-backs.
+ *     Dispatches that are not deferred complete before anything later is recorded (host_gpu_compute.h), so their storage buffers
+ *     are not pending (v1 marked every storage buffer of every dispatch, read-only ones too: TOTK_DATA_SNAPSHOT_STORED=0 does that
+ *     again). Also zero-copy: vertex/index ranges not learned, streams without a bound size or above
+ *     TOTK_DATA_SNAPSHOT_STREAM_KB, and copies over the per-call budgets (TOTK_DATA_SNAPSHOT_CB_MB for every constant-buffer copy,
+ *     eager and learned; TOTK_DATA_SNAPSHOT_MB for vertex streams and index buffers; TOTK_DATA_SNAPSHOT_CB=0: one shared budget, v1).
+ *   Submit-time bytes: at the start of the call (after the page table is current, before the texture re-hash and the translation)
+ *     the pages of the recently used dynamic chunks are copied (TOTK_DATA_SNAPSHOT_EARLY, up to TOTK_DATA_SNAPSHOT_EARLY_MB; vertex
+ *     and index chunks first). A copy made during the translation takes those bytes where this call copied them, the page table
+ *     and big-write count are unchanged and no host write touched them since; else the bytes at the translation. (nxport
+ *     metal/report_guard.rs acts at submit start for the same reason.) A queue idle during the call drops the chunks GPU-ordered
+ *     copies or storing draws wrote since (v2fix: those writes have no host epoch, boot_ds_shadow_drop).
+ *   Learning (the detector): each call samples up to TOTK_DATA_SNAPSHOT_SAMPLES ranges the CPU may write (zero-copy ones and eager
+ *     CB copies; a hash phase picks a range once every `period` calls), hashes the first 128 bytes and a 128-byte window that moves
+ *     through the range, and hashes them again at the end of the call (renderer lock held, as suspect-diag S1). A change no host
+ *     write (boot_render_cb_written epochs, big writes) and no pending GPU work explains makes its chunks dynamic; changes pending
+ *     GPU work explains are counted by source and the first ones logged with their range; a change inside a deferred dispatch's
+ *     merged range on pages compute never stored to is judged after the next idle (its store bitmaps then hold that dispatch). Calls whose GPU work has not completed
+ *     by the next call keep their records for a second check then. With TOTK_SUSPECT_DIAG=1, S1's changed ranges also teach it.
+ *     Dynamic chunks stay (TOTK_DATA_SNAPSHOT_AGE=0, default; else they are dropped after that many calls without use).
+ * Every 300 presents two "data-snapshot" lines in draw-path.log: what was copied (per kind and rule, MiB, from the call-start copy),
+ * what stayed zero-copy and why, the detector and its attribution, the dynamic chunks, the call-start copy, arena and ring
+ * pressure, the pools and the CPU cost per frame. The first TOTK_DATA_SNAPSHOT_EVENTS learn events and the first 32 changes put
+ * down to GPU work are logged with their range. */
+typedef struct BootDsCfg {
+    int mode, early, instance, pools, overlap, cb, stored, plan; uint32_t samples, events;
+    uint64_t budget, cb_budget, early_bytes, arena_bytes, stream_cap, instance_cap, age;
+} BootDsCfg;
+static BootDsCfg boot_ds_cfg;
+static BootDsCore boot_ds_core;
+static BootDsArena boot_ds_arena;
+static BootDsPend boot_ds_pend;       /* GPU writes not known complete (exact intervals) */
+static BootDsStored boot_ds_stored;   /* pages compute has stored to */
+typedef struct BootDsRec { const uint8_t *base; uint64_t va, off, epoch, big, hash, lo, gen; uint32_t n, reg, kind, nw, woff[2], wlen[2]; } BootDsRec;
+#define BOOT_DS_SEEN 4096u
+typedef struct BootDsDet {
+    BootDsRec *rec, *late; uint32_t nrec, nlate, cap, period, picked; uint64_t late_fence, call_bytes, cb_bytes;
+    uint64_t seen[BOOT_DS_SEEN], seen_call[BOOT_DS_SEEN];
+    int capture_due;
+} BootDsDet;
+static BootDsDet *boot_ds_det;
+typedef struct BootDsCount {
+    uint64_t calls, draws, draws_snap, bind_cb[BOOT_DS_K_N];          /* bind_cb: bindings / streams / index ranges taken */
+    uint64_t copies[BOOT_DS_K_N], bytes[BOOT_DS_K_N], shadow_bytes[BOOT_DS_K_N], other_shadow, other_shadow_bytes;
+    uint64_t cb_rule_copies[BOOT_DS_T_N], cb_rule_bytes[BOOT_DS_T_N], eager_hist[5], eager_hist_bytes[5];
+    uint64_t rule[BOOT_DS_T_N], pend[BOOT_DS_P_N], gpu_only, over_budget, cb_over_budget, arena_full, unbounded, too_large, split, ring_full;
+    uint64_t sampled, ch_learn, ch_host, ch_src[BOOT_DS_P_N], gone, late_checked, late_changed, learned_new, learn_full, s1_learn, s1_src[BOOT_DS_P_N], dropped;
+    uint64_t verify_queued, verify_gpu, verify_cpu, verify_dropped, verified_takes;   /* changes inside pending compute ranges, judged after the idle */
+    uint64_t cap_calls, cap_chunks, cap_bytes, cap_full, cap_pending, store_marks, gw_synced, compute_synced;
+    uint64_t cls_bind[5];   /* direct CB decisions by class: dynamic, CPU-writable pool, GPU-only pool, no pool, unclassified */
+    uint64_t q_plan, plan_timed, q_copy, q_det, q_cap, remaps, memo_hits, memo_rechecks;
+    /* v2fix: deferred dispatches whose storage buffers were marked, call-start chunks dropped at a mid-call idle, plan slots visited
+     * and draws with none, the vertex/stream decisions' own timer, the sampled CB-copy timer, the detector's samples inside timed plans
+     * (taken off the plan: they are the detector's), timed intervals (each holds ~one QueryPerformanceCounter call) */
+    uint64_t bound_marks, shadow_dropped, plan_slots, plan_skips, q_vtx, vtx_timed, q_cbcopy, cbcopy_timed, q_plan_det, q_vtx_det, timer_intervals;
+} BootDsCount;
+static BootDsCount boot_ds_c, boot_ds_l;
+static double boot_ds_qpc_ticks;   /* v2fix: one QueryPerformanceCounter call, in its ticks (measured at start-up) */
+static int boot_ds_plan_timing;    /* v2fix: 1 inside a timed plan, 2 inside timed vertex decisions (boot_ds_sample's own time is taken off theirs) */
+static uint64_t boot_ds_presents, boot_ds_frame; static unsigned boot_ds_events_left, boot_ds_src_events_left = 32;
+static uint64_t boot_ds_cls_gen = 1;   /* moves with every learn, class rebuild and aging: the slot memos start over */
+static SRWLOCK boot_ds_init_lock = SRWLOCK_INIT;
+static inline uint64_t boot_ds_env(const char *name, uint64_t def, uint64_t lo, uint64_t hi) {
+    char v[24]; DWORD k = GetEnvironmentVariableA(name, v, sizeof v);
+    if (!k || k >= sizeof v) return def;
+    unsigned long long x = strtoull(v, NULL, 10);
+    return x < lo ? lo : x > hi ? hi : (uint64_t)x;
+}
+static inline uint64_t boot_ds_qpc_freq(void) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (uint64_t)f.QuadPart : 1; }
+static inline __attribute__((noinline)) void boot_ds_mode_init(void) {
+    AcquireSRWLockExclusive(&boot_ds_init_lock);
+    if (boot_ds_mode_v < 0) {
+        char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_DATA_SNAPSHOT", v, sizeof v);
+        int mode = (k && k < sizeof v) ? (v[0] == '0' ? 0 : v[0] == '2' ? 2 : 1) : 1;
+        BootDsCfg *g = &boot_ds_cfg; memset(g, 0, sizeof *g);
+        if (mode) {
+            k = GetEnvironmentVariableA("TOTK_OVERLAP", v, sizeof v); g->overlap = !(k && k < sizeof v && v[0] == '0');   /* as boot_mt_overlap_on */
+            g->budget = boot_ds_env("TOTK_DATA_SNAPSHOT_MB", 8, 1, 256) << 20;
+            g->cb = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_CB", 1, 0, 2);
+            g->cb_budget = boot_ds_env("TOTK_DATA_SNAPSHOT_CB_MB", 32, 1, 512) << 20;
+            g->early = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_EARLY", 1, 0, 1);
+            g->early_bytes = g->early ? boot_ds_env("TOTK_DATA_SNAPSHOT_EARLY_MB", 4, 1, 64) << 20 : 0;
+            g->arena_bytes = boot_ds_env("TOTK_DATA_SNAPSHOT_ARENA_MB", 32, 16, 256) << 20;
+            g->stream_cap = boot_ds_env("TOTK_DATA_SNAPSHOT_STREAM_KB", 1024, 4, 16384) << 10;
+            g->instance = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_INSTANCE", (uint64_t)g->overlap, 0, 1);
+            g->instance_cap = boot_ds_env("TOTK_DATA_SNAPSHOT_INSTANCE_KB", 64, 1, 4096) << 10;
+            g->samples = (uint32_t)boot_ds_env("TOTK_DATA_SNAPSHOT_SAMPLES", 1024, 0, 16384);
+            g->age = boot_ds_env("TOTK_DATA_SNAPSHOT_AGE", 0, 0, 100000000);
+            g->pools = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_POOLS", 1, 0, 1);
+            g->stored = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_STORED", 1, 0, 1);
+            g->plan = (int)boot_ds_env("TOTK_DATA_SNAPSHOT_PLAN", 1, 0, 2);   /* v2fix: 0 = the CB plan visits all 36 slots every draw (A/B of its skips); 2 = cross-check (boot_ds_plan_check) */
+            g->events = (uint32_t)boot_ds_env("TOTK_DATA_SNAPSHOT_EVENTS", 64, 0, 100000);
+            BootDsDet *D = (BootDsDet *)calloc(1, sizeof *D);
+            if (D && g->samples) { D->rec = (BootDsRec *)calloc(g->samples, sizeof *D->rec); D->late = (BootDsRec *)calloc(g->samples, sizeof *D->late); }
+            if (!D || (g->samples && (!D->rec || !D->late)) || !boot_ds_core_init(&boot_ds_core, 16384, (uint32_t)g->early_bytes)) {
+                if (D) { free(D->rec); free(D->late); free(D); }
+                mode = 0; boot_gp_log("data-snapshot: no memory for its tables: off (zero-copy as before)");
+            } else {
+                D->cap = g->samples; D->period = 8; boot_ds_det = D; boot_ds_events_left = g->events;
+                boot_ds_pend_reset(&boot_ds_pend);
+                if (g->early && !boot_ds_core.shadow) g->early = 0;
+                {   LARGE_INTEGER a, b, x; QueryPerformanceCounter(&a); for (unsigned i = 0; i < 1024; ++i) QueryPerformanceCounter(&x);   /* the timer's own cost */
+                    QueryPerformanceCounter(&b); boot_ds_qpc_ticks = (double)(b.QuadPart - a.QuadPart) / 1025.0; }
+                boot_gp_log("data-snapshot v2fix: TOTK_DATA_SNAPSHOT=%d (%s), constant buffers TOTK_DATA_SNAPSHOT_CB=%d (%s, budget %llu MiB per call%s); vertex/index: "
+                            "learned chunks, copy budget %llu MiB per call; call-start copy %s (%llu MiB), arena %llu MiB (%u parts), streams up to %llu KiB, "
+                            "per-instance rule %s (up to %llu KiB; TOTK_OVERLAP %s), detector %u ranges per call, aging %s, NVN pool flags %s, "
+                            "TOTK_DATA_SNAPSHOT_STORED=%d (%s), CB plan %s; timer %.1f ns per call",
+                            mode, mode == 2 ? "every range the CPU may write" : "learned dynamic ranges", g->cb,
+                            g->cb == 0 ? "learned only" : g->cb == 1 ? "eager: every uniform buffer in a CPU-writable pool" : "eager, also program constants",
+                            (unsigned long long)(g->cb_budget >> 20), g->cb ? ", eager and learned copies" : ": unused, learned CB copies share the vertex/index budget (v1)",
+                            (unsigned long long)(g->budget >> 20), g->early ? "on" : "off",
+                            (unsigned long long)(g->early_bytes >> 20), (unsigned long long)(g->arena_bytes >> 20), BOOT_DS_PARTS,
+                            (unsigned long long)(g->stream_cap >> 10), g->instance ? "on" : "off", (unsigned long long)(g->instance_cap >> 10),
+                            g->overlap ? "on" : "off", g->samples, g->age ? "on" : "off (dynamic chunks stay)", g->pools ? "observed" : "not observed",
+                            g->stored, g->stored ? "deferred dispatches' storage buffers pending, changes in merged compute store ranges judged by the store bitmaps"
+                                                 : "v1 attribution: every dispatch's and both stages' storage buffers pending, learnt ranges whole",
+                            g->plan ? "visits changed slots only" : "visits every slot (TOTK_DATA_SNAPSHOT_PLAN=0)", boot_ds_qpc_ticks * 1e9 / (double)boot_ds_qpc_freq());
+            }
+        }
+        g->mode = mode;
+        __atomic_store_n(&boot_ds_mode_v, mode, __ATOMIC_RELEASE);
+    }
+    ReleaseSRWLockExclusive(&boot_ds_init_lock);
+}
+/* Bytes of the copy arena after the driver buffer in the native block (0: snapshot off, the block stays 2 MiB). */
+static inline uint64_t boot_ds_arena_bytes(void) { return boot_ds_on() ? boot_ds_cfg.arena_bytes : 0; }
+/* Guest GPU VA -> host bytes through the CPU page table, without the render-target write-back wait of boot_render_guest
+ * (ranges such a write-back may still write are kept zero-copy instead, boot_ds_gpu_pending). */
+static inline const uint8_t *boot_ds_guest(const BootRender *r, uint64_t va, uint64_t size, uint32_t *reg) {
+    if ((va >> 12) < r->va_base_page || !size || !r->ptable_cpu) return NULL;
+    const uint64_t page = (va >> 12) - r->va_base_page;
+    if (page >= r->ptable_pages) return NULL;
+    const uint32_t e = r->ptable_cpu[page];
+    if (e == 0xffffffffu || (e >> 24) >= r->region_count || !r->region_cpu[e >> 24]) return NULL;
+    const uint64_t off = ((uint64_t)(e & 0xffffff) << 12) | (va & 0xfff);
+    if (off > r->region_size[e >> 24] || size > r->region_size[e >> 24] - off) return NULL;
+    const uint64_t last = ((va & 0xfff) + size - 1) >> 12;
+    for (uint64_t q = 1; q <= last; ++q) if (page + q >= r->ptable_pages || r->ptable_cpu[page + q] != e + (uint32_t)q) return NULL;
+    if (reg) *reg = e >> 24;
+    return r->region_cpu[e >> 24] + off;
+}
+static inline const uint8_t *boot_ds_page_fn(void *ctx, uint64_t va) { return boot_ds_guest((const BootRender *)ctx, va, 4096, NULL); }
+static inline int boot_ds_clean_fn(void *ctx, uint64_t va, uint64_t n, uint64_t epoch) { (void)ctx; return boot_render_cb_clean(va, n, epoch); }
+/* ---- GPU writes recorded and not known complete. The GPU-write table (boot_render_gw) only grows between idles (new entries,
+ * the last one extended in place), deferred dispatches only join boot_compute_pending_list: both are folded into boot_ds_pend
+ * incrementally (boot_ds_pend_sync, once per draw and before every check outside draws); storing draws add their storing stage's
+ * storage buffers when they are recorded, deferred dispatches their bound storage buffers (host_nvn_play.h). Everything is
+ * dropped at the next idle. */
+#define BOOT_DS_STORE_SEEN 1024u
+static uint64_t boot_ds_st_seen[BOOT_DS_STORE_SEEN]; static uint32_t boot_ds_st_seen_gen[BOOT_DS_STORE_SEEN];
+static unsigned boot_ds_gw_synced; static uint64_t boot_ds_gw_last_va, boot_ds_gw_last_size;
+static unsigned boot_ds_cp_synced, boot_ds_cp_nseen; static const void *boot_ds_cp_seen[64];   /* used by host_nvn_exec.h's sync */
+static void (*boot_ds_compute_sync)(void);   /* folds new deferred dispatches in (host_nvn_exec.h sets it) ... */
+static const unsigned *boot_ds_cp_count;     /* ... and points this at boot_compute_pending: no call while nothing was deferred */
+static uint32_t boot_ds_store_stages;        /* the draw just recorded stores from: 1 vertex, 2 pixel (host_gpu_render_draw.h) */
+/* changes inside pending compute ranges on pages compute never stored to: judged after the next idle, whose store bitmaps hold the
+ * dispatches of the call that saw the change (boot_ds_verify_run) */
+#define BOOT_DS_VERIFY 256u
+static struct { uint64_t va, idle; uint32_t n, kind; } boot_ds_verify[BOOT_DS_VERIFY]; static unsigned boot_ds_nverify;
+static uint64_t boot_ds_idles;
+static inline void boot_ds_pend_sync(void) {
+    BootDsPend *p = &boot_ds_pend;
+    if (boot_render_gw_all) { if (!p->all) boot_ds_pend_over(p, BOOT_DS_P_GW, BOOT_DS_OVF_GW); }
+    else {
+        const unsigned n = boot_render_gw_count;
+        if (n < boot_ds_gw_synced) boot_ds_gw_synced = 0;   /* (only an idle empties the table, and it resets this too) */
+        if (boot_ds_gw_synced) {   /* the last entry may have grown in place since: only its new bytes (v2 re-added it whole) */
+            const unsigned i = boot_ds_gw_synced - 1;
+            if (boot_render_gw[i].va != boot_ds_gw_last_va || boot_render_gw[i].size != boot_ds_gw_last_size) {
+                boot_ds_pend_grow(p, boot_ds_gw_last_va, boot_ds_gw_last_va + boot_ds_gw_last_size, boot_render_gw[i].va, boot_render_gw[i].va + boot_render_gw[i].size, BOOT_DS_P_GW);
+                boot_ds_gw_last_va = boot_render_gw[i].va; boot_ds_gw_last_size = boot_render_gw[i].size; ++boot_ds_c.gw_synced;
+            }
+        }
+        for (unsigned i = boot_ds_gw_synced; i < n; ++i) { boot_ds_pend_add(p, boot_render_gw[i].va, boot_render_gw[i].size, BOOT_DS_P_GW); ++boot_ds_c.gw_synced; }
+        if (n > boot_ds_gw_synced) { boot_ds_gw_last_va = boot_render_gw[n - 1].va; boot_ds_gw_last_size = boot_render_gw[n - 1].size; }
+        boot_ds_gw_synced = n;
+    }
+    if (boot_ds_compute_sync && (!boot_ds_cp_count || *boot_ds_cp_count != boot_ds_cp_synced)) boot_ds_compute_sync();
+}
+/* Queue idle (boot_render_idle_cleanup, before it empties the GPU-write table): everything recorded has completed. Chunks of this
+ * call's call-start copy that GPU-ordered copies or storing draws wrote since the capture leave the copy first (those writes have no
+ * host epoch: the copy would pass for clean once the marks are gone); compute stores bump the epochs in boot_compute_idle. */
+static inline void boot_ds_idle(void) {
+    if (boot_ds_mode_v <= 0) return;
+    ++boot_ds_idles;
+    if (boot_ds_core.shadow_used && boot_ds_core.shadow_call == boot_ds_core.call) {
+        boot_ds_pend_sync();
+        boot_ds_c.shadow_dropped += boot_ds_shadow_drop(&boot_ds_core, &boot_ds_pend, (1u << BOOT_DS_P_GW) | (1u << BOOT_DS_P_STORE));
+    }
+    boot_ds_pend_reset(&boot_ds_pend);
+    boot_ds_gw_synced = 0; boot_ds_gw_last_va = boot_ds_gw_last_size = 0; boot_ds_cp_synced = 0; boot_ds_cp_nseen = 0;
+}
+/* A deferred dispatch's learnt range (host_nvn_exec.h): pending as a whole (pages verified CPU-written excepted, boot_ds_gpu_pending). */
+static inline void boot_ds_pend_compute(uint64_t va, uint64_t n) {
+    ++boot_ds_c.compute_synced;
+    boot_ds_pend_add(&boot_ds_pend, va, n, BOOT_DS_P_COMPUTE);
+}
+/* Pages a compute store bitmap showed stored (host_gpu_compute.h boot_compute_idle, every stored run). */
+static inline void boot_ds_gpu_stored(uint64_t va, uint64_t n) { if (boot_ds_mode_v > 0) boot_ds_stored_add(&boot_ds_stored, va, n); }
+/* Storage buffers of the storing stage(s) of a storing draw: GPU stores in command order until the next idle. */
+static inline void boot_ds_stores(const uint64_t *va, const uint64_t *size, unsigned n) {
+    if (!boot_ds_on()) return;
+    ++boot_ds_c.store_marks;
+    boot_ds_mark_bufs(&boot_ds_pend, boot_ds_st_seen, boot_ds_st_seen_gen, BOOT_DS_STORE_SEEN, va, size, n, BOOT_DS_P_STORE);
+}
+/* The stages whose storage buffers a storing draw just recorded marks (host_nvn_play.h): the storing ones; both when unknown, and
+ * with TOTK_DATA_SNAPSHOT_STORED=0 (v1). */
+static inline unsigned boot_ds_store_marked_stages(void) { return boot_ds_store_stage_mask(boot_ds_store_stages, boot_ds_cfg.stored); }
+/* A compute dispatch (host_nvn_play.h boot_nvn_exec_dispatch), before and after boot_compute_dispatch_decoded. Default: a dispatch
+ * that was deferred (boot_compute_deferred grew; exact even when the call idled first) marks its bound storage buffers as
+ * BOOT_DS_P_BOUND: its stores outside the program's learnt ranges (those grow only at the next idle) are pending in GPU order too,
+ * and a CPU verdict never clears them. Read-only buffers among them stay zero-copy until the idle (as v1); a change seen there is
+ * still judged by the store bitmaps (boot_ds_attribute), so v2's attribution is kept. TOTK_DATA_SNAPSHOT_STORED=0: v1, every
+ * dispatch's storage buffers before it as storing-draw writes (a dispatch that completes at once idles before anything later). */
+static inline void boot_ds_dispatch_pre(const uint64_t *va, const uint64_t *size) {
+    if (boot_ds_on() && boot_ds_dispatch_src(boot_ds_cfg.stored, 0, 0) == BOOT_DS_P_STORE) boot_ds_stores(va, size, 16);
+}
+static inline void boot_ds_dispatch_post(int deferred, const uint64_t *va, const uint64_t *size) {
+    if (!deferred || !boot_ds_on()) return;
+    const unsigned src = boot_ds_dispatch_src(boot_ds_cfg.stored, 1, deferred);
+    if (!src) return;
+    ++boot_ds_c.bound_marks;
+    boot_ds_mark_bufs(&boot_ds_pend, boot_ds_st_seen, boot_ds_st_seen_gen, BOOT_DS_STORE_SEEN, va, size, 16, src);
+}
+/* Pending render-target write-backs over [va, va + n) (boot_render_gt_guard's fast path, without the wait). */
+static inline int boot_ds_gt_busy(BootRender *r, uint64_t va, uint64_t n) {
+    if (!boot_render_gt_npending) return 0;
+    if (n >= (UINT64_C(1) << 28) || va >= (UINT64_C(1) << 48)) return 1;
+    uint64_t need = 0;
+    for (uint64_t c = va >> 16, last = (va + n - 1) >> 16; c <= last; ++c) { const uint64_t f = boot_render_gt_chunk_fence[c & (BOOT_RENDER_GT_CHUNK_TABLE - 1)]; if (f > need) need = f; }
+    if (need <= boot_render_gt_done_seen) return 0;
+    const uint64_t done = ID3D12Fence_GetCompletedValue(r->gpu->fence);
+    if (done != UINT64_MAX && done > boot_render_gt_done_seen) boot_render_gt_done_seen = done;
+    return need > boot_render_gt_done_seen;
+}
+/* The source of GPU work recorded earlier that may write [va, va + n) (0: none; then a CPU copy is the bytes GPU order shows).
+ * boot_ds_pend must be synced (boot_ds_pend_sync) since the last GPU-ordered write. */
+static inline unsigned boot_ds_gpu_pending(BootRender *r, uint64_t va, uint64_t n, int count) {
+    const unsigned m = boot_ds_pend_mask(&boot_ds_pend, va, n);
+    const int verified = m == 1u << BOOT_DS_P_COMPUTE && boot_ds_cfg.stored && boot_ds_cpu_all(&boot_ds_stored, va, n);   /* only a merged compute range */
+    unsigned src = boot_ds_pend_verdict(m, boot_ds_cfg.stored, verified);                                                  /* over pages verified CPU-written */
+    if (m && !src && count) ++boot_ds_c.verified_takes;
+    if (!src && boot_ds_gt_busy(r, va, n)) src = BOOT_DS_P_TARGET;
+    if (count && src < BOOT_DS_P_N) ++boot_ds_c.pend[src];
+    return src;
+}
+static const char *const boot_ds_src_name[BOOT_DS_P_N] = {"none", "GPU-ordered copy/report", "storing draw's storage buffer", "deferred compute store", "render-target write-back",
+                                                          "deferred dispatch's storage buffer"};
+/* ---- the detector */
+static inline void boot_ds_sample(BootRender *r, unsigned kind, uint64_t va, uint64_t n, unsigned cls) {
+    BootDsDet *D = boot_ds_det;
+    if (!D || D->nrec >= D->cap || (cls & BOOT_DS_C_HOST) || ((cls & BOOT_DS_C_GPU) && !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL)))) return;
+    if (!boot_ds_pick(va, n, boot_ds_core.call, D->period)) return;
+    const uint64_t key = va ^ (n << 40) ^ ((uint64_t)kind << 62); const uint32_t h = boot_ds_hash32(key) & (BOOT_DS_SEEN - 1);
+    if (D->seen_call[h] == boot_ds_core.call && D->seen[h] == key) return;
+    D->seen[h] = key; D->seen_call[h] = boot_ds_core.call; ++D->picked;
+    uint32_t reg = 0; const uint8_t *p = boot_ds_guest(r, va, n, &reg);
+    if (!p) return;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    BootDsRec *e = &D->rec[D->nrec++];
+    e->base = r->region_cpu[reg]; e->reg = reg; e->off = (uint64_t)(p - e->base); e->va = va; e->n = (uint32_t)n; e->kind = kind;
+    const BootGrView *v = &boot_gr_view[reg];
+    if (v->cpu && v->cpu == e->base) { e->lo = v->lo; e->gen = v->gen; } else { e->lo = 0; e->gen = 0; }
+    e->nw = boot_ds_windows(n, boot_ds_core.call / (D->period ? D->period : 1) + h, e->woff, e->wlen);
+    uint64_t hh = 0; for (unsigned w = 0; w < e->nw; ++w) hh = boot_ds_hash(p + e->woff[w], e->wlen[w], hh);
+    e->hash = hh; e->epoch = boot_render_cb_epoch; e->big = boot_render_big_writes;
+    ++boot_ds_c.sampled;
+    QueryPerformanceCounter(&q1); boot_ds_c.q_det += (uint64_t)(q1.QuadPart - q0.QuadPart);
+    if (boot_ds_plan_timing) *(boot_ds_plan_timing == 1 ? &boot_ds_c.q_plan_det : &boot_ds_c.q_vtx_det) += (uint64_t)(q1.QuadPart - q0.QuadPart);   /* counted once: the detector's */
+}
+static inline int boot_ds_rec_live(const BootRender *r, const BootDsRec *e) {
+    if (e->reg >= r->region_count || r->region_cpu[e->reg] != e->base || e->off + e->n > r->region_size[e->reg]) return 0;
+    const BootGrView *v = &boot_gr_view[e->reg]; const int view_now = v->cpu && v->cpu == e->base;
+    return e->gen ? (view_now && v->lo == e->lo && v->gen == e->gen && !v->stale) : !view_now;
+}
+static const char *const boot_ds_kind_name[BOOT_DS_K_N] = {"constant buffer", "vertex stream", "index buffer"};
+static inline void boot_ds_learned(BootRender *r, uint64_t va, uint64_t n, unsigned kind, const char *how) {
+    const unsigned cls = boot_ds_cls_span(&boot_ds_core, va, n);
+    if ((cls & BOOT_DS_C_HOST) || ((cls & BOOT_DS_C_GPU) && !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL)))) return;
+    if ((uint64_t)boot_ds_core.n * 4 >= (uint64_t)boot_ds_core.cap * 3) ++boot_ds_c.learn_full;   /* new chunks are not kept */
+    const unsigned fresh = boot_ds_learn_core(&boot_ds_core, va, n, kind);
+    boot_ds_c.learned_new += fresh; if (fresh) ++boot_ds_cls_gen;
+    if (fresh && boot_ds_events_left) {
+        --boot_ds_events_left;
+        boot_gp_log("data-snapshot: learned %u chunk(s) at %llx (%s va %llx size %llu %s, pool class %s%s%s%s) at call %llu frame %llu; dynamic chunks %u",
+                    fresh, (unsigned long long)(va & ~(BOOT_DS_CHUNK_BYTES - 1)), boot_ds_kind_name[kind % BOOT_DS_K_N], (unsigned long long)va,
+                    (unsigned long long)n, how, (cls & BOOT_DS_C_CPU) ? "CPU-writable pool " : "", (cls & BOOT_DS_C_NOPOOL) ? "no pool " : "",
+                    (cls & BOOT_DS_C_CODE) ? "shader code " : "", !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL)) ? "unclassified" : "",
+                    (unsigned long long)boot_ds_core.call, (unsigned long long)boot_ds_frame, boot_ds_core.n);
+    }
+    (void)r;
+}
+static inline void boot_ds_src_event(unsigned src, uint64_t va, uint64_t n, unsigned kind, const char *who) {
+    if (!boot_ds_src_events_left) return;
+    --boot_ds_src_events_left;
+    boot_gp_log("data-snapshot: %s change of %s va %llx size %llu put down to GPU work recorded before it (%s): kept zero-copy, not learned (call %llu frame %llu)",
+                who, boot_ds_kind_name[kind % BOOT_DS_K_N], (unsigned long long)va, (unsigned long long)n, boot_ds_src_name[src % BOOT_DS_P_N],
+                (unsigned long long)boot_ds_core.call, (unsigned long long)boot_ds_frame);
+}
+/* A change of [va, va + n) no host write explains: 1 put down to GPU work recorded before it (counted in `src_count`, logged), 0 the
+ * game's CPU (learn it), 2 inside a pending compute range on pages compute never stored to: judged after the next idle. */
+static inline int boot_ds_attribute(BootRender *r, uint64_t va, uint64_t n, unsigned kind, uint64_t *src_count, const char *who) {
+    const unsigned m = boot_ds_pend_mask(&boot_ds_pend, va, n);
+    if (!m) {
+        if (!boot_ds_gt_busy(r, va, n)) return 0;
+        ++src_count[BOOT_DS_P_TARGET]; boot_ds_src_event(BOOT_DS_P_TARGET, va, n, kind, who); return 1;
+    }
+    if (boot_ds_attr_judged(m, boot_ds_cfg.stored) && !boot_ds_stored_any(&boot_ds_stored, va, n)) {   /* deferred compute only (learnt
+                                                                                                     * ranges, bound storage buffers) */
+        if (boot_ds_cpu_all(&boot_ds_stored, va, n)) return 0;   /* verified before */
+        if (boot_ds_nverify < BOOT_DS_VERIFY) {
+            boot_ds_verify[boot_ds_nverify].va = va; boot_ds_verify[boot_ds_nverify].n = (uint32_t)n; boot_ds_verify[boot_ds_nverify].kind = kind;
+            boot_ds_verify[boot_ds_nverify++].idle = boot_ds_idles; ++boot_ds_c.verify_queued;
+        } else ++boot_ds_c.verify_dropped;
+        return 2;
+    }
+    const unsigned src = (unsigned)__builtin_ctz(m);
+    ++src_count[src % BOOT_DS_P_N]; boot_ds_src_event(src, va, n, kind, who);
+    return 1;
+}
+/* After an idle (the compute store bitmaps of everything before it are in boot_ds_stored): changes queued before it are GPU when compute
+ * stored to their pages, else CPU: their pages are marked verified CPU-written and learned. */
+static inline void boot_ds_verify_run(BootRender *r) {
+    unsigned k = 0;
+    for (unsigned i = 0; i < boot_ds_nverify; ++i) {
+        const uint64_t va = boot_ds_verify[i].va, n = boot_ds_verify[i].n; const unsigned kind = boot_ds_verify[i].kind;
+        if (boot_ds_verify[i].idle == boot_ds_idles) { boot_ds_verify[k++] = boot_ds_verify[i]; continue; }   /* no idle since: keep */
+        if (boot_ds_stored_any(&boot_ds_stored, va, n)) {
+            ++boot_ds_c.verify_gpu; boot_ds_src_event(BOOT_DS_P_COMPUTE, va, n, kind, "after the idle (compute stored to it):");
+        } else {
+            ++boot_ds_c.verify_cpu; boot_ds_cpu_mark(&boot_ds_stored, va, n);
+            boot_ds_learned(r, va, n, kind, "changed during the call inside a deferred dispatch's merged store range, compute never stored there");
+        }
+    }
+    boot_ds_nverify = k;
+}
+/* Hashes the records again: a change no host write and no pending GPU work explains is the game writing during the call. */
+static inline void boot_ds_recheck(BootRender *r, BootDsRec *rec, uint32_t n, int late) {
+    boot_ds_pend_sync();
+    for (uint32_t i = 0; i < n; ++i) {
+        BootDsRec *e = &rec[i];
+        if (!boot_ds_rec_live(r, e)) { ++boot_ds_c.gone; continue; }
+        const uint8_t *p = e->base + e->off; uint64_t h = 0;
+        for (unsigned w = 0; w < e->nw; ++w) h = boot_ds_hash(p + e->woff[w], e->wlen[w], h);
+        if (late) ++boot_ds_c.late_checked;
+        if (h == e->hash) continue;
+        e->hash = h;   /* the late check compares against the end of the call */
+        if (late) ++boot_ds_c.late_changed;
+        if (!boot_render_cb_clean(e->va, e->n, e->epoch + 1) || e->big != boot_render_big_writes) { ++boot_ds_c.ch_host; continue; }
+        if (boot_ds_attribute(r, e->va, e->n, e->kind, boot_ds_c.ch_src, "detector:")) continue;
+        ++boot_ds_c.ch_learn;
+        boot_ds_learned(r, e->va, e->n, e->kind, late ? "changed after the call while its GPU work ran" : "changed during the call");
+    }
+}
+/* suspect-diag S1 saw [va, va + n) change during a call (host writes already excluded). */
+static inline void boot_ds_s1_changed(BootRender *r, uint64_t va, uint64_t n, unsigned kind) {
+    if (!boot_ds_on() || !n || va > UINT64_MAX - n) return;
+    boot_ds_pend_sync();
+    if (boot_ds_attribute(r, va, n, kind, boot_ds_c.s1_src, "suspect-diag S1:")) return;
+    ++boot_ds_c.s1_learn;
+    boot_ds_learned(r, va, n, kind, "changed during the call (suspect-diag S1)");
+}
+/* ---- decisions */
+static inline void boot_ds_touch(uint64_t va, uint64_t n) {
+    for (uint64_t c = va >> BOOT_DS_CHUNK_SHIFT, last = (va + n - 1) >> BOOT_DS_CHUNK_SHIFT, k = 0; c <= last && k < 64; ++c, ++k) {
+        BootDsChunk *e = boot_ds_chunk(&boot_ds_core, c, 0);
+        if (e) e->last_use = boot_ds_core.call;
+    }
+}
+/* The rule that would copy [va, va + n) of kind `kind` (0: zero-copy), from its class only. `eager`: the eager CB rule applies. */
+static inline int boot_ds_rule(unsigned cls, int instance_ok, int eager) {
+    return boot_ds_take_core(boot_ds_cfg.mode, cls, instance_ok && boot_ds_cfg.instance, eager);
+}
+/* A rule's copy of a range of `kind` may be taken now: no pending GPU write over it, within the call's budget (constant buffers:
+ * TOTK_DATA_SNAPSHOT_CB_MB for every rule, v2 charged learned ones to the vertex/index budget; vertex/index: TOTK_DATA_SNAPSHOT_MB). */
+static inline int boot_ds_take_ok(BootRender *r, unsigned kind, uint64_t va, uint64_t n, int t) {
+    if (boot_ds_gpu_pending(r, va, n, 1)) return 0;
+    BootDsDet *D = boot_ds_det;
+    if (D) {
+        const int cb = boot_ds_uses_cb_budget(kind, t, boot_ds_cfg.cb);
+        if (cb && D->cb_bytes + n > boot_ds_cfg.cb_budget) { ++boot_ds_c.cb_over_budget; return 0; }
+        if (!cb && D->call_bytes + n > boot_ds_cfg.budget) { ++boot_ds_c.over_budget; return 0; }
+    }
+    ++boot_ds_c.rule[t % BOOT_DS_T_N];
+    if (t == BOOT_DS_T_LEARNED) boot_ds_touch(va, n);
+    return 1;
+}
+/* > 0: the rule that takes a copy; 0: zero-copy (sampled by the detector when the CPU may write it); -1: a copy was wanted but GPU
+ * work may write the range or the call's budget is spent (zero-copy). Vertex streams and index buffers (constant buffers: the plan). */
+static inline int boot_ds_decide(BootRender *r, unsigned kind, uint64_t va, uint64_t n, int instance_ok) {
+    if (!n || va > UINT64_MAX - n) return 0;
+    const unsigned cls = boot_ds_cls_span(&boot_ds_core, va, n);
+    const int t = boot_ds_rule(cls, instance_ok, 0);
+    if (!t) {
+        if ((cls & BOOT_DS_C_GPU) && !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL))) ++boot_ds_c.gpu_only;
+        else if (boot_ds_det && boot_ds_det->cap) boot_ds_sample(r, kind, va, n, cls);
+        return 0;
+    }
+    return boot_ds_take_ok(r, kind, va, n, t) ? t : -1;
+}
+/* The draw's constant-buffer slots (vertex group 0, pixel group 4) that read a copy instead of a direct CBV, decided before the ring
+ * room check (which then counts their snapshot bytes): boot_ds_plan_run (the core) over the slot memos. A binding equal to the
+ * previous one at its slot, in the same call, with no class change since, has the same rule; a rule that copies is re-checked
+ * against pending GPU writes only when those changed over its chunks (boot_ds_pend_changed) or the render-target write-back state
+ * moved (v2: on every draw while any write-back was pending), and against the budget once it is spent (every rule; v2: eager only).
+ * v2fix: slots whose rows, memo and answer cannot have changed are not visited at all; the producer's bind generation
+ * (boot_ds_bind_gen, host_nvn_exec.h) spares the row compare when it did not rebuild the table. Within a call a range is sampled
+ * at most once. */
+static uint64_t boot_ds_plan_n;
+static BootDsPlan boot_ds_plan;
+static int boot_ds_draw_cb;   /* the draw in flight reads a constant buffer from a copy (boot_ds_vertex counts the draws with a copy) */
+static inline int boot_ds_plan_rule(void *ctx, unsigned slot, uint64_t va, uint64_t n) {   /* a binding the slot memo does not hold */
+    BootRender *r = (BootRender *)ctx;
+    const unsigned cls = boot_ds_cls_span(&boot_ds_core, va, n);
+    const int eager = boot_ds_cfg.cb >= 2 ? 2 : boot_ds_cfg.cb == 1 && slot >= 3 ? 1 : 0;   /* slot 1: program constants */
+    const int t = boot_ds_rule(cls, 0, eager);
+    ++boot_ds_c.cls_bind[(cls & BOOT_DS_C_DYN) ? 0 : (cls & BOOT_DS_C_CPU) ? 1 : (cls & BOOT_DS_C_NOPOOL) ? 3 : (cls & BOOT_DS_C_GPU) ? 2 : 4];
+    if (!t) {
+        if ((cls & BOOT_DS_C_GPU) && !(cls & (BOOT_DS_C_CPU | BOOT_DS_C_NOPOOL))) ++boot_ds_c.gpu_only;
+        else if (boot_ds_det && boot_ds_det->cap) boot_ds_sample(r, BOOT_DS_K_CB, va, n, cls);
+        return 0;
+    }
+    if (t == BOOT_DS_T_EAGER && boot_ds_det && boot_ds_det->cap) boot_ds_sample(r, BOOT_DS_K_CB, va, n, cls);   /* to learn the racing ones */
+    return t;
+}
+static inline int boot_ds_plan_take(void *ctx, uint64_t va, uint64_t n, int t) { return boot_ds_take_ok((BootRender *)ctx, BOOT_DS_K_CB, va, n, t); }
+/* The render-target write-back state for the slot memos (boot_ds_gt_token): one fence read per draw at most, only while the newest
+ * pending write-back has not been seen complete (boot_render_gt_npending stays until a slow path or the idle prunes it). */
+static inline uint64_t boot_ds_gt_state(BootRender *r) {
+    if (!boot_render_gt_npending) return 0;
+    if (boot_render_gt_newest > boot_render_gt_done_seen && r->gpu && r->gpu->fence) {
+        const uint64_t done = ID3D12Fence_GetCompletedValue(r->gpu->fence);
+        if (done != UINT64_MAX && done > boot_render_gt_done_seen) boot_render_gt_done_seen = done;
+    }
+    return boot_ds_gt_token(boot_render_gt_npending, boot_render_gt_newest, boot_render_gt_done_seen, boot_render_gt_gen);
+}
+/* TOTK_DATA_SNAPSHOT_PLAN=2 (diagnostic; play-106's LOD-dependent tree/terrain explosions on the Sky Island, gone with =0): the
+ * skipping plan's answer is checked against a second plan that visits every slot on every draw (=0's answer, which the draw then
+ * uses, so nothing breaks on screen). Each draw where they differ is counted; the first 48 differing slots are logged with the
+ * slot's row, both answers, and the plan state that made the skip not visit it (`pre`: the skipping plan before this draw). */
+static BootDsPlan boot_ds_plan_full;
+static uint64_t boot_ds_plan_ck_draws, boot_ds_plan_ck_bad, boot_ds_plan_ck_slots;
+static inline void boot_ds_plan_check(BootRender *r, const BootRenderDraw *in, const BootDsPlan *pre, int pre_rows_same, uint64_t pre_rows,
+                                      uint64_t stamp, uint64_t pver, uint64_t gtok, int over) {
+    uint8_t full[2][18];
+    boot_ds_plan_full.primed = 0;
+    (void)boot_ds_plan_run(&boot_ds_plan_full, in->cbufs[0], in->cbufs[4], (const void *)in->cbufs, boot_ds_bind_gen, 0, stamp, pver, gtok, over,
+                           &boot_ds_pend, boot_ds_plan_rule, boot_ds_plan_take, r, full);
+    ++boot_ds_plan_ck_draws;
+    if (!(boot_ds_plan_ck_draws & ((UINT64_C(1) << 18) - 1)))
+        boot_gp_log("nvn native: data-snapshot plan check (TOTK_DATA_SNAPSHOT_PLAN=2): draws %llu, draws where the skip differed %llu (slots %llu)",
+                    (unsigned long long)boot_ds_plan_ck_draws, (unsigned long long)boot_ds_plan_ck_bad, (unsigned long long)boot_ds_plan_ck_slots);
+    if (!memcmp(full, boot_ds_cbt, sizeof full)) return;
+    ++boot_ds_plan_ck_bad;
+    static unsigned logged;
+    for (unsigned i = 0; i < BOOT_DS_SLOTS; ++i) {
+        const unsigned g = i >= 18, slot = i - 18 * g;
+        if (full[g][slot] == boot_ds_cbt[g][slot]) continue;
+        ++boot_ds_plan_ck_slots;
+        if (logged >= 48) continue;
+        ++logged;
+        const BootCbufBinding *b = g ? &in->cbufs[4][slot] : &in->cbufs[0][slot];
+        const BootDsMemo *m = &pre->m[i];
+        boot_gp_log("nvn native: data-snapshot plan check #%u: %s slot %u row %llx size %u valid %u: skip says %u, full walk %u | pre: primed %d same table %d "
+                    "same stamp %d same gtok %d rows-same+bgen %d row changed %d pver same %d valid %d tmask %d take %d keyok %d key %llx | memo va %llx size %u "
+                    "stamp same %d t %d take %d | draw %llu, draws %llu, differing draws %llu (submission %llu)",
+                    logged, g ? "pixel" : "vertex", slot, (unsigned long long)b->address, b->size, b->valid, boot_ds_cbt[g][slot], full[g][slot],
+                    pre->primed, pre->in == (const void *)in->cbufs, pre->stamp == stamp, pre->gtok == gtok, pre_rows_same, (int)((pre_rows >> i) & 1),
+                    pre->pver == pver, (int)((pre->valid >> i) & 1), (int)((pre->tmask >> i) & 1), (int)((pre->take >> i) & 1), (int)((pre->keyok >> i) & 1),
+                    (unsigned long long)pre->key[i], (unsigned long long)m->va, m->size, m->stamp == stamp, m->t, m->take,
+                    (unsigned long long)boot_ds_c.draws, (unsigned long long)boot_ds_plan_ck_draws, (unsigned long long)boot_ds_plan_ck_bad,
+                    (unsigned long long)boot_render_exec_id);
+    }
+    memcpy(boot_ds_cbt, full, sizeof full);   /* the draw takes the full walk's answer (=0, clean in the user's A/B) */
+}
+static inline void boot_ds_cb_plan(BootRender *r, const BootRenderDraw *in) {
+    if (!boot_ds_on()) { memset(boot_ds_cbt, 0, sizeof boot_ds_cbt); return; }
+    ++boot_ds_c.draws;
+    const int timed = !(++boot_ds_plan_n & 63); LARGE_INTEGER q0, q1; if (timed) { QueryPerformanceCounter(&q0); boot_ds_plan_timing = 1; }
+    boot_ds_pend_sync();   /* GPU-ordered writes recorded since the previous draw */
+    const BootDsDet *D = boot_ds_det;
+    const int over = D && (boot_ds_cfg.cb ? D->cb_bytes > boot_ds_cfg.cb_budget : D->call_bytes > boot_ds_cfg.budget);   /* (boot_ds_take_ok's budgets) */
+    if (!boot_ds_cfg.plan) boot_ds_plan.primed = 0;   /* TOTK_DATA_SNAPSHOT_PLAN=0: every slot, every draw */
+    const uint64_t stamp = boot_ds_core.call ^ (boot_ds_cls_gen << 40), gtok = boot_ds_gt_state(r), pver = boot_ds_pend.ver;
+    const int rows_same = (const void *)in->cbufs == boot_ds_bind_of, ck = boot_ds_cfg.plan == 2;
+    static BootDsPlan pre; uint64_t pre_rows = 0;   /* TOTK_DATA_SNAPSHOT_PLAN=2 only */
+    if (ck) { pre = boot_ds_plan; pre_rows = boot_ds_rows_changed(&boot_ds_plan, in->cbufs[0], in->cbufs[4]); }
+    const BootDsPlanOut o = boot_ds_plan_run(&boot_ds_plan, in->cbufs[0], in->cbufs[4], (const void *)in->cbufs, boot_ds_bind_gen, rows_same,
+                                             stamp, pver, gtok, over, &boot_ds_pend,
+                                             boot_ds_plan_rule, boot_ds_plan_take, r, boot_ds_cbt);
+    if (ck) boot_ds_plan_check(r, in, &pre, rows_same && pre.bgen == boot_ds_bind_gen, pre_rows, stamp, pver, gtok, over);
+    boot_ds_draw_cb = o.taken != 0;
+    boot_ds_c.memo_hits += o.hits; boot_ds_c.memo_rechecks += o.rechecks; boot_ds_c.bind_cb[BOOT_DS_K_CB] += o.taken;
+    boot_ds_c.plan_slots += o.visited; boot_ds_c.plan_skips += !o.visited;
+    if (timed) { QueryPerformanceCounter(&q1); boot_ds_c.q_plan += (uint64_t)(q1.QuadPart - q0.QuadPart); ++boot_ds_c.plan_timed; ++boot_ds_c.timer_intervals; boot_ds_plan_timing = 0; }
+}
+static inline int boot_ds_fill_wanted(uint64_t va, uint64_t n) { return boot_ds_mode_v > 0 && boot_ds_shadow_any(&boot_ds_core, va, n); }
+/* boot_render_cbv_ex's copy of a constant buffer: call-start bytes where there are any (else memcpy of `live`). boot_ds_cb_now: the
+ * rule that took the binding (0: another snapshot over a dynamic chunk). The timer runs on 1 copy in 64 (boot_ds_tick64). */
+static uint64_t boot_ds_fill_n;
+static inline void boot_ds_fill(BootRender *r, uint8_t *dst, uint64_t va, const uint8_t *live, uint64_t n) {
+    (void)r;
+    const int timed = boot_ds_tick64(&boot_ds_fill_n); LARGE_INTEGER q0, q1; if (timed) QueryPerformanceCounter(&q0);
+    const uint64_t sh = boot_ds_fill_core(&boot_ds_core, dst, va, live, n, boot_render_map_gen, boot_render_big_writes, boot_ds_clean_fn, NULL);
+    if (timed) { QueryPerformanceCounter(&q1); boot_ds_c.q_cbcopy += (uint64_t)(q1.QuadPart - q0.QuadPart); ++boot_ds_c.cbcopy_timed; ++boot_ds_c.timer_intervals; }
+    const unsigned t = (unsigned)boot_ds_cb_now;
+    if (t) {
+        ++boot_ds_c.copies[BOOT_DS_K_CB]; boot_ds_c.bytes[BOOT_DS_K_CB] += n; boot_ds_c.shadow_bytes[BOOT_DS_K_CB] += sh;
+        ++boot_ds_c.cb_rule_copies[t % BOOT_DS_T_N]; boot_ds_c.cb_rule_bytes[t % BOOT_DS_T_N] += n;
+        if (t == BOOT_DS_T_EAGER) { const unsigned k = n <= 256 ? 0 : n <= 1024 ? 1 : n <= 4096 ? 2 : n <= 16384 ? 3 : 4; ++boot_ds_c.eager_hist[k]; boot_ds_c.eager_hist_bytes[k] += n; }
+        if (boot_ds_det) { if (boot_ds_uses_cb_budget(BOOT_DS_K_CB, (int)t, boot_ds_cfg.cb)) boot_ds_det->cb_bytes += n; else boot_ds_det->call_bytes += n; }
+    } else if (sh) { ++boot_ds_c.other_shadow; boot_ds_c.other_shadow_bytes += sh; }
+}
+/* vertex copies of the open list by (stream address, size), and the per-stream memo: ds_c (host_gpu_render_draw.h) */
+#define BOOT_DS_VCACHE 512u
+static struct { uint64_t va, list, epoch, off; uint32_t n, pad; } boot_ds_vc[BOOT_DS_VCACHE];
+static struct { uint64_t va, call, gen; uint32_t size, inst; } boot_ds_vmemo[16];
+/* ---- the call */
+static inline void boot_ds_call_begin(void) {
+    if (!boot_ds_on()) return;
+    ++boot_ds_core.call; ++boot_ds_c.calls;
+    BootDsDet *D = boot_ds_det;
+    if (D) { D->nrec = 0; D->picked = 0; D->call_bytes = 0; D->cb_bytes = 0; D->capture_due = 1; }
+}
+/* After the call's first page-table sync (renderer and window locks held, before the texture re-hash and the translation): the
+ * late check of the previous call's records, then the call-start copy of the recently used dynamic chunks, vertex and index
+ * chunks first (constant buffers are copied anyway with the eager rule; this only moves their bytes to the submit). */
+static inline void boot_ds_capture(BootRender *r) {
+    BootDsDet *D = boot_ds_det;
+    if (!D || !D->capture_due) return;
+    D->capture_due = 0;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    boot_ds_pend_sync();
+    if (boot_ds_nverify) boot_ds_verify_run(r);
+    if (D->nlate) {
+        const uint64_t done = r->gpu && r->gpu->fence ? ID3D12Fence_GetCompletedValue(r->gpu->fence) : UINT64_MAX;
+        if (done != UINT64_MAX && done < D->late_fence) boot_ds_recheck(r, D->late, D->nlate, 1);
+        D->nlate = 0;
+    }
+    BootDsCore *d = &boot_ds_core;
+    if (boot_ds_cfg.early && d->shadow && d->n) {
+        boot_ds_shadow_begin(d); ++boot_ds_c.cap_calls;
+        const uint32_t vi = (1u << BOOT_DS_K_VERTEX) | (1u << BOOT_DS_K_INDEX);
+        for (int pass = 0, full = 0; pass < 2 && !full; ++pass)
+            for (uint32_t j = 0, nj = boot_ds_scan_n(d); j < nj; ++j) {   /* the occupied chunks (v2 visited 2 x 16384 slots per call) */
+                BootDsChunk *e = boot_ds_scan_at(d, j);
+                if (!e->key || (d->call - e->last_use > 600 && d->call - e->learned > 600)) continue;
+                if (!pass != !!(e->kinds & vi)) continue;   /* pass 0: vertex / index chunks; pass 1: the others */
+                const uint64_t va = (e->key - 1) << BOOT_DS_CHUNK_SHIFT;
+                if (boot_ds_cls_at(d, va) & BOOT_DS_C_HOST) continue;
+                if (boot_ds_gpu_pending(r, va, BOOT_DS_CHUNK_BYTES, 0)) { ++boot_ds_c.cap_pending; continue; }   /* GPU order decides: no CPU copy */
+                if (boot_ds_shadow_take(d, e, boot_ds_page_fn, r, boot_render_cb_epoch, boot_render_big_writes, boot_render_map_gen)) ++boot_ds_c.cap_chunks;
+                else if (d->shadow_cap - d->shadow_used < BOOT_DS_CHUNK_BYTES) { ++boot_ds_c.cap_full; full = 1; break; }
+            }
+        boot_ds_c.cap_bytes += d->shadow_used;
+    }
+    QueryPerformanceCounter(&q1); boot_ds_c.q_cap += (uint64_t)(q1.QuadPart - q0.QuadPart);
+}
+/* End of the call (window lock held): the detector's check, its next period, and the records kept for the late check. */
+static inline void boot_ds_call_done(BootRender *r) {
+    BootDsDet *D = boot_ds_det;
+    if (!D) return;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    if (boot_ds_nverify) boot_ds_verify_run(r);
+    boot_ds_recheck(r, D->rec, D->nrec, 0);
+    D->period = boot_ds_period_next(D->period, D->nrec, D->cap);
+    const uint64_t done = r->gpu && r->gpu->fence ? ID3D12Fence_GetCompletedValue(r->gpu->fence) : UINT64_MAX;
+    if (D->nrec && r->gpu && done != UINT64_MAX && done < r->gpu->submitted) {   /* its GPU work still runs: check again at the next call */
+        BootDsRec *t = D->late; D->late = D->rec; D->rec = t; D->nlate = D->nrec; D->late_fence = r->gpu->submitted;
+    } else D->nlate = 0;
+    D->nrec = 0;
+    QueryPerformanceCounter(&q1); boot_ds_c.q_det += (uint64_t)(q1.QuadPart - q0.QuadPart);
+}
+/* ---- page-table rebuild: classes of the GPU mappings, the arena */
+#define BOOT_DS_POOLS 8192u
+static BootDsPool boot_ds_pool[BOOT_DS_POOLS]; static uint32_t boot_ds_npool;
+static struct { uint64_t builder, cpu, size; uint32_t flags, set; } boot_ds_builder[64]; static unsigned boot_ds_builder_next;
+static SRWLOCK boot_ds_pool_lock = SRWLOCK_INIT;
+static uint64_t boot_ds_pool_inits, boot_ds_pool_finals, boot_ds_pool_lost, boot_ds_pool_noflags;
+static uint64_t boot_ds_map_chunks[5];   /* at the last rebuild: GPU-mapped chunks CPU-writable, GPU-only, no pool, the executor's, shader code */
+/* NVN memory pool calls the snapshot observes (host_nvn.h boot_nvn_policy: OBSERVE, no renderer lock) */
+static inline int boot_ds_pool_fn(const char *n) {
+    if (boot_ds_mode() <= 0 || !boot_ds_cfg.pools || strncmp(n, "nvnMemoryPool", 13)) return 0;
+    n += 13;
+    return !strcmp(n, "BuilderSetDefaults") || !strcmp(n, "BuilderSetFlags") || !strcmp(n, "BuilderSetStorage") || !strcmp(n, "Initialize") || !strcmp(n, "Finalize");
+}
+/* Before the driver's function: SetDefaults(builder), SetFlags(builder, flags), SetStorage(builder, memory, size),
+ * Initialize(pool, builder), Finalize(pool). */
+static inline void boot_ds_pool_note(const char *n, uint64_t x0, uint64_t x1, uint64_t x2) {
+    if (!boot_ds_pool_fn(n)) return;
+    n += 13;
+    AcquireSRWLockExclusive(&boot_ds_pool_lock);
+    if (!strncmp(n, "Builder", 7)) {
+        unsigned j = 0; while (j < 64 && boot_ds_builder[j].builder != x0) ++j;
+        if (j == 64) { j = boot_ds_builder_next++ & 63; memset(&boot_ds_builder[j], 0, sizeof boot_ds_builder[j]); boot_ds_builder[j].builder = x0; boot_ds_builder[j].flags = 0x22u; }
+        if (!strcmp(n, "BuilderSetDefaults")) { boot_ds_builder[j].flags = 0x22u; boot_ds_builder[j].cpu = boot_ds_builder[j].size = 0; boot_ds_builder[j].set = 0; }   /* NVN default: CPU_UNCACHED | GPU_CACHED */
+        else if (!strcmp(n, "BuilderSetFlags")) { boot_ds_builder[j].flags = (uint32_t)x1; boot_ds_builder[j].set |= 1; }
+        else { boot_ds_builder[j].cpu = x1; boot_ds_builder[j].size = x2; boot_ds_builder[j].set |= 2; }
+    } else if (!strcmp(n, "Initialize")) {
+        unsigned j = 0; while (j < 64 && boot_ds_builder[j].builder != x1) ++j;
+        if (j == 64 || !boot_ds_builder[j].cpu || !boot_ds_builder[j].size) ++boot_ds_pool_lost;
+        else {
+            uint32_t k = 0, free_k = UINT32_MAX;
+            for (; k < boot_ds_npool; ++k) { if (boot_ds_pool[k].live && boot_ds_pool[k].obj == x0) break; if (!boot_ds_pool[k].live && free_k == UINT32_MAX) free_k = k; }
+            if (k == boot_ds_npool) k = free_k != UINT32_MAX ? free_k : boot_ds_npool < BOOT_DS_POOLS ? boot_ds_npool++ : UINT32_MAX;
+            if (k == UINT32_MAX) ++boot_ds_pool_lost;
+            else {
+                boot_ds_pool[k].obj = x0; boot_ds_pool[k].cpu = boot_ds_builder[j].cpu; boot_ds_pool[k].size = boot_ds_builder[j].size;
+                boot_ds_pool[k].flags = boot_ds_builder[j].flags; boot_ds_pool[k].live = 1; ++boot_ds_pool_inits;
+                if (!(boot_ds_builder[j].set & 1)) ++boot_ds_pool_noflags;
+            }
+        }
+    } else {
+        for (uint32_t k = 0; k < boot_ds_npool; ++k) if (boot_ds_pool[k].live && boot_ds_pool[k].obj == x0) { boot_ds_pool[k].live = 0; ++boot_ds_pool_finals; }
+    }
+    ReleaseSRWLockExclusive(&boot_ds_pool_lock);
+}
+/* Live pools sorted by start (malloc'd; NULL with n 0 when there are none). */
+static inline BootDsPool *boot_ds_pools_sorted(uint32_t *n) {
+    AcquireSRWLockShared(&boot_ds_pool_lock);
+    uint32_t live = 0; for (uint32_t k = 0; k < boot_ds_npool; ++k) live += boot_ds_pool[k].live;
+    BootDsPool *s = live ? (BootDsPool *)malloc((size_t)live * sizeof *s) : NULL; uint32_t m = 0;
+    for (uint32_t k = 0; s && k < boot_ds_npool; ++k) if (boot_ds_pool[k].live) s[m++] = boot_ds_pool[k];
+    ReleaseSRWLockShared(&boot_ds_pool_lock);
+    if (s) qsort(s, m, sizeof *s, boot_ds_pool_order);
+    *n = m; return s;
+}
+/* Start of a class rebuild over the page table's VA range; then boot_ds_map_class per GPU mapping, then boot_ds_map_done. */
+static inline int boot_ds_map_begin(const BootRender *r) {
+    memset(boot_ds_map_chunks, 0, sizeof boot_ds_map_chunks); ++boot_ds_c.remaps; ++boot_ds_cls_gen;
+    const uint64_t c0 = (uint64_t)r->va_base_page >> 4, c1 = ((uint64_t)r->va_base_page + r->ptable_pages + 15) >> 4;
+    return c1 > c0 && c1 - c0 < (UINT64_C(1) << 26) && boot_ds_cls_reset(&boot_ds_core, c0, (uint32_t)(c1 - c0));
+}
+static inline void boot_ds_map_class(uint64_t gpu, uint64_t cpu, uint64_t size, const BootDsPool *sorted, uint32_t n) {
+    const unsigned bits = boot_ds_pool_class(boot_ds_pool_find(sorted, n, cpu));
+    boot_ds_cls_mark(&boot_ds_core, gpu, size, bits);
+    const uint64_t chunks = (size + BOOT_DS_CHUNK_BYTES - 1) >> BOOT_DS_CHUNK_SHIFT;
+    boot_ds_map_chunks[(bits & BOOT_DS_C_CPU) ? 0 : (bits & BOOT_DS_C_GPU) ? 1 : 2] += chunks;
+    if (bits & BOOT_DS_C_CODE) boot_ds_map_chunks[4] += chunks;
+}
+/* The executor's block [block_va, + bytes): never taken; its arena part after the driver buffer becomes the copy arena. */
+static inline void boot_ds_map_done(uint8_t *block, uint64_t block_va, uint64_t bytes, uint64_t driver_bytes) {
+    boot_ds_cls_mark(&boot_ds_core, block_va, bytes, BOOT_DS_C_HOST);
+    boot_ds_map_chunks[3] = bytes >> BOOT_DS_CHUNK_SHIFT;
+    boot_ds_cls_relearn(&boot_ds_core);
+    if (block && bytes > driver_bytes + (UINT64_C(1) << 20)) {
+        BootDsArena *a = &boot_ds_arena;
+        if (a->cpu != block + driver_bytes || a->va != block_va + driver_bytes) { memset(a->list, 0, sizeof a->list); memset(a->used, 0, sizeof a->used); }
+        a->cpu = block + driver_bytes; a->va = block_va + driver_bytes;
+        a->part_bytes = (uint32_t)(((bytes - driver_bytes) / BOOT_DS_PARTS) & ~UINT64_C(0xffff));
+        memset(boot_ds_vc, 0, sizeof boot_ds_vc);
+    }
+}
+/* ---- every 300 presents (renderer and window locks held) */
+static inline void boot_ds_present(BootRender *r, uint64_t frames) {
+    if (!boot_ds_on()) return;
+    boot_ds_frame = frames;
+    if (++boot_ds_presents % 300) return;
+    if (boot_ds_cfg.age) { const unsigned dropped = boot_ds_age_core(&boot_ds_core, boot_ds_cfg.age); boot_ds_c.dropped += dropped; if (dropped) ++boot_ds_cls_gen; }
+    const BootDsCount *c = &boot_ds_c, *l = &boot_ds_l;
+#define BOOT_DS_D(x) (unsigned long long)(c->x - l->x)
+#define BOOT_DS_MB(x) (double)(c->x - l->x) / 1048576.0
+    const double ms = 1000.0 / (double)boot_ds_qpc_freq() / 300.0;   /* per frame */
+    /* timed on 1 draw / CB copy in 64; the detector's samples inside a timed plan are the detector's (v2 counted them twice) */
+    const uint64_t qp = c->q_plan - l->q_plan, qpd = c->q_plan_det - l->q_plan_det;
+    const double plan = c->plan_timed > l->plan_timed ? (double)(qp > qpd ? qp - qpd : 0) * 64.0 * ms : 0.0;
+    const uint64_t qv = c->q_vtx - l->q_vtx, qvd = c->q_vtx_det - l->q_vtx_det;
+    const double vtx = (double)(qv > qvd ? qv - qvd : 0) * 64.0 * ms, copies = (double)(c->q_copy - l->q_copy) * ms + (double)(c->q_cbcopy - l->q_cbcopy) * 64.0 * ms;
+    const double det = (double)(c->q_det - l->q_det) * ms, cap = (double)(c->q_cap - l->q_cap) * ms, timer = (double)(c->timer_intervals - l->timer_intervals) * 64.0 * boot_ds_qpc_ticks * ms;
+    uint64_t sb = 0, b = 0; for (unsigned k = 0; k < BOOT_DS_K_N; ++k) { sb += c->shadow_bytes[k] - l->shadow_bytes[k]; b += c->bytes[k] - l->bytes[k]; }
+    uint64_t pend = 0, chg = 0, s1g = 0; for (unsigned k = 1; k < BOOT_DS_P_N; ++k) { pend += c->pend[k] - l->pend[k]; chg += c->ch_src[k] - l->ch_src[k]; s1g += c->s1_src[k] - l->s1_src[k]; }
+    uint32_t pools = 0; AcquireSRWLockShared(&boot_ds_pool_lock); for (uint32_t k = 0; k < boot_ds_npool; ++k) pools += boot_ds_pool[k].live; ReleaseSRWLockShared(&boot_ds_pool_lock);
+    const BootDsPend *P = &boot_ds_pend;
+    boot_gp_log("data-snapshot frame %llu, last 300 presents (TOTK_DATA_SNAPSHOT=%d, CB rule %d%s%s%s): calls %llu, draws %llu, with a copy %llu; COPIED: constant buffers "
+                "%llu bindings (%llu copies, %.2f MiB; eager %llu copies %.2f MiB [<=256 B %llu, <=1 KiB %llu, <=4 KiB %llu, <=16 KiB %llu, <=64 KiB %llu = %.2f MiB], "
+                "learned %llu copies %.2f MiB; the rest shared), vertex streams %llu (%llu copies, %.2f MiB), index buffers %llu (%.2f MiB); %.0f%% of the bytes from "
+                "the call-start copy (+%.2f MiB for other constant-buffer snapshots); takes by rule: learned %llu, all %llu, per-instance %llu, eager %llu; KEPT "
+                "ZERO-COPY: GPU work may write it %llu (copies/reports %llu, storing draws %llu, deferred compute %llu, target write-backs %llu, deferred dispatches' "
+                "storage buffers %llu), GPU-only pool %llu, over the budget %llu (constant buffers %llu), arena full %llu, ring full %llu, stream unbounded %llu / too "
+                "large %llu / not contiguous %llu; CB decisions by class: dynamic %llu, CPU-writable %llu, GPU-only %llu, no pool %llu, unclassified %llu (memo hits %llu, "
+                "rechecks %llu; plan slots visited %llu, draws with nothing to re-decide %llu)",
+                (unsigned long long)frames, boot_ds_cfg.mode, boot_ds_cfg.cb, boot_ds_cfg.early ? ", call-start copy" : "", boot_ds_cfg.instance ? ", per-instance rule" : "",
+                boot_ds_cfg.stored ? "" : ", STORED=0: v1 attribution",
+                BOOT_DS_D(calls), BOOT_DS_D(draws), BOOT_DS_D(draws_snap), BOOT_DS_D(bind_cb[0]), BOOT_DS_D(copies[0]), BOOT_DS_MB(bytes[0]),
+                BOOT_DS_D(cb_rule_copies[BOOT_DS_T_EAGER]), BOOT_DS_MB(cb_rule_bytes[BOOT_DS_T_EAGER]), BOOT_DS_D(eager_hist[0]), BOOT_DS_D(eager_hist[1]),
+                BOOT_DS_D(eager_hist[2]), BOOT_DS_D(eager_hist[3]), BOOT_DS_D(eager_hist[4]), BOOT_DS_MB(eager_hist_bytes[4]),
+                BOOT_DS_D(cb_rule_copies[BOOT_DS_T_LEARNED]), BOOT_DS_MB(cb_rule_bytes[BOOT_DS_T_LEARNED]),
+                BOOT_DS_D(bind_cb[1]), BOOT_DS_D(copies[1]), BOOT_DS_MB(bytes[1]), BOOT_DS_D(bind_cb[2]), BOOT_DS_MB(bytes[2]),
+                b ? 100.0 * (double)sb / (double)b : 0.0, BOOT_DS_MB(other_shadow_bytes), BOOT_DS_D(rule[1]), BOOT_DS_D(rule[2]), BOOT_DS_D(rule[3]), BOOT_DS_D(rule[4]),
+                (unsigned long long)pend, BOOT_DS_D(pend[1]), BOOT_DS_D(pend[2]), BOOT_DS_D(pend[3]), BOOT_DS_D(pend[4]), BOOT_DS_D(pend[5]), BOOT_DS_D(gpu_only),
+                BOOT_DS_D(over_budget), BOOT_DS_D(cb_over_budget), BOOT_DS_D(arena_full), BOOT_DS_D(ring_full), BOOT_DS_D(unbounded), BOOT_DS_D(too_large), BOOT_DS_D(split),
+                BOOT_DS_D(cls_bind[0]), BOOT_DS_D(cls_bind[1]), BOOT_DS_D(cls_bind[2]), BOOT_DS_D(cls_bind[3]), BOOT_DS_D(cls_bind[4]), BOOT_DS_D(memo_hits), BOOT_DS_D(memo_rechecks),
+                BOOT_DS_D(plan_slots), BOOT_DS_D(plan_skips));
+    boot_gp_log("data-snapshot frame %llu: DETECTOR sampled %llu ranges (period %u), changed during the call %llu: learned %llu (new chunks %llu, table full %llu), "
+                "host writes %llu, GPU work recorded before it %llu (copies/reports %llu, storing draws %llu, deferred compute %llu, target write-backs %llu, deferred "
+                "dispatches' storage buffers %llu), gone %llu; late check %llu ranges, changed %llu; suspect-diag S1 changes: learned %llu, GPU work %llu (copies/reports "
+                "%llu, storing draws %llu, deferred compute %llu, target %llu, deferred storage buffers %llu); DYNAMIC CHUNKS %u (dropped %llu); pending GPU writes: "
+                "copies/reports folded in %llu, deferred dispatch ranges %llu, storing draws marked %llu, deferred dispatches marked %llu, chunks with pending writes now "
+                "%u + %u large ranges, overflows %llu (all time: chunk map %llu, large ranges %llu, copies/reports table full %llu, wide compute %llu, other %llu); changes "
+                "inside merged compute ranges judged after the idle: queued %llu, compute stored there %llu, verified CPU %llu (learned), dropped %llu; copies taken over "
+                "verified CPU pages %llu; compute store history %u chunks%s; call-start copy %llu calls, %llu chunks "
+                "(%.2f MiB), not taken: GPU work pending %llu, full %llu, dropped at a mid-call idle %llu; arena part peak %u of %u KiB; ring-full list executions %llu (all "
+                "time); NVN pools live %u (initialized %llu, finalized %llu, unmatched %llu, without SetFlags %llu); GPU-mapped chunks at the last rebuild: CPU-writable %llu "
+                "(shader code %llu), GPU-only %llu, no pool %llu, executor %llu (rebuilds %llu); CPU per frame: decisions %.3f ms (constant-buffer plan: v1 and v2 also "
+                "counted the vertex part and the detector's samples in it), vertex/stream decisions %.3f ms, copies %.3f ms, detector %.3f ms, call-start copy %.3f ms, "
+                "total %.3f ms (the timer itself ~%.3f ms of it)",
+                (unsigned long long)frames, BOOT_DS_D(sampled), boot_ds_det ? boot_ds_det->period : 0,
+                BOOT_DS_D(ch_learn) + BOOT_DS_D(ch_host) + (unsigned long long)chg, BOOT_DS_D(ch_learn), BOOT_DS_D(learned_new), BOOT_DS_D(learn_full), BOOT_DS_D(ch_host),
+                (unsigned long long)chg, BOOT_DS_D(ch_src[1]), BOOT_DS_D(ch_src[2]), BOOT_DS_D(ch_src[3]), BOOT_DS_D(ch_src[4]), BOOT_DS_D(ch_src[5]),
+                BOOT_DS_D(gone), BOOT_DS_D(late_checked), BOOT_DS_D(late_changed), BOOT_DS_D(s1_learn),
+                (unsigned long long)s1g, BOOT_DS_D(s1_src[1]), BOOT_DS_D(s1_src[2]), BOOT_DS_D(s1_src[3]), BOOT_DS_D(s1_src[4]), BOOT_DS_D(s1_src[5]),
+                boot_ds_core.n, BOOT_DS_D(dropped), BOOT_DS_D(gw_synced), BOOT_DS_D(compute_synced), BOOT_DS_D(store_marks), BOOT_DS_D(bound_marks),
+                P->nslot, P->nbig, (unsigned long long)P->overflows, (unsigned long long)P->ovf[BOOT_DS_OVF_MAP], (unsigned long long)P->ovf[BOOT_DS_OVF_BIG],
+                (unsigned long long)P->ovf[BOOT_DS_OVF_GW], (unsigned long long)P->ovf[BOOT_DS_OVF_WIDE], (unsigned long long)P->ovf[BOOT_DS_OVF_WRAP],
+                BOOT_DS_D(verify_queued), BOOT_DS_D(verify_gpu),
+                BOOT_DS_D(verify_cpu), BOOT_DS_D(verify_dropped), BOOT_DS_D(verified_takes), boot_ds_stored.n, boot_ds_stored.full ? " (full: no CPU verdicts)" : "",
+                BOOT_DS_D(cap_calls), BOOT_DS_D(cap_chunks), BOOT_DS_MB(cap_bytes), BOOT_DS_D(cap_pending), BOOT_DS_D(cap_full), BOOT_DS_D(shadow_dropped),
+                boot_ds_arena.peak >> 10, boot_ds_arena.part_bytes >> 10, (unsigned long long)boot_render_ring_full,
+                pools, (unsigned long long)boot_ds_pool_inits, (unsigned long long)boot_ds_pool_finals, (unsigned long long)boot_ds_pool_lost,
+                (unsigned long long)boot_ds_pool_noflags, (unsigned long long)boot_ds_map_chunks[0], (unsigned long long)boot_ds_map_chunks[4],
+                (unsigned long long)boot_ds_map_chunks[1], (unsigned long long)boot_ds_map_chunks[2], (unsigned long long)boot_ds_map_chunks[3], BOOT_DS_D(remaps),
+                plan, vtx, copies, det, cap, plan + vtx + copies + det + cap, timer);
+#undef BOOT_DS_D
+#undef BOOT_DS_MB
+    boot_ds_l = boot_ds_c; boot_ds_arena.peak = 0;
+    (void)r;
 }
 
 #include "host_gpu_render_draw.h"

@@ -72,6 +72,16 @@ def early_z_requested(cid):
             if len(f) >= 2: _EARLY_Z[f[0]] = f[1] == '1' and _EARLY_Z.get(f[0], True)
     return _EARLY_Z.get(cid, False)
 
+# K2 (batch-4): InstanceId (a[0x2f8]) counts from 0 without the base instance, and a per-instance attribute reads element
+# base + instance / divisor, as on the source GPU (GL/Vulkan/NVN rule; nxport crates/sass2spv/src/instructions/
+# attribute.rs:506-510 returns InstanceIndex - BaseInstance: behaviour only, sass2spv follows Ryujinx's design). Was:
+# iid = SV_InstanceID + base for both, so a draw with a base instance read instance data `base` too far, and divisor > 1
+# or frequency-0 streams read (base + i) / divisor. The VS prologue adds host_iid_offset() (maxwell_runtime.hlsli: the
+# instances before this host draw, TOTK_INSTANCE_EXPAND) and vin_attr4 takes the base from HostState
+# (INSTANCE_ID_ZERO_BASED). TOTK_SHADER_INSTANCE_ID=0 translates as before; at run time the host's
+# TOTK_INSTANCE_ID_ZERO_BASED=0 makes these shaders compute the rule of before (host_gpu_render_draw.h boot_render_iid_offset).
+INSTANCE_ID_ZERO_BASED = os.environ.get('TOTK_SHADER_INSTANCE_ID', '1') != '0'
+
 def assemble(em, prog, body, ps_mask=None):
     st = prog.stage; L = []
     if st == 'compute': return assemble_compute(em, prog, body)
@@ -80,6 +90,7 @@ def assemble(em, prog, body, ps_mask=None):
     if gmem_writable:
         L.append('#define GMEM_WRITABLE')
     L.append('#define KILLED ' + ('killed_' if 'kill' in em.uses else 'false'))
+    if st == 'vertex' and INSTANCE_ID_ZERO_BASED: L.append('#define INSTANCE_ID_ZERO_BASED')   # K2: vin_attr4's instance rule
     L.append('#include "maxwell_runtime.hlsli"')
     if 'lmem' in em.uses:
         n = max(prog.local_bytes // 4, 1)
@@ -107,10 +118,10 @@ def assemble(em, prog, body, ps_mask=None):
         L.append('VsOut finish_vs(VsOut o) { if (host_depth_minus1 != 0u) o.pos.z = (o.pos.z + o.pos.w) * 0.5f; if (host_flip_y != 0u) o.pos.y = -o.pos.y; return o; }')
         L.append('#define FINISH return finish_vs(o)')
         L.append('VsOut main(uint vid_ : SV_VertexID, uint iid_ : SV_InstanceID) {')
-        # Outputs the program never stores read (0, 0, 0, 1) on the source GPU (suyu EmitPrologue stores
-        # that default to the position and every declared generic before the program runs).
+        # Outputs the program never stores read (0, 0, 0, 1) on the source GPU (Ryujinx Translator.cs
+        # EmitOutputsInitialization stores that default to the position and every used generic first).
         L.append('    VsOut o = (VsOut)0; o.pos.w = 1.0f;' + ''.join(f' o.g{g}.w = 1.0f;' for g in em.vs_declared))
-        L.append('    uint vid = vid_ + host_vertex_base, iid = iid_ + host_instance_base;')
+        L.append('    uint vid = vid_ + host_vertex_base, iid = iid_ + ' + ('host_iid_offset();' if INSTANCE_ID_ZERO_BASED else 'host_instance_base;'))
         for g in sorted(em.vs_inputs): L.append(f'    uint4 va{g} = vin_attr4({g}u, vid, iid);')
     else:
         targets, depth, sample_mask = prog.ps_outputs()

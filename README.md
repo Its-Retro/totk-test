@@ -60,7 +60,7 @@ Use your own paths. `-RomFS` can also point at a RomFS image file. You can stop 
 7. **Prepares your RomFS**: packs the extracted folder into one image file, the form the game reads, or links your image file in. The result must be identical, byte for byte, to the base game's RomFS, which also proves every file is intact.
 8. **Writes the headers made from your game files** (service list, NVN function names, driver format tables).
 9. **Translates the game's ARM64 code to C** (about 13 million instructions, 3.7 GB of C, about 45 minutes).
-10. **Translates the game's shaders** from the Switch GPU's machine code to HLSL and compiles them to DirectX 12 DXIL (about 22,000 shaders, 30-90 minutes).
+10. **Translates the game's shaders** from the Switch GPU's machine code to HLSL and compiles them to DirectX 12 DXIL (about 22,000 shaders, 30-90 minutes), then builds the geometry shaders that draw point sprites.
 11. **Compiles and links the game** into `totk-play.dll` (13,265 compile units; about 1.5-3 hours).
 12. **Builds the launcher** `totk.exe`.
 13. **Writes the start script** `play.cmd`.
@@ -114,6 +114,7 @@ Each part of the pipeline has been run in the development tree. The builder's ow
 - Downloading zig, DXC, Python and the libraries, and `build.ps1` finding or fetching Python and installing the packages.
 - Packing a real extracted RomFS folder. The packer reproduces the base game's RomFS layout exactly (checked byte for byte against the original image's tables) and round-trips a small test folder, but a full 17 GB pack has not been run.
 - The C translation, DLL compile and shader steps as the builder runs them in a fresh output folder (same commands as development), including the new parallel translation of the scanned shaders and the shader manifest with relative paths.
+- The point-sprite geometry shader step (`make_point_gs.py`) as the builder runs it, on a manifest with relative paths. It is optional: if it fails, the build continues.
 - The GPU macro table is built empty (the real one comes from a run-time capture). The native renderer should never need it, but no build with the empty table has been started yet.
 - `play.cmd` and the background shader helper.
 - A first start with no save folder.

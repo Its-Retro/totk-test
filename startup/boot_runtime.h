@@ -1827,6 +1827,37 @@ shared_invalid:
     }
     boot_fault(c,BOOT_SVC,pc,c->x[0],0);return 0;
 }
+/* svc-S4: the device time-zone rule (time:u GetClockSnapshot calendars and ToCalendarTimeWithMyRule below, nn::time
+ * ToCalendarTime in host_sdk_time.h) is the host's Windows time zone, as nxport (MIT) does with localtime_r
+ * (crates/engine/src/horizon/nn.rs:556-571): returns the UTC offset of posix time t in seconds (the zone's rule for
+ * t's year, DST included) and sets the DST flag and a short tzdata-style name ("UTC", "+01", "-0330"). Posix times
+ * and ToCalendarTimeInUtc stay UTC. TOTK_TIME_ZONE=utc (or 0), or t outside years 1601..9999: UTC (0, "UTC"). */
+static inline int32_t boot_time_zone_local(int64_t t,char name[8],uint8_t*dst){
+    static INIT_ONCE once=INIT_ONCE_STATIC_INIT;static DYNAMIC_TIME_ZONE_INFORMATION zone;static int local;
+    memset(name,0,8);memcpy(name,"UTC",3);*dst=0;
+    BOOL pending=FALSE;
+    if(InitOnceBeginInitialize(&once,0,&pending,NULL) && pending){
+        char v[8];DWORD n=GetEnvironmentVariableA("TOTK_TIME_ZONE",v,sizeof v);
+        local=!(n && n<sizeof v && (!_stricmp(v,"utc") || !strcmp(v,"0"))) && GetDynamicTimeZoneInformation(&zone)!=TIME_ZONE_ID_INVALID;
+        InitOnceComplete(&once,0,NULL);
+    }
+    if(!local || t<-INT64_C(11644473600) || t>INT64_C(253402300799))return 0;
+    ULARGE_INTEGER u;u.QuadPart=(uint64_t)(t+INT64_C(11644473600))*10000000u;
+    FILETIME f,g;f.dwLowDateTime=u.LowPart;f.dwHighDateTime=u.HighPart;SYSTEMTIME utc,civil;
+    if(!FileTimeToSystemTime(&f,&utc) || !SystemTimeToTzSpecificLocalTimeEx(&zone,&utc,&civil) || !SystemTimeToFileTime(&civil,&g))return 0;
+    ULARGE_INTEGER l;l.LowPart=g.dwLowDateTime;l.HighPart=g.dwHighDateTime;
+    int64_t offset=((int64_t)l.QuadPart-(int64_t)u.QuadPart)/10000000;
+    if(offset<-86400 || offset>86400)return 0;
+    DYNAMIC_TIME_ZONE_INFORMATION copy=zone;TIME_ZONE_INFORMATION year;
+    int64_t standard=GetTimeZoneInformationForYear(utc.wYear,&copy,&year)?-(int64_t)(year.Bias+year.StandardBias)*60:-(int64_t)(zone.Bias+zone.StandardBias)*60;
+    *dst=offset!=standard;
+    if(offset || *dst){
+        uint32_t a=(uint32_t)(offset<0?-offset:offset),h=a/3600%100,m=a/60%60;
+        name[0]=offset<0?'-':'+';name[1]=(char)('0'+h/10);name[2]=(char)('0'+h%10);
+        if(m){name[3]=(char)('0'+m/10);name[4]=(char)('0'+m%10);}
+    }
+    return (int32_t)offset;
+}
 static inline int boot_cmif_control(BootContext*c,uint64_t pc,unsigned slot){
     uint8_t*data=boot_access(c,c->tpidrro,44,READ|WRITE,pc);if(!data)return 0;
     uint32_t type=(uint32_t)little_read(data,4),words=(uint32_t)little_read(data+4,4);
@@ -1874,7 +1905,7 @@ static inline int boot_cmif_control(BootContext*c,uint64_t pc,unsigned slot){
         else if(c->session_types[slot]==BOOT_SESSION_FSP)value=0x1000;
         /* nfp:user: a zero size made the SDK abort with hipc PointerBufferTooSmall
          * (0x11a0b) after IUser::AttachAvailabilityChangeEvent. */
-        else if(c->session_types[slot]==122)value=0x8000; /* suyu reports 0x8000 for every session */
+        else if(c->session_types[slot]==122)value=0x8000; /* one size for every session, as Ryujinx ServerBase answers HIPC control 3 (PointerBufferSize 0x8000) */
         /* prepo:u reports pass pointer (X) buffers; zero aborted the same way. */
         else if(c->session_types[slot]==120)value=0x8000;
         /* time:u: nn::time::ClockSnapshot::CreateWithAdjustableSystemClock receives its
@@ -1912,7 +1943,7 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
        c->session_process_ids[slot]==1){
         /* hwopus: IHardwareOpusDecoderManager (domain root, object type FSP+18) and the
          * IHardwareOpusDecoder objects it opens (command lists and result codes per
-         * switchbrew / suyu hwopus). Decoding is real libopus (vendored 1.5.2, built natively by
+         * Switchbrew Audio_services, hwopus section). Decoding is real libopus (vendored 1.5.2, built natively by
          * third_party/build_opus.py and linked as a whole archive; referenced weakly so
          * runtime builds without it still link and stop here instead). Decoder state lives in this host
          * table keyed by domain object. The work-buffer transfer memory is retained (driver
@@ -2166,7 +2197,7 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
     if(domain && c->session_types[slot]==BOOT_SESSION_APPLET && ((type&0xffff)==4 || (type&0xffff)==6) &&
        !(header>>31) && c->session_process_ids[slot]==1){
         /* Library applets (ILibraryAppletCreator / ILibraryAppletAccessor / IStorage /
-         * IStorageAccessor, command lists per suyu am/service). An applet completes as soon
+         * IStorageAccessor, command lists per Switchbrew Applet_Manager_services). An applet completes as soon
          * as it starts; the Controller applet (0x0c) reports one player on npad No1. Storage
          * and accessor state live in this host table, keyed by domain object. */
         enum { LA_ACCESSOR=126, LA_STORAGE=128, LA_STORAGE_ACCESSOR=130, LA_SOURCE_STATE=703, LA_SOURCE_POP=704 };
@@ -2287,8 +2318,9 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
         }
         static const uint8_t source_id[16]={0x54,0x4f,0x54,0x4b,0x2d,0x57,0x69,0x6e,
                                             0x2d,0x54,0x69,0x6d,0x65,0x2d,0x30,0x31};
-        /* UTC civil date (Howard Hinnant's days-to-civil). */
-        int64_t days=unix_seconds/86400,rem=unix_seconds%86400;if(rem<0){rem+=86400;--days;}
+        /* Civil date by the device rule (svc-S4: host time zone, boot_time_zone_local; Howard Hinnant's days-to-civil). */
+        char zone[8];uint8_t dst;int32_t offset=boot_time_zone_local(unix_seconds,zone,&dst);int64_t local=unix_seconds+offset;
+        int64_t days=local/86400,rem=local%86400;if(rem<0){rem+=86400;--days;}
         int64_t z=days+719468,era=(z>=0?z:z-146096)/146097;unsigned doe=(unsigned)(z-era*146097);
         unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365;int64_t year=(int64_t)yoe+era*400;
         unsigned doy=doe-(365*yoe+yoe/4-yoe/100),mp=(5*doy+2)/153,day=doy-(153*mp+2)/5+1,month=mp<10?mp+3:mp-9;
@@ -2306,7 +2338,7 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
             little_write(cal,(uint64_t)year,2);cal[2]=(uint8_t)month;cal[3]=(uint8_t)day;
             cal[4]=(uint8_t)(rem/3600);cal[5]=(uint8_t)((rem/60)%60);cal[6]=(uint8_t)(rem%60);
             uint8_t*info=out+0x60+k*0x18;
-            little_write(info,wday,4);little_write(info+4,yday,4);memcpy(info+8,"UTC",3);
+            little_write(info,wday,4);little_write(info+4,yday,4);memcpy(info+8,zone,8);info[16]=dst;little_write(info+20,(uint32_t)offset,4);
         }
         little_write(out+0x90,steady_seconds,8);memcpy(out+0x98,source_id,16);
         memcpy(out+0xa8,"UTC",3);out[0xcc]=0;out[0xcd]=(uint8_t)kind;
@@ -3150,9 +3182,10 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
     if(c->session_types[slot]==BOOT_SESSION_TIME && parent_type==BOOT_SESSION_TIME+5 && command==101 && type==6 && !special && words==14 &&
        little_read(data+raw,4)==UINT64_C(0x180001) && c->session_process_ids[slot]==1){
         /* ITimeZoneService::ToCalendarTimeWithMyRule(PosixTime) -> CalendarTime, CalendarAdditionalInfo.
-         * The device rule is UTC, so the host time zone never reaches the guest. Civil date from
-         * days since the epoch (proleptic Gregorian, H. Hinnant's days_from_civil inverse). */
+         * The device rule is the host time zone (svc-S4, boot_time_zone_local; UTC with TOTK_TIME_ZONE=utc).
+         * Civil date from days since the epoch (proleptic Gregorian, H. Hinnant's days_from_civil inverse). */
         int64_t t=(int64_t)little_read(data+raw+32,8);
+        char zone[8];uint8_t dst;int32_t offset=boot_time_zone_local(t,zone,&dst);t+=offset;
         int64_t days=t>=0?t/86400:-((-t+86399)/86400),secs=t-days*86400;
         int64_t z=days+719468,era=(z>=0?z:z-146096)/146097,doe=z-era*146097;
         int64_t yoe=(doe-doe/1460+doe/36524-doe/146096)/365,y=yoe+era*400,doy=doe-(365*yoe+yoe/4-yoe/100);
@@ -3167,7 +3200,7 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
         little_write(data+32,UINT32_C(0x4f434653),4);little_write(data+36,1,4);little_write(data+44,token,4);
         little_write(data+48,(uint64_t)(uint16_t)y,2);data[50]=(uint8_t)m;data[51]=(uint8_t)d;
         data[52]=(uint8_t)(secs/3600);data[53]=(uint8_t)(secs/60%60);data[54]=(uint8_t)(secs%60);
-        little_write(data+56,(uint64_t)wday,4);little_write(data+60,(uint64_t)yday,4);memcpy(data+64,"UTC",3);
+        little_write(data+56,(uint64_t)wday,4);little_write(data+60,(uint64_t)yday,4);memcpy(data+64,zone,8);data[72]=dst;little_write(data+76,(uint32_t)offset,4);
         c->x[0]=0;return 1;
     }
     if(parent_type==BOOT_SESSION_FSP+1 || parent_type==FSP_READY+1){
@@ -3378,7 +3411,8 @@ static inline int boot_cmif_domain(BootContext*c,uint64_t pc,unsigned slot){
           command==50 || command==62 || command==63 || command==65 || command==68 || command==69 || command==100)) ||
         (parent_type==BOOT_SESSION_APP_FUNCTIONS+1 &&
          (command==40 || command==67 || command==68 || command==90 || command==102 || command==1001)))){
-        /* appletOE calls that only record a preference (command list per suyu am/service):
+        /* appletOE calls that only record a preference (command lists per Switchbrew Applet_Manager_services,
+         * ISelfController / IApplicationFunctions):
          * acknowledged. Getters: GetIdleTimeDetectionExtension (63) 0, IsAutoSleepDisabled (69)
          * false, NotifyRunning (40) false = not resumed from a suspension. */
         int getter=(parent_type==BOOT_SESSION_SELF_CONTROL+1 && (command==63 || command==69)) ||
@@ -3677,8 +3711,8 @@ static inline int boot_schedule_audio_completion(HANDLE source){
 #endif
 /* Npad backend: once the game has activated npad and set its supported style set, a
      * wired Pro Controller (Fullkey; Handheld if Fullkey is unsupported) is connected and
-     * sampled, following suyu NPad::InitNewlyAddedController / OnUpdate and the
-     * SharedMemoryFormat layout (npad entries at 0x9a00, 0x5000 each; NpadCondition at
+     * sampled, following Ryujinx NpadDevices (SetupNpad / Update) and the
+     * SharedMemoryFormat layout (Switchbrew HID_Shared_Memory; npad entries at 0x9a00, 0x5000 each; NpadCondition at
      * 0x3e200). With every style tag zero the game re-runs ShowControllerSupport forever
      * and never leaves the loading screen. Keyboard (window focused): K/J/I/U = A/B/X/Y,
      * Q/E = L/R, 1/3 = ZL/ZR, Enter/Tab = Plus/Minus, arrows = d-pad, WASD = left stick,
@@ -3751,7 +3785,7 @@ static inline void boot_hid_npad_tick(BootContext*c,uint64_t now){
         little_write(lifo+16,tail,8);little_write(lifo,(uint64_t)now,8);
     }
 #ifdef TOTK_DRAW_PATH
-    {   /* six-axis (fullkey LIFO; handheld LIFO for the handheld entry, as suyu SixAxis::OnUpdate) at the
+    {   /* six-axis (fullkey LIFO; handheld LIFO for the handheld entry, as Ryujinx NpadDevices.GetSixAxisSensorLifo picks them) at the
          * hardware's 200 Hz, so the 17-entry LIFO spans 85 ms of samples */
         static uint64_t sixaxis_last;
         if(!sixaxis_last || now<sixaxis_last || now-sixaxis_last>=5){
@@ -4735,7 +4769,7 @@ static inline int boot_send_sync(BootContext*c,uint64_t pc){
            ((little_read(request+4,4)&UINT32_C(0xfffffc00))==UINT32_C(0x80000000) || !(little_read(request+4,4)&UINT32_C(0xfffffc00))) &&
            (request=boot_access(c,c->tpidrro,80,READ|WRITE,pc))){
             /* hid setters and simple getters with no buffers or handles (command list per
-             * suyu hid_server.cpp). No controller is connected on this host: setters are
+             * Switchbrew HID_services, IHidServer). No controller is connected on this host: setters are
              * accepted; getters report the defaults a disconnected console reports. */
             static const uint16_t setters[]={66,67,69,70,72,79,81,84,89,91,92,104,107,122,123,124,125,126,127,128,130,
                                              132,133,134,135,136,201,204,209,210,300,301,302};
@@ -4743,7 +4777,7 @@ static inline int boot_send_sync(BootContext*c,uint64_t pc){
             uint32_t command=(uint32_t)little_read(request+base+8,4);
             if((command==200 || command==202) && little_read(request+base,4)==UINT32_C(0x49434653) && (!pid || little_read(request+8,4)==1)){
                 /* 200 GetVibrationDeviceInfo(VibrationDeviceHandle): linear resonant actuator, left/right by the
-                 * handle's device index (byte 2). 202 GetActualVibrationValue: the default value suyu reports
+                 * handle's device index (byte 2). 202 GetActualVibrationValue: the neutral value Ryujinx reports (NpadDevices._neutralVibrationValue)
                  * {0, 160 Hz, 0, 320 Hz}; no vibration hardware is driven. */
                 uint32_t version=type==6?1:0,token=(uint32_t)little_read(request+base+12,4);
                 if(c->session_domains[slot] || c->session_process_ids[slot]!=1 || little_read(request+base+4,4)!=version){
@@ -5777,7 +5811,10 @@ static inline int boot_send_sync(BootContext*c,uint64_t pc){
         unsigned kind=UINT32_MAX;
         for(unsigned i=0;i<sizeof(endpoints)/sizeof(endpoints[0]);++i)
             if(!memcmp(request+8,endpoints[i].name,8)){kind=endpoints[i].kind;break;}
-        if(kind==UINT32_MAX){boot_fault(c,BOOT_SVC,pc,c->tpidrro,20);return 0;}
+        if(kind==UINT32_MAX){   /* svc-S6: name the allowed service that has no endpoint here, then stop as before */
+            fprintf(stderr,"sm GetService: allowed service \"%.8s\" has no endpoint on this host (stopping)\n",(const char*)request+8);
+            boot_fault(c,BOOT_SVC,pc,c->tpidrro,20);return 0;
+        }
         uint32_t handle=boot_new_session(c,pc,kind,c->session_process_ids[slot]);if(!handle)return 0;
         little_write(request,0,4);little_write(request+4,UINT64_C(0x80000001),4);
         little_write(request+8,0x20,4);little_write(request+12,handle,4);little_write(request+16,0,4);

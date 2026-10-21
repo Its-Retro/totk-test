@@ -323,8 +323,61 @@ static inline void boot_ct_add(uint64_t qpc,unsigned kind,unsigned thread,unsign
     BootCtRec*r=&boot_ct_ring[boot_ct_head++%BOOT_CT_RING];
     r->qpc=qpc;r->obj=obj;r->thread=(uint16_t)thread;r->other=(uint16_t)other;r->kind=(uint8_t)kind;r->state=(uint8_t)state;r->cpu=cpu;r->eff=boot_ct_eff[cpu];
 }
+/* fence-read trace (TOTK_FENCE_READ_TRACE=1; host_nvn_fence_read.h, play-work/fence-read-trace; observation only): when the
+ * frame-fence waiter (TOTK's main thread, t0) hands the next frame to the NVN presenting thread (t2). host_nvn sets `watch`
+ * (t2, at its first traced present) and `sig_thread` (t0, at its first frame-fence return); t2 drains both rings right after
+ * each of its presents.
+ *  - Parks of the watched thread and its first wake after each (boot_wg_block / boot_wg_wake below, both run with the kernel
+ *    lock held: one writer at a time, plain stores for the open park): the park's state (4 lock, 5 handles, 6 arbiter, 7
+ *    condvar, 8 sleep) and objects (wait_address: the arbiter word or the mutex; key: the condvar key or the first handle; the
+ *    kernel clears both at the wake), then the waker (the guest thread whose kernel exit made it runnable, boot_mt_kick_check,
+ *    as the wait graph has it; 0xfffe timer), the wait result and the time parked.
+ *  - The waiter's signalling SVCs (0x35 SignalToAddress, 0x1d SignalProcessWideKey, 0x1b ArbitrateUnlock, 0x11 SignalEvent) at
+ *    boot_mt_svc's entry, before the lock-free shortcuts (a signal for a word nobody is parked on yet never enters the kernel), at most
+ *    `armed` per frame (host_nvn re-arms it on that same thread at each frame-fence return: one writer).
+ * Off (default): watch and sig_thread stay BOOT_FRT_NONE, never a guest thread index: one compare per hook, nothing stored. */
+#define BOOT_FRT_NONE 0xffffffffu
+#define BOOT_FRT_KRING 1024u
+#define BOOT_FRT_SRING 256u
+#define BOOT_FRT_SIG_ARM 64u
+typedef struct BootFrtK { uint64_t qpc,obj,key,parked; uint32_t thread,other,result; uint16_t state,kind; } BootFrtK;   /* other: waker ('W'), svc ('S') */
+static struct { volatile uint32_t watch,sig_thread; } boot_frt_k __attribute__((aligned(64))) = {BOOT_FRT_NONE,BOOT_FRT_NONE};   /* read by every hook */
+static struct { uint32_t open,state;uint64_t qpc,obj,key; volatile uint32_t head,tail;uint32_t lost;BootFrtK ring[BOOT_FRT_KRING]; } boot_frt_kr __attribute__((aligned(64)));
+static struct { uint32_t armed; volatile uint32_t head,tail;uint32_t lost;BootFrtK ring[BOOT_FRT_SRING]; } boot_frt_sr __attribute__((aligned(64)));
+static inline void boot_frt_k_put(unsigned kind,unsigned i,unsigned other,uint64_t qpc,uint64_t parked,uint32_t result){   /* kernel lock held */
+    const uint32_t h=boot_frt_kr.head;
+    if(h-__atomic_load_n(&boot_frt_kr.tail,__ATOMIC_ACQUIRE)>=BOOT_FRT_KRING){++boot_frt_kr.lost;return;}
+    BootFrtK*e=&boot_frt_kr.ring[h%BOOT_FRT_KRING];
+    e->qpc=qpc;e->obj=boot_frt_kr.obj;e->key=boot_frt_kr.key;e->parked=parked;e->thread=i;e->other=other;e->result=result;
+    e->state=(uint16_t)boot_frt_kr.state;e->kind=(uint16_t)kind;
+    __atomic_store_n(&boot_frt_kr.head,h+1,__ATOMIC_RELEASE);
+}
+static inline void boot_frt_k_park(const BootContext*M,unsigned i){   /* the watched thread just parked (kernel lock held) */
+    if(i>=M->thread_count)return;
+    const BootThread*t=&M->threads[i];
+    if(t->state<4 || t->state>8)return;
+    boot_frt_kr.open=1;boot_frt_kr.state=t->state;boot_frt_kr.qpc=boot_klock_now();
+    boot_frt_kr.obj=t->state==5 || t->state==8?0:t->wait_address;boot_frt_kr.key=t->state==5 || t->state==7?t->wait_native[0]:0;
+    boot_frt_k_put('B',i,0,boot_frt_kr.qpc,0,0);
+}
+static inline void boot_frt_k_wake(unsigned i,unsigned waker){   /* runnable again (kernel lock held; called at every kernel exit while it is: the first counts) */
+    if(!boot_frt_kr.open)return;
+    boot_frt_kr.open=0;
+    const BootContext*M=boot_mt.master;const uint64_t now=boot_klock_now();
+    boot_frt_k_put('W',i,waker,now,now-boot_frt_kr.qpc,M && i<M->thread_count?(uint32_t)M->threads[i].x[0]:0);
+}
+static inline void boot_frt_k_svc(const BootContext*c,unsigned thread,unsigned svc){   /* the waiter's own thread, at its SVC entry */
+    if(!boot_frt_sr.armed || (svc!=0x35 && svc!=0x1d && svc!=0x1b && svc!=0x11))return;
+    --boot_frt_sr.armed;
+    const uint32_t h=boot_frt_sr.head;
+    if(h-__atomic_load_n(&boot_frt_sr.tail,__ATOMIC_ACQUIRE)>=BOOT_FRT_SRING){++boot_frt_sr.lost;return;}
+    BootFrtK*e=&boot_frt_sr.ring[h%BOOT_FRT_SRING];
+    e->qpc=boot_klock_now();e->obj=c->x[0];e->key=c->x[1];e->parked=c->x[2];e->thread=thread;e->other=svc;e->result=(uint32_t)c->x[3];e->state=0;e->kind='S';
+    __atomic_store_n(&boot_frt_sr.head,h+1,__ATOMIC_RELEASE);
+}
 /* thread i just parked (its worker went idle with the thread in a wait state) */
 static inline void boot_wg_block(const BootContext*M,unsigned i){
+    if(i==boot_frt_k.watch)boot_frt_k_park(M,i);   /* fence-read trace (off: never a thread) */
     if(!boot_wg_on() || i>=M->thread_count)return;
     const BootThread*t=&M->threads[i];
     if(t->state==3){boot_wg.run_at[i]=0;boot_wg.block_at[i]=0;return;}   /* exited: no longer running */
@@ -337,6 +390,7 @@ static inline void boot_wg_block(const BootContext*M,unsigned i){
 }
 /* thread i became runnable; waker = guest thread index, BOOT_WG_TIMER or BOOT_WG_EVENT */
 static inline void boot_wg_wake(unsigned i,unsigned waker){
+    if(i==boot_frt_k.watch)boot_frt_k_wake(i,waker);   /* fence-read trace (off: never a thread) */
     if(!boot_wg_on() || i>=BOOT_THREAD_CAPACITY || !boot_wg.block_at[i] || boot_wg.wake_at[i])return;
     boot_wg.wake_at[i]=boot_wg_now();boot_wg.waker[i]=waker;
     if(boot_ct_state>0)boot_ct_add(boot_wg.wake_at[i],'W',i,waker,boot_wg.state[i],boot_wg.obj[i],boot_ct_cpu());   /* chain P0 */
@@ -710,6 +764,7 @@ static inline int boot_mt_arb_fast(BootCore*k,BootContext*c,unsigned svc,uint64_
 }
 static inline __attribute__((noinline)) int boot_mt_svc(BootContext*c,uint64_t pc,uint64_t next,unsigned svc,uint64_t*target){
     BootCore*k=(BootCore*)c;
+    if(k->thread==boot_frt_k.sig_thread)boot_frt_k_svc(c,k->thread,svc);   /* fence-read trace: the frame waiter's signals (off: never a thread) */
     if(svc==0xb && boot_mt.host_threads && (int64_t)c->x[0]<=0 && (int64_t)c->x[0]>=-2){   /* play (60): yield without the kernel */
         static int kernel=-1;if(kernel<0){const char*v=getenv("TOTK_YIELD_KERNEL");kernel=v && !strcmp(v,"1");}
         if(!kernel){if(boot_wg_on()){_InterlockedIncrement64(&boot_mt_fast_yields);if(k->thread<BOOT_THREAD_CAPACITY)_InterlockedIncrement64(&boot_mt_thread_yields[k->thread]);}   /* chain P0 */

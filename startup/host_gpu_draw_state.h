@@ -99,7 +99,7 @@ static inline void boot_draw_state_decode(const uint32_t *regs, uint32_t begin, 
         uint32_t sh = R3D(0x2000 + j * 64);
         s->stage_enabled[j] = sh & 1; s->stage_type[j] = (sh >> 4) & 15; s->stage_offset[j] = R3D(0x2004 + j * 64);
     }
-    s->stage_enabled[1] = 1;   /* VERTEX_B ignores its enable bit: hardware always runs it (yuzu IsShaderConfigEnabled) */
+    s->stage_enabled[1] = 1;   /* VERTEX_B ignores its enable bit: hardware always runs it (Ryujinx StateUpdater.UpdateShaderState: index != 1) */
     /* texture/sampler pools */
     s->tsc_address = ((uint64_t)(R3D(0x155c) & 0xff) << 32) | R3D(0x1560); s->tsc_max = R3D(0x1564) & 0x3fffff;
     s->tic_address = ((uint64_t)(R3D(0x1574) & 0xff) << 32) | R3D(0x1578); s->tic_max = R3D(0x157c) & 0x3fffff;

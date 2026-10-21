@@ -26,7 +26,17 @@ cbuffer HostState : register(b18) {
     uint  host_instance_base;
     uint  host_flip_y;         // 1 when the source viewport has negative y scale (D3D12 needs positive height)
     uint  host_provoking_first;   // render-36: 1 = flat inputs from the first vertex (D3D), 0 = the last (Maxwell/NVN default)
+    uint  host_instance_offset;   // K2 (batch-4): instances before this host draw (TOTK_INSTANCE_EXPAND: one host draw per
+                                  // instance), else 0; host_instance_base is the draw's base instance plus it. 0xffffffff:
+                                  // the host's TOTK_INSTANCE_ID_ZERO_BASED=0 (host_iid_offset)
 };
+#ifdef INSTANCE_ID_ZERO_BASED
+// K2 (batch-4): what a vertex shader translated with K2 adds to SV_InstanceID (translate_game_shaders.py
+// INSTANCE_ID_ZERO_BASED): the instances before this host draw, so InstanceId counts from 0 without the base instance, as on
+// the source GPU. 0xffffffff (host TOTK_INSTANCE_ID_ZERO_BASED=0): the base instance, as before; vin_attr4 then reads
+// element iid / divisor, exactly the rule of shaders translated without K2.
+uint host_iid_offset() { return host_instance_offset == 0xffffffffu ? host_instance_base : host_instance_offset; }
+#endif
 
 #define CBUF(n) cbuffer CB##n : register(b##n) { uint4 cb##n[4096]; }
 CBUF(0) CBUF(1) CBUF(2) CBUF(3) CBUF(4) CBUF(5) CBUF(6) CBUF(7) CBUF(8)
@@ -285,13 +295,41 @@ struct VertexAttrib {
     uint  offset;      // byte offset in the vertex
     uint  format;      // bits 0-5 size code, 6-8 type (Maxwell encoding), 9 bgra, 31 enabled
     uint  divisor;     // 0 = per vertex, otherwise per-instance step rate
-    uint2 pad;
+    uint  size;        // vbounds: bytes bound from stream_va (NVN BindVertexBuffer size); 0 = unknown, no bound
+    uint  pad;
 };
 StructuredBuffer<VertexAttrib> vertex_attribs : register(t2, space0);
 
-float unorm_(uint v, uint bits_) { return (float)v / (bits_ >= 32u ? 4294967295.0f : (float)((1u << bits_) - 1u)); }   // HLSL masks shift counts: 1u << 32 is 1
+// v / (2^k - 1) correctly rounded, 1 <= k <= 16, v <= 2^k - 1. The source GPU converts UNORM/SNORM vertex formats in
+// fixed function, exactly (nxport: Metal *Normalized vertex formats, translated.rs:2134-2160); a runtime fp32 divide is
+// only required to 2.5 ULP in D3D, and game vertex shaders recover integers with trunc(attr * (2^n - 1)) as table
+// indices (foliage/wind, VS 744dd70b, 5df7f30c), where 1 ULP low picks the neighbouring entry. The quotient is the
+// k-bit pattern of v repeated (binary 0.vvvv...); its expansion never ends in all zeros, so the round bit decides
+// (no ties). Bit-exact against IEEE division for every v, unorm 2-16 bits and snorm 8/10/16
+// (play-work/explode-work2/shader-translation-b.md section B).
+float unorm_div_exact(uint v, uint k) {
+    if (v == 0u) return 0.0f;
+    if (v >= (1u << k) - 1u) return 1.0f;
+    uint64_t X = (uint64_t)v << (64u - k);
+    [unroll] for (uint s = 1u; s <= 32u; s <<= 1u) { uint sh = s * k; if (sh < 64u) X |= X >> sh; }
+    uint L = firstbithigh(v);
+    uint64_t W = X << (k - 1u - L);                                     // window starting at the leading 1
+    uint M = (uint)(W >> 40) + ((uint)(W >> 39) & 1u);                  // 24-bit significand plus the round bit
+    uint e = 127u - (k - L);
+    if ((M >> 24) != 0u) { M >>= 1; e += 1u; }
+    return asfloat((e << 23) | (M & 0x7fffffu));
+}
+float unorm_(uint v, uint bits_) {
+    if (bits_ <= 16u) return unorm_div_exact(v, bits_);
+    return (float)v / (bits_ >= 32u ? 4294967295.0f : (float)((1u << bits_) - 1u));   // HLSL masks shift counts: 1u << 32 is 1
+}
 float snorm_(uint v, uint bits_) {
     int s = (int)(v << (32u - bits_)) >> (32u - bits_);
+    if (bits_ <= 16u) {   // |s| / (2^(bits_-1) - 1), exact; the most negative code clamps to -1
+        uint a_ = (uint)abs(s);
+        float r = a_ >= (1u << (bits_ - 1u)) - 1u ? 1.0f : unorm_div_exact(a_, bits_ - 1u);
+        return s < 0 ? -r : r;
+    }
     return max((float)s / (float)((1u << (bits_ - 1u)) - 1u), -1.0f);
 }
 uint conv_(uint raw, uint bits_, uint type) {
@@ -325,14 +363,25 @@ uint4 vin_layout(uint size) {
 // layouts such as stride 20 with an R8G8B8A8 attribute at offset 10 put elements at 2 (mod 4).
 // gmem_load reads the aligned word containing an address, so the element's bytes are assembled
 // from the aligned words that cover it (funnel shift by the byte misalignment).
+// Element bytes at or past the stream's bound size read 0, per vertex and per instance stream (vbounds, below).
 uint4 vin_attr4(uint g, uint vid, uint iid) {
     VertexAttrib a = vertex_attribs[g];
     uint fmt = a.format, size = fmt & 63u, type = (fmt >> 6) & 7u;
     bool integer = type == 3u || type == 4u;
     uint4 v = uint4(0u, 0u, 0u, integer ? 1u : 0x3f800000u);
     if ((fmt >> 31) == 0u) return v;
+#ifdef INSTANCE_ID_ZERO_BASED
+    // K2 (batch-4): per-instance element = base instance + instance / divisor (GL, Vulkan, NVN), iid counting from 0
+    // (translate_game_shaders.py INSTANCE_ID_ZERO_BASED; nxport attribute.rs:506-510). host_instance_base - host_iid_offset()
+    // is the draw's base instance (0 when iid already holds it: host_iid_offset). Frequency 0 (divisor 0xffffffff,
+    // host_gpu_render_draw.h boot_render_attrib_divisor) reads element `base` for every instance, as Vulkan's divisor 0.
+    // The vbounds check below bounds the final element.
+    uint index = a.divisor == 0u ? vid : (host_instance_base - host_iid_offset()) + iid / a.divisor;
+#else
     uint index = a.divisor == 0u ? vid : (iid / a.divisor);
-    uint2 base = gmem_addr(a.stream_va.x, a.stream_va.y, (int)(index * a.stride + a.offset));
+#endif
+    uint rel = index * a.stride + a.offset;                             // element offset from the stream start
+    uint2 base = gmem_addr(a.stream_va.x, a.stream_va.y, (int)rel);
     uint4 lay = vin_layout(size);
     uint total = size == 0x31u ? 32u : lay.x + lay.y + lay.z + lay.w;   // element bits
     uint sh = (base.x & 3u) * 8u;                                       // misalignment in bits
@@ -341,6 +390,21 @@ uint4 vin_attr4(uint g, uint vid, uint iid) {
     [unroll] for (uint k = 0u; k < 5u; ++k) aw[k] = k < need ? gmem_load(base, 4u * k) : 0u;
     uint words[4];
     [unroll] for (uint j = 0u; j < 4u; ++j) words[j] = sh == 0u ? aw[j] : (aw[j] >> sh) | (aw[j + 1u] << (32u - sh));
+    // vbounds: the source GPU bounds vertex fetches by the stream limit (NVN BindVertexBuffer size) and reads 0 past it.
+    // TOTK draws with base vertices past the bound buffers while meshes stream in (nxport translated.rs:5683-5686:
+    // base vertex 2533 into 408-vertex streams); such a draw collapses there, here it read whatever memory follows
+    // (spikes on the sky islands). As nxport's zero-padded stream copy (translated.rs:5824-5850: bytes up to the size
+    // copied, the rest 0) the bound is per byte: a partly covered element keeps its covered bytes. Everything after is
+    // the normal decode: zero bytes give 0 / 0.0 components, and components the format lacks keep (0, 0, 0, 1 / 1.0).
+    // One compare per fetch; size 0 (unknown: TOTK_VERTEX_BOUNDS=0 or an older host) makes size - 1 the largest uint.
+    uint last = rel + max(total >> 3, 1u) - 1u;                         // the element's last byte (max: 32-bit wrap)
+    if (max(rel, last) > a.size - 1u) {
+        uint avail = rel < a.size ? a.size - rel : 0u;                  // element bytes inside the bound size
+        [unroll] for (uint q = 0u; q < 4u; ++q) {
+            uint keep = avail > 4u * q ? avail - 4u * q : 0u;
+            words[q] &= keep >= 4u ? 0xffffffffu : (1u << (8u * keep)) - 1u;
+        }
+    }
     if (size == 0x31u) {   // 11_11_10 float
         uint w = words[0];
         [unroll] for (uint c = 0u; c < 3u; ++c) {
@@ -513,7 +577,7 @@ float4 tex_grad_1da(uint h, float c, uint a, float dx, float dy) { return tex1da
 float4 tex_grad_2d(uint h, float2 c, float2 dx, float2 dy) { return tex2d_[TIC(h)].SampleGrad(samp_[TSC(h)], c, dx, dy); }
 float4 tex_grad_2da(uint h, float2 c, uint a, float2 dx, float2 dy) { return tex2da_[TIC(h)].SampleGrad(samp_[TSC(h)], float3(c, arr_(a)), dx, dy); }
 // Texel fetches (TLD/TLDS). A 1D fetch reads a TEXHEAD_1D_BUFFER view when the handle's TIC is one
-// (suyu resolves the 1D/buffer choice from the header the same way): the buffer array holds a view
+// (header version 0, the TEXHEAD_1D layout of clb097tex.h): the buffer array holds a view
 // only for buffer headers, so its element count is 0 otherwise. Offsets are added to the texel
 // coordinate (Load's own offset operand needs an immediate).
 float4 tex_fetch_1d(uint h, int c, int l) {
@@ -540,7 +604,7 @@ float4 tex_gathercmpr_2d(uint h, float2 c, float d) { return tex2d_[TIC(h)].Gath
 float4 tex_gathercmpr_2da(uint h, float2 c, uint a, float d) { return tex2da_[TIC(h)].GatherCmpRed(sampc_[TSC(h)], float3(c, arr_(a)), d); }
 float4 tex_gathercmpr_cube(uint h, float3 c, float d) { return texcube_[TIC(h)].GatherCmpRed(sampc_[TSC(h)], c, d); }
 float4 tex_gathercmpr_cubea(uint h, float3 c, uint a, float d) { return texcubea_[TIC(h)].GatherCmpRed(sampc_[TSC(h)], float4(c, arr_(a)), d); }
-// TXQ dimension: (width, height, depth or layers, levels) as suyu's ImageQueryDimensions returns them
+// TXQ dimension: (width, height, depth or layers, levels), levels in w as Mesa NAK reads them (nak_nir_lower_tex.c)
 // per type -- 1D (w, 0, 0, levels); 1D array (w, layers, 0, levels); 2D and cube (w, h, 0, levels);
 // 2D array, cube array (cubes) and 3D (w, h, d, levels); buffer (elements, 0, 0, 0). The texture
 // type is not known when the shader is translated: the view lives only in the array of its

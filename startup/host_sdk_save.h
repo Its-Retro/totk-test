@@ -21,7 +21,9 @@
  *   MountCacheStorage(index)      <root>\cache\0100F2C0115B6000\<index> (CreateCacheStorage makes it)
  *   MountSaveDataReadOnly(app)    <root>\<APPID>, read-only; TargetNotFound when absent (as the IPC path)
  *   DeleteCacheStorage            moves the volume to <root>\deleted\<tick>-cache-<index> (recoverable)
- * Writes go straight to the host files (Commit flushes); there is no journal.
+ * MountSaveData is journaled (S2, TOTK_SAVE_JOURNAL, on by default; see "journal" below): its writes go to a working
+ * copy and Commit swaps a flushed copy of it in atomically, so a crash keeps the last committed save. The other mounts,
+ * and every mount with TOTK_SAVE_JOURNAL=0, write straight to the host files (Commit flushes).
  *
  * Native handles (top byte 0xF5, kind in bits 52..55, generation 40..47, slot 32..39): 3 save file,
  * 4 save directory, 5 cache-storage list. The open host handles live in host slots, so a handle does
@@ -50,7 +52,7 @@
 #define SDK_FS_ENTRY_SIZE         0x310         /* nn::fs::DirectoryEntry (also host_sdk_fs.h) */
 
 /* ---------------------------------------------------------------- mounts */
-typedef struct SdkSaveMount { char name[16]; wchar_t root[MAX_PATH]; int read_only; } SdkSaveMount;
+typedef struct SdkSaveMount { char name[16]; wchar_t root[MAX_PATH]; int read_only, journal; } SdkSaveMount;   /* journal: root is the S2 working copy */
 typedef struct SdkSaveState {
     SRWLOCK lock; SdkSaveMount mount[SDK_SAVE_MOUNTS];
     struct { volatile LONG used; uint32_t generation, mode, cursor, count; HANDLE file; int mount; wchar_t *dir; int32_t index[64]; } slot[SDK_SAVE_SLOTS];
@@ -172,8 +174,211 @@ static inline int sdk_save_stale(BootContext *c, uint64_t self, const char *what
 }
 static inline int sdk_save_done(BootContext *c, uint32_t result) { c->x[0] = result; return BOOT_HOST_DONE; }
 
+/* ---------------------------------------------------------------- journal (S2: crash-safe commits)
+ * Horizon save data is transactional: writes become durable only at nn::fs::Commit, and a crash or power loss leaves the
+ * last committed state. Writing the host files in place (as before, and as nxport's fs.rs) lets a crash, a forced kill
+ * or a BOOT stop during an autosave leave a half-written progress.sav / caption.sav in common\slot_NN. With
+ * TOTK_SAVE_JOURNAL on (the default; TOTK_SAVE_JOURNAL=0 is the old in-place behaviour exactly) the save mount
+ * (MountSaveData, ...\common) is kept the way Horizon keeps directory-backed save data, as a committed and a working copy:
+ *   common           the committed save: never written in place, only replaced as a whole by a commit (backups, the
+ *                    TOTK_SAVE_JOURNAL=0 path, IsSaveDataExisting and the fsp IPC handlers see it as before)
+ *   common.work      the working copy, made from common at the session's first mount; every native operation of the
+ *                    mount goes here (reads too, as on Horizon: they see the uncommitted writes)
+ *   common.sync.tmp  a commit being built: each file of the working copy copied and flushed (FlushFileBuffers), or a hard
+ *                    link to the committed file when its bytes are the same (committed files are never written in place,
+ *                    so the link is safe, and a commit does not rewrite the album and the other slots every time)
+ *   common.sync      the built commit, renamed from .tmp with MOVEFILE_WRITE_THROUGH: the commit point (complete, on disk)
+ *   common.old       the replaced committed copy while common.sync becomes common (both renames write-through), then removed
+ * Commit flushes the mount's open write handles (as before), builds and renames the sync copy and swaps it in. It fails
+ * (an fs result) only when the sync copy cannot be built, and the committed save is then untouched; when the swap cannot
+ * finish (a file of common held open by another process, retried for ~200 ms) the commit is still on disk in common.sync
+ * and the next mount finishes it. The session's first mount resolves a crash's leftovers before it makes the working copy:
+ * common.sync.tmp is removed (a commit that did not reach its commit point: the last committed version stays), a
+ * common.sync is swapped in (rolled forward), a lone common.old becomes common again, a stale common.old and the old
+ * common.work (writes never committed) are removed; every step is logged to native-save.log. If the working copy cannot be
+ * made the mount uses common directly (the old behaviour, logged); if no committed save can be restored the mount fails
+ * with TargetNotFound rather than showing the game an empty save. Unmount keeps the working copy (Horizon drops uncommitted
+ * writes; the next first mount recopies). Only MountSaveData is journaled: temporary and cache storage stay in place. */
+#define SDK_SAVE_JPATH (SDK_SAVE_WPATH + 16)
+typedef struct SdkSaveJournal { int refs; wchar_t committed[SDK_SAVE_JPATH], work[SDK_SAVE_JPATH]; } SdkSaveJournal;
+static inline SdkSaveJournal *sdk_save_journal(void) { static SdkSaveJournal j; return &j; }   /* under sdk_save()->lock */
+static inline int sdk_save_journal_on(void) {
+    static int v = -1;
+    if (v < 0) { char e[8]; DWORD n = GetEnvironmentVariableA("TOTK_SAVE_JOURNAL", e, sizeof e); v = !(n && n < sizeof e && e[0] == '0'); }
+    return v;
+}
+static inline int sdk_save_remove_tree(const wchar_t *dir);   /* path operations, below */
+static inline int sdk_save_exists_path(const wchar_t *path) { return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
+static inline void sdk_save_journal_name(wchar_t *out, const wchar_t *committed, const wchar_t *suffix) { swprintf(out, SDK_SAVE_JPATH, L"%ls%ls", committed, suffix); }
+/* Write-through rename, retried for ~200 ms while a scanner or indexer holds a file of the tree. 0 or the Win32 error. */
+static inline DWORD sdk_save_journal_move(const wchar_t *from, const wchar_t *to) {
+    for (int attempt = 0;; ++attempt) {
+        if (MoveFileExW(from, to, MOVEFILE_WRITE_THROUGH)) return 0;
+        DWORD e = GetLastError();
+        if (attempt >= 20 || (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION)) return e;
+        Sleep(10);
+    }
+}
+/* One file copy (`to` must not exist); flush: FlushFileBuffers before closing. 0 or the Win32 error. */
+static inline DWORD sdk_save_journal_copy_file(const wchar_t *from, const wchar_t *to, int flush, uint8_t *buf, DWORD cap) {
+    HANDLE in = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (in == INVALID_HANDLE_VALUE) return GetLastError();
+    HANDLE out = CreateFileW(to, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out == INVALID_HANDLE_VALUE) { DWORD e = GetLastError(); CloseHandle(in); return e; }
+    DWORD e = 0, got = 0, put = 0;
+    for (;;) {
+        if (!ReadFile(in, buf, cap, &got, NULL)) { e = GetLastError(); break; }
+        if (!got) break;
+        if (!WriteFile(out, buf, got, &put, NULL) || put != got) { e = GetLastError(); if (!e) e = ERROR_WRITE_FAULT; break; }
+    }
+    if (!e && flush && !FlushFileBuffers(out)) e = GetLastError();
+    CloseHandle(in);
+    if (!CloseHandle(out) && !e) e = GetLastError();
+    return e;
+}
+/* 1 when both files exist with the same bytes. */
+static inline int sdk_save_journal_same(const wchar_t *a, const wchar_t *b, uint8_t *buf, DWORD cap) {
+    HANDLE x = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (x == INVALID_HANDLE_VALUE) return 0;
+    HANDLE y = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (y == INVALID_HANDLE_VALUE) { CloseHandle(x); return 0; }
+    LARGE_INTEGER sa, sb; DWORD half = cap / 2;
+    int same = GetFileSizeEx(x, &sa) && GetFileSizeEx(y, &sb) && sa.QuadPart == sb.QuadPart;
+    while (same) {
+        DWORD ga = 0, gb = 0;
+        if (!ReadFile(x, buf, half, &ga, NULL) || !ReadFile(y, buf + half, half, &gb, NULL) || ga != gb) { same = 0; break; }
+        if (!ga) break;
+        if (memcmp(buf, buf + half, ga)) same = 0;
+    }
+    CloseHandle(x); CloseHandle(y);
+    return same;
+}
+/* Copies the tree `from` to `to` (created here, must not exist). link: the committed tree, whose files with the same bytes
+ * are hard-linked instead of copied (NULL: copy all); flush: flush every copied file. n[0] files copied, n[1] linked.
+ * 0 or the Win32 error. */
+static inline DWORD sdk_save_journal_copy_tree(const wchar_t *from, const wchar_t *to, const wchar_t *link, int flush, uint8_t *buf, DWORD cap, unsigned n[2]) {
+    if (!CreateDirectoryW(to, NULL)) return GetLastError();
+    enum { P = SDK_SAVE_JPATH + MAX_PATH };
+    wchar_t *a = (wchar_t *)malloc(4 * P * sizeof(wchar_t)); WIN32_FIND_DATAW fd;
+    if (!a) return ERROR_NOT_ENOUGH_MEMORY;
+    wchar_t *b = a + P, *l = b + P, *pattern = l + P;
+    swprintf(pattern, P, L"%ls\\*", from);
+    HANDLE f = FindFirstFileW(pattern, &fd);
+    if (f == INVALID_HANDLE_VALUE) { DWORD e = GetLastError(); free(a); return e == ERROR_FILE_NOT_FOUND ? 0 : e; }
+    DWORD e = 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        swprintf(a, P, L"%ls\\%ls", from, fd.cFileName); swprintf(b, P, L"%ls\\%ls", to, fd.cFileName);
+        if (link) swprintf(l, P, L"%ls\\%ls", link, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) e = sdk_save_journal_copy_tree(a, b, link ? l : NULL, flush, buf, cap, n);
+        else if (link && sdk_save_journal_same(a, l, buf, cap) && CreateHardLinkW(b, l, NULL)) ++n[1];
+        else if (!(e = sdk_save_journal_copy_file(a, b, flush, buf, cap))) ++n[0];
+    } while (!e && FindNextFileW(f, &fd));
+    if (!e && GetLastError() != ERROR_NO_MORE_FILES) e = GetLastError();
+    FindClose(f); free(a);
+    return e;
+}
+/* common.sync -> common, past the commit point: the replaced copy goes to common.old and is removed after. 1 = done;
+ * 0 = not finished (common is the previous commit again where it could be put back; common.sync stays for the next mount). */
+static inline int sdk_save_journal_swap(const wchar_t *committed) {
+    wchar_t sync[SDK_SAVE_JPATH], old[SDK_SAVE_JPATH]; DWORD e;
+    sdk_save_journal_name(sync, committed, L".sync"); sdk_save_journal_name(old, committed, L".old");
+    if (sdk_save_is_dir(committed)) {
+        if (sdk_save_exists_path(old) && !sdk_save_remove_tree(old)) { sdk_save_log("journal: cannot remove the stale %ls; the commit stays in %ls", old, sync); return 0; }
+        if ((e = sdk_save_journal_move(committed, old))) { sdk_save_log("journal: cannot move %ls aside (error %lu); the commit stays in %ls", committed, (unsigned long)e, sync); return 0; }
+    }
+    if ((e = sdk_save_journal_move(sync, committed))) {
+        DWORD back = sdk_save_is_dir(old) && !sdk_save_is_dir(committed) ? sdk_save_journal_move(old, committed) : 0;
+        sdk_save_log("journal: cannot rename %ls to %ls (error %lu); the previous commit %s, the new one stays in %ls", sync, committed, (unsigned long)e,
+                     back ? "could not be put back" : "is in place", sync);
+        return 0;
+    }
+    if (sdk_save_exists_path(old) && !sdk_save_remove_tree(old)) sdk_save_log("journal: could not remove %ls (removed at the next mount)", old);
+    return 1;
+}
+/* A crash's leftovers next to `committed` (the session's first mount). Returns the newest committed copy to make the
+ * working copy from: `committed`, or `sync` (filled in) when a commit that passed its commit point could not be swapped in;
+ * NULL when no committed save can be restored. */
+static inline const wchar_t *sdk_save_journal_recover(const wchar_t *committed, wchar_t *sync) {
+    wchar_t tmp[SDK_SAVE_JPATH], old[SDK_SAVE_JPATH];
+    sdk_save_journal_name(tmp, committed, L".sync.tmp"); sdk_save_journal_name(sync, committed, L".sync"); sdk_save_journal_name(old, committed, L".old");
+    if (sdk_save_exists_path(tmp)) {
+        int ok = sdk_save_remove_tree(tmp);
+        sdk_save_log("journal: removed %ls%s: a commit that did not reach its commit point; the last committed save stays", tmp, ok ? "" : " (partly, error)");
+    }
+    if (sdk_save_is_dir(sync)) {
+        sdk_save_log("journal: %ls is a complete commit that was not swapped in: rolling it forward", sync);
+        if (!sdk_save_journal_swap(committed)) return sdk_save_is_dir(sync) ? sync : NULL;
+    }
+    if (!sdk_save_is_dir(committed) && sdk_save_is_dir(old)) {
+        DWORD e = sdk_save_journal_move(old, committed);
+        sdk_save_log("journal: %ls missing, %ls %s (error %lu)", committed, old, e ? "could not be put back" : "put back", (unsigned long)e);
+        if (e) return NULL;
+    }
+    if (sdk_save_exists_path(old) && !sdk_save_remove_tree(old)) sdk_save_log("journal: could not remove the stale %ls", old);
+    if (!sdk_save_is_dir(committed) && !sdk_save_mkdirs(committed)) return NULL;   /* first use: an empty save, as before */
+    return committed;
+}
+/* MountSaveData with the journal (exclusive lock held): the path the mount uses. The working copy (made at the session's
+ * first mount, after the leftovers of a crash are resolved), `committed` itself when the working copy is impossible (the
+ * old behaviour), NULL when no committed save can be restored (the mount fails). */
+static inline const wchar_t *sdk_save_journal_acquire(const wchar_t *committed) {
+    SdkSaveJournal *j = sdk_save_journal();
+    if (j->refs) {   /* mounted again under another name: the same working copy */
+        if (!_wcsicmp(j->committed, committed)) { ++j->refs; return j->work; }
+        return committed;
+    }
+    if (wcslen(committed) + 6 >= MAX_PATH) { sdk_save_log("journal: %ls too long for a working copy path; mounted without the journal", committed); return committed; }
+    LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
+    wchar_t sync[SDK_SAVE_JPATH]; const wchar_t *from = sdk_save_journal_recover(committed, sync);
+    if (!from) { sdk_save_log("journal: no committed save at %ls could be restored; mount refused (see the lines above)", committed); return NULL; }
+    wcscpy(j->committed, committed); sdk_save_journal_name(j->work, committed, L".work");
+    if (sdk_save_exists_path(j->work)) {
+        int ok = sdk_save_remove_tree(j->work);
+        sdk_save_log("journal: %s %ls: writes after the last commit, never committed", ok ? "discarded" : "could not discard", j->work);
+        if (!ok) return from == committed ? committed : NULL;
+    }
+    enum { CAP = 1 << 20 }; uint8_t *buf = (uint8_t *)malloc(CAP); unsigned n[2] = {0, 0};
+    DWORD e = buf ? sdk_save_journal_copy_tree(from, j->work, NULL, 0, buf, CAP, n) : ERROR_NOT_ENOUGH_MEMORY;
+    free(buf);
+    if (e) {
+        sdk_save_log("journal: cannot make the working copy %ls from %ls (error %lu); %s", j->work, from, (unsigned long)e,
+                     from == committed ? "mounted without the journal" : "mount refused");
+        sdk_save_remove_tree(j->work);
+        return from == committed ? committed : NULL;
+    }
+    j->refs = 1; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+    sdk_save_log("journal: on (TOTK_SAVE_JOURNAL=0 turns it off): working copy %ls made from %ls, %u files, %.1f ms", j->work, from, n[0],
+                 (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return j->work;
+}
+static inline void sdk_save_journal_release(void) { SdkSaveJournal *j = sdk_save_journal(); if (j->refs) --j->refs; }
+/* nn::fs::Commit of the journaled mount (exclusive lock held): 0 or an fs result. */
+static inline uint32_t sdk_save_journal_commit(void) {
+    SdkSaveJournal *j = sdk_save_journal(); wchar_t tmp[SDK_SAVE_JPATH], sync[SDK_SAVE_JPATH];
+    sdk_save_journal_name(tmp, j->committed, L".sync.tmp"); sdk_save_journal_name(sync, j->committed, L".sync");
+    LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
+    if (sdk_save_is_dir(sync) && !sdk_save_journal_swap(j->committed) && !sdk_save_remove_tree(sync)) {   /* an older commit not swapped in: this one supersedes it */
+        sdk_save_log("journal: commit failed: cannot replace %ls; the committed save is unchanged", sync); return SDK_SAVE_R_TARGET_LOCKED; }
+    if (sdk_save_exists_path(tmp) && !sdk_save_remove_tree(tmp)) { sdk_save_log("journal: commit failed: cannot remove %ls; the committed save is unchanged", tmp); return SDK_SAVE_R_TARGET_LOCKED; }
+    enum { CAP = 1 << 20 }; uint8_t *buf = (uint8_t *)malloc(CAP); unsigned n[2] = {0, 0};
+    DWORD e = buf ? sdk_save_journal_copy_tree(j->work, tmp, j->committed, 1, buf, CAP, n) : ERROR_NOT_ENOUGH_MEMORY;
+    free(buf);
+    if (!e) e = sdk_save_journal_move(tmp, sync);   /* the commit point */
+    if (e) {
+        sdk_save_remove_tree(tmp);
+        sdk_save_log("journal: commit failed (error %lu); the committed save is unchanged", (unsigned long)e);
+        return sdk_save_win32_result(e);
+    }
+    int swapped = sdk_save_journal_swap(j->committed);
+    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+    sdk_save_log("journal: commit: %u files copied and flushed, %u unchanged (linked), %s, %.1f ms", n[0], n[1],
+                 swapped ? "swapped in" : "on disk in common.sync, swapped in at the next mount", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return 0;
+}
+
 /* ---------------------------------------------------------------- mounting */
-static inline int sdk_save_add_mount(BootContext *c, uint64_t name_address, const wchar_t *root, int read_only) {
+static inline int sdk_save_add_mount(BootContext *c, uint64_t name_address, const wchar_t *root, int read_only, int journal) {
     char name[17];
     if (!name_address || !svc_fs_peek_string(c, name_address, name, sizeof name) || !name[0] || name[0] == '@' || strchr(name, ':') || strchr(name, '/'))
         return BOOT_HOST_DECLINE;                                 /* the SDK's own name checks and results */
@@ -184,7 +389,11 @@ static inline int sdk_save_add_mount(BootContext *c, uint64_t name_address, cons
         int free_slot = -1;
         for (int i = 0; i < SDK_SAVE_MOUNTS && free_slot < 0; ++i) if (!s->mount[i].name[0]) free_slot = i;
         if (free_slot < 0) result = UINT32_C(0x101802);
-        else { wcscpy(s->mount[free_slot].root, root); s->mount[free_slot].read_only = read_only; memcpy(s->mount[free_slot].name, name, 16); }
+        else {
+            const wchar_t *use = journal ? sdk_save_journal_acquire(root) : root;   /* S2: the working copy (NULL: no committed save) */
+            if (!use) result = SDK_SAVE_R_TARGET_MISSING;
+            else { wcscpy(s->mount[free_slot].root, use); s->mount[free_slot].read_only = read_only; s->mount[free_slot].journal = use != root; memcpy(s->mount[free_slot].name, name, 16); }
+        }
     }
     ReleaseSRWLockExclusive(&s->lock);
     if (result) sdk_save_log("mount %s -> %#x", name, result);
@@ -201,8 +410,8 @@ static inline int sdk_save_mount(BootContext *c, uint64_t self, uint64_t *target
     switch (kind) {
     case 0: case 1:
         swprintf(root, SDK_SAVE_WPATH, L"%ls\\%016llX\\%ls", sdk_save_root(), (unsigned long long)SDK_SAVE_APP, kind ? L"temporary" : L"common");
-        if (!sdk_save_mkdirs(root)) { sdk_save_log("cannot create %ls", root); return sdk_save_done(c, SDK_SAVE_R_TARGET_MISSING); }
-        break;
+        if (!(kind == 0 && sdk_save_journal_on()) && !sdk_save_mkdirs(root)) { sdk_save_log("cannot create %ls", root); return sdk_save_done(c, SDK_SAVE_R_TARGET_MISSING); }
+        break;   /* S2: the journal creates (and after a crash restores) common itself, at the mount below */
     case 2:
         if ((int32_t)c->x[1] < 0) return BOOT_HOST_DECLINE;
         swprintf(root, SDK_SAVE_WPATH, L"%ls\\cache\\%016llX\\%d", sdk_save_root(), (unsigned long long)SDK_SAVE_APP, (int)(int32_t)c->x[1]);
@@ -213,7 +422,7 @@ static inline int sdk_save_mount(BootContext *c, uint64_t self, uint64_t *target
         if (!sdk_save_is_dir(root)) return sdk_save_done(c, SDK_SAVE_R_TARGET_MISSING);
         break;
     }
-    return sdk_save_add_mount(c, c->x[0], root, kind == 3);
+    return sdk_save_add_mount(c, c->x[0], root, kind == 3, kind == 0 && sdk_save_journal_on());
 }
 /* void Unmount(const char *name x0): native mounts only (open handles stay usable; the SDK would abort). */
 static inline int sdk_save_unmount(BootContext *c, uint64_t self, uint64_t *target, void *user) {
@@ -224,22 +433,29 @@ static inline int sdk_save_unmount(BootContext *c, uint64_t self, uint64_t *targ
     int m = sdk_save_find(name);
     if (m >= 0) {
         hit = 1; memset(s->mount[m].name, 0, sizeof s->mount[m].name);
+        if (s->mount[m].journal) { s->mount[m].journal = 0; sdk_save_journal_release(); }   /* S2: uncommitted writes are dropped at the next first mount */
         for (int i = 0; i < SDK_SAVE_SLOTS; ++i)
             if (s->slot[i].used && s->slot[i].mount == m && s->slot[i].file) sdk_save_log("Unmount %s with a file still open (SDK aborts here)", name);
     }
     ReleaseSRWLockExclusive(&s->lock);
     return hit ? BOOT_HOST_DONE : BOOT_HOST_DECLINE;
 }
-/* Result Commit(const char *name x0): flush every open file of the mount. */
+/* Result Commit(const char *name x0): flush every open file of the mount; on the journaled mount (S2) the working copy
+ * then becomes the committed save. */
 static inline int sdk_save_commit(BootContext *c, uint64_t self, uint64_t *target, void *user) {
     (void)self; (void)target; (void)user;
-    char name[17]; SdkSaveState *s = sdk_save();
+    char name[17]; SdkSaveState *s = sdk_save(); uint32_t result = 0;
     if (!c->x[0] || !svc_fs_peek_string(c, c->x[0], name, sizeof name)) return BOOT_HOST_DECLINE;
     AcquireSRWLockShared(&s->lock);
-    int m = sdk_save_find(name);
+    int m = sdk_save_find(name), journal = m >= 0 && s->mount[m].journal;
     if (m >= 0) for (int i = 0; i < SDK_SAVE_SLOTS; ++i) if (s->slot[i].used && s->slot[i].mount == m && s->slot[i].file && (s->slot[i].mode & 2)) FlushFileBuffers(s->slot[i].file);
     ReleaseSRWLockShared(&s->lock);
-    return m >= 0 ? sdk_save_done(c, 0) : BOOT_HOST_DECLINE;
+    if (journal) {
+        AcquireSRWLockExclusive(&s->lock);
+        if (sdk_save_journal()->refs) result = sdk_save_journal_commit();
+        ReleaseSRWLockExclusive(&s->lock);
+    }
+    return m >= 0 ? sdk_save_done(c, result) : BOOT_HOST_DECLINE;
 }
 
 /* ---------------------------------------------------------------- path operations */

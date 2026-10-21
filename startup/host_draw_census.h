@@ -118,6 +118,8 @@ static inline __attribute__((noinline)) void boot_census_init(BootCensus *c) {
     c->max_gap = boot_census_env_u32("TOTK_DRAW_CENSUS_MAX_GAP", 30, 1, 600);
     k = GetEnvironmentVariableA("TOTK_FLICKER_LOG", v, sizeof v);
     c->delay = (k && k < sizeof v && v[0] == '1') ? 10 : 0;    /* the flicker detector reports up to 8 presents late */
+    k = GetEnvironmentVariableA("TOTK_GLITCH_SCAN", v, sizeof v);   /* water-work: the glitch scanner reports ~2 presents + the readback lag late */
+    if (k && k < sizeof v && v[0] && v[0] != '0') c->delay = 14;
     c->frame = 1; c->lines_left = BOOT_CENSUS_LINES; c->summary_lines = BOOT_CENSUS_SUMMARY_LINES;
     LARGE_INTEGER q; QueryPerformanceFrequency(&q); c->freq = q.QuadPart > 0 ? q.QuadPart : 1;
     QueryPerformanceCounter(&q); c->t0 = c->sum_t = q.QuadPart; c->sum_interval = c->freq;
@@ -298,7 +300,7 @@ static inline FILE *boot_census_open(BootCensus *c) {
     setvbuf(c->log, NULL, _IOFBF, 1 << 16);
     fprintf(c->log, "# draw-census v1: min run %u frames, max gap %u frames, event delay %u frames; keys: draw = hash(vs,ps,vbuf0,ibuf,first,count,base,rt0)\n"
                     "# V = vanish group (frame it returned, first missing frame, gap in frames, keys; GAME = never issued, OURS = issued and dropped every gap frame)\n"
-                    "# S = once-per-second summary, F = flicker detector DROP verdict\n", c->min_run, c->max_gap, c->delay);
+                    "# S = once-per-second summary, F = flicker detector DROP verdict or glitch scanner event (flicker-drop= counts both)\n", c->min_run, c->max_gap, c->delay);
     return c->log;
 }
 static inline void boot_census_prog(char *o, size_t n, uint32_t t, int va, int present) {
@@ -404,6 +406,18 @@ static inline __attribute__((noinline)) void boot_census_flicker_drop_slow(uint6
     if (f) fprintf(f, "F flicker DROP at flicker present %llu (census frame %u; census is at frame %u)\n", (unsigned long long)flicker_present, cf, c->frame);
 }
 #define BOOT_CENSUS_FLICKER_DROP(p) boot_census_flicker_drop_slow(p)
+/* water-work: the glitch scanner (TOTK_GLITCH_SCAN, host_gpu_draw_exec.h) found a one-present local flash in census frame
+ * `cf` (the scanner records the census frame of every copied present, so no numbering offset applies). Same mark as a
+ * flicker DROP: vanish groups starting within 2 frames of it print flicker-drop=yes. */
+static inline __attribute__((noinline)) void boot_census_glitch_slow(uint32_t cf, const char *what) {
+    BootCensus *c = &boot_census;
+    if (c->mode == 0) boot_census_init(c);
+    if (c->mode != 1 || !cf) return;
+    c->marks[c->nmarks % BOOT_CENSUS_MARKS] = cf; ++c->nmarks;
+    FILE *f = c->summary_lines ? boot_census_open(c) : NULL;
+    if (f) fprintf(f, "F glitch scanner %s at census frame %u (census is at frame %u)\n", what ? what : "event", cf, c->frame);
+}
+#define BOOT_CENSUS_GLITCH(cf, what) boot_census_glitch_slow((cf), (what))
 #define BOOT_CENSUS_PROGRAMS(vs, ps) boot_census_programs_slow((vs), (ps))
 #define BOOT_CENSUS_COMPUTE(va, id, ssbo, n, rc, err) boot_census_compute_slow((va), (id), (ssbo), (n), (rc), (err))
 #define BOOT_CENSUS_NOSTATE(ibuf, first, count, mode) boot_census_nostate_slow((ibuf), (first), (count), (mode))

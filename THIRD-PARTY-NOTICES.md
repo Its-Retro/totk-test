@@ -4,14 +4,16 @@ This repository is MIT-licensed (see `LICENSE`). It is the Windows / x86-64 side
 
 **No Nintendo material is included.** The game's code, data, shaders and tables are read from the user's own dump at build time, and everything made from them stays in the user's `output` folder, which git ignores.
 
-**Reference-only projects (no code copied).** Suyu (GPL-3.0), yuzu (GPL-2.0-or-later) and Ryujinx were used as references for how the hardware and the system software behave. Our source cites them in comments where it matches a behaviour they document. No code from Suyu or yuzu is included. The one file whose logic comes from Ryujinx (by way of nxport's Rust port of it) is listed under Ryujinx below. Hardware and format references used the same way: the NVIDIA Tegra X1 TRM, NVIDIA open-gpu-doc class headers (MIT), deko3d (zlib), libnx (ISC), switchbrew and envytools documentation.
+**Suyu and yuzu are not used.** No code from Suyu (GPL-3.0) or yuzu (GPL-2.0-or-later) is included. Earlier comments cited them as behaviour references; every such citation has been replaced by a public or MIT-licensed source, so the source no longer names them.
+
+**Reference-only sources (no code copied).** Ryujinx (MIT) is cited in comments as a behaviour reference (listed under Ryujinx below, together with the one file whose logic comes from it by way of nxport). Hardware and format references used the same way: the NVIDIA Tegra X1 TRM, NVIDIA open-gpu-doc class headers (MIT), deko3d (zlib), libnx (ISC), Mesa (MIT; nouveau/NAK texture-instruction operands and result orders in `startup/maxwell_hlsl.py` and `startup/maxwell_runtime.hlsli`, the macro format in `startup/translate_gpu_macros.py`), switchbrew and envytools documentation.
 
 ---
 
 ## Code adapted into this repository
 
 ### nxport
-https://github.com/nxporting/nxport. Ideas and logic adapted in `startup/translate_game_shaders.py` (early depth/stencil flag, position invariance), `startup/maxwell_hlsl.py` (loop guard), `startup/shader-tools/extract_early_z.py`, `startup/host_nvn_exec.h`, `startup/host_nvn_play.h`, `startup/host_nvn_overlap.h` and `startup/host_audren_voices.h` (audio renderer voice progress: the wave-buffer and play-state logic of nxport's `crates/engine/src/horizon/audio/renderer.rs`).
+https://github.com/nxporting/nxport. Ideas and logic adapted in `startup/translate_game_shaders.py` (early depth/stencil flag, position invariance), `startup/maxwell_hlsl.py` (loop guard), `startup/shader-tools/extract_early_z.py`, `startup/host_nvn_exec.h`, `startup/host_nvn_play.h`, `startup/host_nvn_overlap.h` (early fence and write guard) and `startup/host_audren_voices.h` (audio renderer voice progress: the wave-buffer and play-state logic of nxport's `crates/engine/src/horizon/audio/renderer.rs`). Behaviour followed (each place names the nxport file and lines; no code copied): the SAMPLES_PASSED counter semantics of the GPU-counted occlusion queries (`startup/host_nvn_occl.h`), which reports carry the GPU's time in the opt-in GPU-written TIMESTAMP reports (`startup/host_nvn_gpu_ts.h`; the D3D12 query, conversion shader and units are ours), the present-interval wait in nvnWindowAcquireTexture (`startup/host_nvn.h`, `startup/host_nvn_play.h`), the 60 Hz guest vsync source (`startup/host_vsync.h`), the per-call HID clock (`startup/host_sdk_hid.h`), the host time-zone device rule (`startup/boot_runtime.h`, `startup/host_sdk_time.h`), the optional linear rumble drive (`startup/host_input_sdl.c`), the TMML result order, the IADD3.RS note and the shader forms left unsupported (`startup/maxwell_hlsl.py`), InstanceId without the base instance and the per-instance fetch rule (`startup/translate_game_shaders.py`, `startup/maxwell_runtime.hlsli`), and the point size / point coordinate rules of point sprites (`startup/host_gpu_render_draw.h`, `startup/make_point_gs.py`, `startup/host_nvn_play.h`).
 
 ```
 MIT License
@@ -38,7 +40,7 @@ SOFTWARE.
 ```
 
 ### Ryujinx
-https://github.com/Ryujinx/Ryujinx. `startup/host_audren_voices.h` follows Ryujinx's audio renderer server (`Ryujinx.Audio/Renderer/Server`: `VoiceInfo`, `VoiceUpdateState`, `Dsp/DataSourceHelper`) through nxport's port of it (see nxport above): how voices take wave buffers, play, loop, flush and stop, and how far a voice advances in one renderer frame. Only that sample accounting is used; no decoding, resampling or mixing.
+https://github.com/Ryujinx/Ryujinx. `startup/host_audren_voices.h` follows Ryujinx's audio renderer server (`Ryujinx.Audio/Renderer/Server`: `VoiceInfo`, `VoiceUpdateState`, `Dsp/DataSourceHelper`) through nxport's port of it (see nxport above): how voices take wave buffers, play, loop, flush and stop, and how far a voice advances in one renderer frame. Only that sample accounting is used; no decoding, resampling or mixing. Elsewhere Ryujinx is cited as a behaviour reference only, no code copied: the HIPC pointer-buffer size (`HOS/Services/ServerBase.cs`), npad set-up, six-axis LIFOs and the neutral vibration value (`Hid/HidDevices/NpadDevices.cs`) in `startup/boot_runtime.h`, motion units (`Ryujinx.Input/HLE/NpadController.cs`) in `startup/host_input_sdl.h`, 3D-engine state (`Engine/Threed/StateUpdater.cs`, `DrawManager.cs`) in `startup/host_gpu_draw_state.h`, `startup/host_gpu_render_draw.h` and `startup/host_nvn_play.h`, colour-target pitch and layer size (`RtColorState`) in `startup/host_gpu_render.h` and `startup/host_gpu_render_draw.h`, block-linear sizes (`Ryujinx.Graphics.Texture/SizeCalculator.cs`) in `startup/host_texture_desc.h`, default shader outputs (`Shader/Translation/Translator.cs`) in `startup/translate_game_shaders.py`, and the macro interpreter (`MacroInterpreter.cs`) in `startup/translate_gpu_macros.py`. nxport's shader translator (sass2spv), which `startup/maxwell_hlsl.py` and `startup/maxwell_isa.py` cite for instruction behaviour, is itself a port of Ryujinx's.
 
 ```
 MIT License
@@ -92,12 +94,66 @@ SOFTWARE.
 ```
 
 ### SuperMarioWonderRecomp
-https://github.com/BelmanteGu/SuperMarioWonderRecomp. Used in `startup/host_gpu_render.h` (linear-content check, GPU-authoritative render targets) and `startup/host_nvn_play.h` (present pacing).
+https://github.com/BelmanteGu/SuperMarioWonderRecomp. Used in `startup/host_gpu_render.h` (linear-content check, GPU-authoritative render targets) and `startup/host_nvn_play.h` (present pacing); `startup/host_nvn.h` follows the same immutable-recording model as its shared command lists (behaviour only).
 
 ```
 MIT License
 
 Copyright (c) 2026 BelmanteGu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### DirectXTex
+https://github.com/microsoft/DirectXTex at tag may2026, commit 4feb3e11a020f35b796fc769a74216a555d4f5ef. The GPU BC7 encoder (opt-in, `TOTK_BC7=1`): `startup/bc7-shaders/bc7_encode.hlsl` is `DirectXTex/Shaders/BC7Encode.hlsl` (upstream sha256 8eaff54f8afd5442fa7dcb8973599ffc1f7f60255aed1970763de38657d3852b) with the I/O changes listed at its top (raw RGBA8 input buffer with edge clamping, batch-local mode buffers, guarded root-UAV writes, pitched output, masked partition tables, an optional error gate on the 2- and 3-subset passes); the encoding math is upstream's. Its DXIL is embedded in `startup/host_bc7_dxil.h` (`startup/bc7-shaders/build.sh`). The pass sequence in `startup/host_bc7_encode.h` follows `DirectXTex/BCDirectCompute.cpp` (`GPUCompressBC::Compress`).
+
+```
+MIT License
+
+Copyright (c) Microsoft Corporation.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
+```
+
+### tegra_swizzle
+https://github.com/ScanMountGoat/tegra_swizzle. The block-linear addressing in `startup/host_texture_layout.h` (3D detiling) and `startup/host_gpu_draw_exec.h` (`boot_bl_offset3`) is written in the form of its `src/swizzle.rs` (`gob_address_x` / `gob_address_y` / `gob_address_z` and `gob_offset`, which follow the Tegra X1 TRM v1.3, pp. 1217-1218).
+
+```
+MIT License
+
+Copyright (c) 2021 SMG
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

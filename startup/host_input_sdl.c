@@ -160,10 +160,20 @@ static void publish(void){
     ReleaseSRWLockExclusive(&totk_lock);
 }
 
+/* Motor drive for one band amplitude (0..1). SDL_RumbleGamepad drives a low- and a high-frequency motor, on most
+ * pads eccentric-mass motors that do not start at low drive, so small amplitudes are lifted: the drive is the mean
+ * of the amplitude and a^0.35, a concave curve that keeps 0 -> 0 and 1 -> 1 (a = 0.1 drives 27 %, 0.5 drives 64 %).
+ * TOTK_RUMBLE_LINEAR=1 drives the amplitude as given instead, as nxport does (MIT, crates/engine/src/host/rumble.rs
+ * lines 52-53, intensity = clamped amplitude). Read once; the input thread is the only caller. */
+static int rumble_linear(void){
+    static int v=-1;
+    if(v<0){char e[8];DWORD n=GetEnvironmentVariableA("TOTK_RUMBLE_LINEAR",e,sizeof e);v=n>0 && n<sizeof e && e[0]=='1';}
+    return v;
+}
 static uint16_t rumble_strength(float a){
     if(!(a>0))return 0;if(a>1)a=1;
-    float v=(a+powf(a,0.35f))*0.5f;           /* yuzu/suyu SDL curve for non-HD rumble motors */
-    long r=lroundf(v*65535.0f);return (uint16_t)(r>65535?65535:r);
+    float drive=rumble_linear()?a:0.5f*a+0.5f*powf(a,0.35f);
+    long r=lroundf(drive*65535.0f);return (uint16_t)(r>65535?65535:r);
 }
 
 static void apply_rumble(void){

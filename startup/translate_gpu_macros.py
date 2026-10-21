@@ -3,8 +3,8 @@
 Covers the full Maxwell macro ISA: ALU (add/addc/sub/subb/xor/or/and/andnot/
 nand with carry), add-immediate, extract-insert, both extract-shift-left forms,
 read and branch, with every result assignment. Field layout and semantics
-follow the documented macro format (yuzu macro_interpreter / Ryujinx
-MacroInterpreter). Register-amount shifts >= 32 stop instead of guessing.
+follow the documented macro format (envytools macro disassembler, Mesa
+mme_fermi_sim.c, Ryujinx MacroInterpreter). Register-amount shifts >= 32 stop instead of guessing.
 """
 import hashlib,json,struct
 from pathlib import Path

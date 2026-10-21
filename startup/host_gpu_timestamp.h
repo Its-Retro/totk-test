@@ -159,6 +159,9 @@ static inline void boot_draw_path_write(const char *text, size_t n) {
     DWORD done = 0; WriteFile(h, out, (DWORD)m, &done, NULL);
     if (out != small) free(out);
 }
+/* suspect-diag (host_gpu_render.h, TOTK_SUSPECT_DIAG): the frame-N.bmp number of the frame being built, appended to every line
+ * below as " [frame N]" (the glitch.log / flash locator numbering); -1 (the switch off) appends nothing. */
+static volatile LONG64 boot_sd_tag_frame = -1;
 /* One line: the formatted text and "\n" (as vfprintf + fputc('\n') to an fopen("a") stream did). */
 static inline void boot_draw_path_vlog(const char *fmt, va_list ap) {
     char buf[1024]; va_list aq; va_copy(aq, ap);
@@ -171,6 +174,17 @@ static inline void boot_draw_path_vlog(const char *fmt, va_list ap) {
         vsnprintf(line, (size_t)k + 1, fmt, aq);
     }
     va_end(aq);
+    {   const LONG64 sd_frame = boot_sd_tag_frame;   /* suspect-diag: " [frame N]" */
+        char *sd_line = sd_frame >= 0 ? (char *)malloc((size_t)k + 40) : NULL;
+        if (sd_line) {
+            memcpy(sd_line, line, (size_t)k);
+            int t = snprintf(sd_line + k, 40, " [frame %lld]\n", (long long)sd_frame);
+            if (t <= 0 || t >= 40) { sd_line[k] = '\n'; t = 1; }
+            boot_draw_path_write(sd_line, (size_t)k + (size_t)t);
+            free(sd_line); if (line != buf) free(line);
+            return;
+        }
+    }
     line[k] = '\n';
     boot_draw_path_write(line, (size_t)k + 1);
     if (line != buf) free(line);

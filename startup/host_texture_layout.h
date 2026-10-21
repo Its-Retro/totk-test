@@ -53,8 +53,8 @@ static inline int boot_texture_sizes_3d(uint32_t width_bytes,uint32_t rows,uint3
     if(packed>limit || (packed*=gy)>limit || (packed*=gz)>limit)return 0;
     *linear=(size_t)plain;*tiled=(size_t)packed;return 1;
 }
-/* Detiles a 3D block-linear level (suyu texture_cache decoders SwizzleImpl / Tegra TRM block-linear
- * addressing): byte (x, y, z) lives at
+/* Detiles a 3D block-linear level (Tegra X1 TRM v1.3 block-linear addressing, pp. 1217-1218, as tegra_swizzle
+ * (MIT) src/swizzle.rs writes it: gob_address_x/y/z + gob_offset): byte (x, y, z) lives at
  *   (z >> bd) * slab + (z & (2^bd - 1)) * 512 * 2^bh            slab = gy * gx * block
  *   + (y >> (3 + bh)) * gx * block + ((y >> 3) & (2^bh - 1)) * 512
  *   + (x >> 6) * block + GOB-internal offset(x & 63, y & 7)      block = 512 * 2^(bh + bd)

@@ -26,8 +26,13 @@ $env:TOTK_GUEST_CLOCK = 'wall'; $env:TOTK_PRESENT_HOLD = '0'; $env:TOTK_FRAME_LO
 $env:TOTK_SYNC_WAIT_FENCE = '1'; $env:TOTK_PRESENT_TRACE = '1'
 $env:TOTK_PROVOKING_FIRST = '0'; $env:TOTK_NVN_WAIT_TRACE = '0'; $env:TOTK_RT_WINDOW_TRACE = '0'
 if (-not $env:TOTK_MOVIE_PACE) { $env:TOTK_MOVIE_PACE = 'game' }
-if (-not $env:TOTK_OVERLAP) { $env:TOTK_OVERLAP = '1' }
+if (-not $env:TOTK_OVERLAP) { $env:TOTK_OVERLAP = '0' }                # 1 (game and GPU frames overlapping) caused the sky-island vertex explosions
 if (-not $env:TOTK_MT_CPUSETS) { $env:TOTK_MT_CPUSETS = 'p' }          # P-cores on hybrid CPUs; no effect on others
+if (-not $env:TOTK_OCCLUSION) { $env:TOTK_OCCLUSION = 'fake' }         # occlusion queries answer "visible": real answers arrive late and objects blink
+if (-not $env:TOTK_TEX_LIVE_TRIM) { $env:TOTK_TEX_LIVE_TRIM = '1' }    # keep textures within the budget every submission, not only when idle
+if (-not $env:TOTK_TEX_MIN_AGE) { $env:TOTK_TEX_MIN_AGE = '120' }      # frames a texture stays unused before it may be evicted
+if (-not $env:TOTK_VERTEX_FORMATS) { $env:TOTK_VERTEX_FORMATS = '0' }  # 1 made broken slabs on stone ruins
+if (-not $env:TOTK_DATA_SNAPSHOT_PLAN) { $env:TOTK_DATA_SNAPSHOT_PLAN = '0' }   # 1 made vertex explosions on the Sky Island
 if (-not $env:TOTK_SLOT_VERSIONING) { $env:TOTK_SLOT_VERSIONING = '0' }
 if ($Diagnostics) { $env:TOTK_DRED_MARKERS = '1'; $env:TOTK_FLICKER_LOG = '1' }
 else { $env:TOTK_DRED_MARKERS = '0'; $env:TOTK_FLICKER_LOG = '0'; $env:TOTK_FRAME_DUMP_EVERY = '0' }

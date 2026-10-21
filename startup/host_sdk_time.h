@@ -7,8 +7,9 @@
  *   Initialize, IsInitialized, Finalize, StandardSteadyClock::now, StandardUserSystemClock::GetCurrentTime,
  *   StandardNetworkSystemClock::GetCurrentTime, ClockSnapshot::CreateWithStandardSystemClock, ToCalendarTime.
  * Values are exactly the runtime's time service (boot_runtime.h time:u handlers): the guest clock
- * (boot_guest_steady_unix, guest_time.h), steady clock source id "TOTK-Win-Time-01", the UTC device rule,
- * the 0xd0-byte ClockSnapshot layout. Pure SDK computation stays guest code (ClockSnapshot ctor,
+ * (boot_guest_steady_unix, guest_time.h), steady clock source id "TOTK-Win-Time-01", the device rule (svc-S4:
+ * the host time zone, boot_time_zone_local in boot_runtime.h; TOTK_TIME_ZONE=utc: UTC), the 0xd0-byte ClockSnapshot
+ * layout. Pure SDK computation stays guest code (ClockSnapshot ctor,
  * CalculateSpanBetween, CalculateStandardUserSystemClockDifferenceByUser, ToCalendarTimeInUtc,
  * ToPosixTimeFromUtc). Before Initialize the functions return what the SDK returns uninitialized
  * (now() = 0, NotInitialized 0x74).
@@ -28,8 +29,11 @@
 static inline volatile LONG *sdk_time_initialized(void) { static volatile LONG v; return &v; }
 static const uint8_t sdk_time_source_id[16] = {0x54,0x4f,0x54,0x4b,0x2d,0x57,0x69,0x6e,0x2d,0x54,0x69,0x6d,0x65,0x2d,0x30,0x31};
 
-/* UTC civil date of a posix time: CalendarTime (8 bytes) and CalendarAdditionalInfo (0x18 bytes). */
+/* Civil date of a posix time by the device rule: CalendarTime (8 bytes) and CalendarAdditionalInfo (0x18 bytes: day of
+ * week, day of year, TimeZone {name[8], DST flag at +16, UTC offset in seconds at +20}). svc-S4: the host time zone
+ * (boot_time_zone_local); UTC with TOTK_TIME_ZONE=utc, byte-identical to before. */
 static inline int sdk_time_calendar(int64_t t, uint8_t cal[8], uint8_t info[0x18]) {
+    char zone[8]; uint8_t dst; int32_t offset = boot_time_zone_local(t, zone, &dst); t += offset;
     int64_t days = t >= 0 ? t / 86400 : -((-t + 86399) / 86400), secs = t - days * 86400;
     int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097, doe = z - era * 146097;
     int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365, y = yoe + era * 400, doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -41,11 +45,12 @@ static inline int sdk_time_calendar(int64_t t, uint8_t cal[8], uint8_t info[0x18
     int16_t year = (int16_t)y; memset(cal, 0, 8); memcpy(cal, &year, 2);
     cal[2] = (uint8_t)m; cal[3] = (uint8_t)d; cal[4] = (uint8_t)(secs / 3600); cal[5] = (uint8_t)(secs / 60 % 60); cal[6] = (uint8_t)(secs % 60);
     uint32_t w = (uint32_t)wday, yd = (uint32_t)yday;
-    memset(info, 0, 0x18); memcpy(info, &w, 4); memcpy(info + 4, &yd, 4); memcpy(info + 8, "UTC", 3);
+    memset(info, 0, 0x18); memcpy(info, &w, 4); memcpy(info + 4, &yd, 4); memcpy(info + 8, zone, 8); info[16] = dst; memcpy(info + 20, &offset, 4);
     return 1;
 }
 /* The ClockSnapshot GetClockSnapshot(type) fills (time:u 400 handler): user and network contexts,
- * times, calendars, steady time point, location "UTC", automatic correction off, type. */
+ * times, calendars (device rule), steady time point, location "UTC" (no IANA name on Windows; nxport's
+ * GetDeviceLocationName says "UTC" too, nn.rs:809-815), automatic correction off, type. */
 static inline void sdk_time_snapshot(uint8_t out[0xd0], uint64_t steady, int64_t unix_seconds, unsigned kind) {
     memset(out, 0, 0xd0);
     for (unsigned k = 0; k < 2; ++k) {

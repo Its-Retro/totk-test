@@ -315,6 +315,7 @@ static inline void boot_compute_idle(BootRender *r) {
                 if (boot_image_trace_enabled) boot_render_invalidate(va, size);
                 else { boot_render_cb_written(va, size); boot_compute_inv_add(va, size); }
                 boot_render_rt_guest_written(r, va, size);   /* render-18: so are host render targets over them (reloaded on next use) */
+                boot_ds_gpu_stored(va, size);   /* data-snapshot: pages compute really stored to (deferred dispatches' pending writes) */
                 if (owner && (!boot_compute_pending || !boot_compute_writes_overlap(owner, va, size))) {
                     if (boot_compute_pending) ++boot_compute_grown;   /* a deferred dispatch stored outside its ranges */
                     boot_compute_writes_add(owner, va, size);

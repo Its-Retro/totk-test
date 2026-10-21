@@ -269,9 +269,12 @@ VMNMX = [T(s5700_0, 'dsigned'), T(s5700_1, 'asize'), T(s5700_3, 'vmode'), ON(47,
          R08, T(s50f0_1, 'bopnd'), R39]
 
 # Packed half-precision arithmetic (SM53, Tegra X1: HADD2 / HMUL2 / HFMA2). envydis (gm107) does not
-# know these, so the field layout follows the instruction encodings documented by the suyu
-# shader recompiler (reference/suyu-v14.1.0 .../half_floating_point_*.cpp, maxwell.inc); the token
-# text is this decoder's own (there is no envydis text to match). Operand swizzles and the result
+# know these. Opcodes and field positions match nxport's decoder table form by form (MIT,
+# crates/sass2spv/src/decoders/inst_decoders.rs + inst_table_data.rs, generated from Ryujinx's
+# InstDecoders.cs, MIT); checked on random words of every form by play-work/p96/provenance/verify_half_ops.py. One
+# difference: HFMA2_32I takes swizzle 53 / precision 55 like nxport's HADD2_32I and HMUL2_32I, and
+# neg_c 52 (no .SAT), where nxport reuses the HFMA2 immediate-form positions 47 / 57 / 51, which
+# overlap the 32-bit immediate and the opcode. The token text is this decoder's own (there is no envydis text to match). Operand swizzles and the result
 # merge mode: see maxwell_hlsl.Emitter.half_op.
 HSWZ = ['h1_h0', 'f32', 'h0_h0', 'h1_h1']
 HMRG = ['h1_h0', 'f32', 'mrg_h0', 'mrg_h1']

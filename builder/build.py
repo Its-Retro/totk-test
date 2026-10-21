@@ -551,6 +551,11 @@ def step_shaders(c):
           heartbeat=beat, what='Scanned shader translation')
     rows = sum(1 for l in (c.startup / 'shader-manifest.tsv').read_text(encoding='utf-8').splitlines() if l)
     say(f'    shader-manifest.tsv: {rows:,} shaders (the development build has about 22,560 before run-time captures)')
+    say('    point-sprite geometry shaders (one per vertex-shader output layout of the manifest)')
+    try:
+        c.py('make_point_gs.py', '--jobs', str(c.workers), log='shaders', env=env, what='Point-sprite geometry shaders')
+    except BuildError:   # optional: without its geometry shader a point-sprite draw keeps the pipeline of before (logged once)
+        say('      (some point-sprite geometry shaders did not build; see logs/shaders.log. Continuing)')
 
 
 # Step 11: compile
@@ -616,7 +621,7 @@ TRANSLATOR_INPUTS = ['translate_startup.py', 'float_emit.py', 'float_emit_ext.py
                      'discovered-rtld-ranges.json', 'discovered-entries.json', 'entry-points-static.json', 'script-entries.json']
 SHADER_INPUTS = ['maxwell_hlsl.py', 'maxwell_isa.py', 'maxwell_runtime.hlsli', 'translate_game_shaders.py', 'translate_runtime_shaders.py',
                  'inventory_game_shaders.py', 'shader_package_reader.py', 'bnsh_reader.py', 'extract_shader_pairs.py',
-                 'extract_shader_headers.py', 'write_shader_manifest.py', 'debug/effect_shader_scan.py', 'shader-tools/extract_early_z.py',
+                 'extract_shader_headers.py', 'write_shader_manifest.py', 'make_point_gs.py', 'debug/effect_shader_scan.py', 'shader-tools/extract_early_z.py',
                  'clear-shaders/clear.hlsl', 'diag-shaders/const.ps.hlsl', 'diag-shaders/varying3.ps.hlsl']
 RUNTIME_C = ['host_input_sdl.c', 'host_movie_vpx.c', 'host_movie_webm.cpp']   # never glob *.c: translated_startup.c is huge
 COMPILE_INPUTS = ['incremental/compile_cached_fast.py', 'compile_cached.py', 'split_page_header.py', 'split_host_window.py',

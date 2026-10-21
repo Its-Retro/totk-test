@@ -23,7 +23,8 @@
  *   d-pad; sticks scaled to +-32767 with +y up and a radial dead zone (TOTK_INPUT_DEADZONE percent, default 8).
  *   Home/Capture are system buttons: on hardware the application never receives them in its npad state, so
  *   they are reported in TotkPadState.system_buttons only.
- * Six-axis (nn::hid::SixAxisSensorState, suyu input_common/drivers/sdl_driver.cpp conventions):
+ * Six-axis (nn::hid::SixAxisSensorState; SDL's axes and units from SDL3 SDL_sensor.h, the Switch units as Ryujinx
+ *   NpadController.GetHLEMotionState reports them):
  *   accel in G, gyro in revolutions/s, Switch axes from SDL's (x right, y up, z toward the player):
  *   accel = (-ax, az, -ay)/9.80665, gyro = (gx, -gz, gy)/(2 pi); at rest flat accel = (0,0,-1).
  *   rotation = integrated gyro (revolutions), orientation = rows of the device-to-world rotation (Mahony
@@ -95,7 +96,7 @@ static inline void totk_input_sixaxis_write(uint8_t*lifo,uint64_t now_ms,uint64_
 }
 
 /* StartSixAxisSensor (hid 66) / StopSixAxisSensor (67): one bit per SixAxisSensorHandle (style index x device
- * index). The game reads real motion only while a handle is started; otherwise the at-rest default (as suyu). */
+ * index). The game reads real motion only while a handle is started; otherwise the at-rest default. */
 static volatile long totk_input_sixaxis_started;
 static inline void totk_input_sixaxis_handle(uint32_t handle,int start){
     unsigned bit=((handle&7u)<<2)|((handle>>16)&3u);

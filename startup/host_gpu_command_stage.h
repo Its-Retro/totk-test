@@ -74,7 +74,8 @@ static inline int boot_gpu_stage_semaphore(BootGpuStage*s,const BootGpuSemaphore
 /* NVB197 report semaphore of ZPASS_PIXEL_CNT (2) or ZPASS_PIXEL_CNT64 (0x15), operation RELEASE or
  * REPORT_ONLY at pipeline location ALL. The value is the channel's sample counter: samples passing the
  * depth/stencil tests in draws with SET_ZPASS_PIXEL_COUNT enabled since the last CLEAR_REPORT_VALUE
- * ZPASS_PIXEL_CNT (suyu Maxwell3D::ProcessQueryGet / ProcessCounterReset, query_cache CounterReport).
+ * ZPASS_PIXEL_CNT (open-gpu-doc clb197.h SET_REPORT_SEMAPHORE_D / CLEAR_REPORT_VALUE / SET_ZPASS_PIXEL_COUNT;
+ * nxport metal/mod.rs:3430-3443 counts the same SAMPLES_PASSED value).
  * It is known only after the preceding draws ran, so an ordered report event marks the point and the
  * value words are staged as kinds 4/5, resolved from D3D12 occlusion queries before commit. Four-word
  * form: 64-bit value, then the 64-bit timestamp (kinds 1/2) like every other report; one word: the

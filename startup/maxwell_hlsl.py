@@ -17,6 +17,14 @@ APPROXIMATIONS = {
     'unwritten_input_zero': 'pixel input the paired vertex shader never writes reads 0 (undefined on the source GPU)',
 }
 
+# batch-4 translator fixes, each with a switch read once here (default on; NAME=0 translates exactly as before). They act
+# when shaders are retranslated (retranslate_shaders.py), so set them for that run, not for the game.
+def _switch(name): return os.environ.get(name, '1') != '0'
+TMML_HW_ORDER = _switch('TOTK_SHADER_TMML_HW')     # shd-S2: TMML result order of the source GPU (op_tmml)
+IADD3_RS_CARRY = _switch('TOTK_SHADER_IADD3_CARRY')   # K4: IADD3.RS shifts the 33-bit sum (op_iadd3)
+ATOM_KILL_GUARD = _switch('TOTK_SHADER_ATOM_KILL')  # L3: ATOM after a deferred KIL does not reach memory (op_atom)
+TEX_STRICT = _switch('TOTK_SHADER_TEX_STRICT')      # L1/L2: unverified TEXS/TLDS/TLD4S forms are unsupported
+
 def f32_literal(bits32):
     return f'asfloat(0x{bits32 & 0xffffffff:08x}u)'
 
@@ -221,7 +229,7 @@ class Emitter:
         if e is None: raise Unsupported(f"mufu {f['op']}")
         self.notes.add('mufu'); self.fres(ins, e)
     def op_rro(self, ins):
-        # Range reduction is folded into the host sin/cos/exp2 (as yuzu and Ryujinx do).
+        # Range reduction is folded into the host sin/cos/exp2 (as Ryujinx does; nxport sass2spv float.rs emit_rro).
         self.fres(ins, self.fsrc(ins, 'b', 'neg', 'abs'))
     def op_fswzadd(self, ins):
         # Per-lane (lane & 3) 2-bit selector from the swizzle LUT: a*{1,-1,1,0} + b*{1,1,-1,1}.
@@ -246,7 +254,8 @@ class Emitter:
         lo, hi = f'f16tof32(({x}) & 0xffffu)', f'f16tof32(({x}) >> 16)'
         return {'h1_h0': (lo, hi), 'h0_h0': (lo, lo), 'h1_h1': (hi, hi)}[swz] + (False,)
     def half_op(self, ins, kind):
-        """suyu half_floating_point_*.cpp semantics: each source is a pair of halves (or one fp32 value
+        """Packed-half semantics (operand roles, swizzles and merge modes as nxport sass2spv
+        instructions/float.rs hadd2_*/hmul2_*/hfma2_*, from Ryujinx): each source is a pair of halves (or one fp32 value
         used for both lanes, swizzle f32); the two lanes are computed independently, saturated, and
         rounded to fp16 (round to nearest even, h_round) before the merge: h1_h0 packs both lanes,
         f32 writes the low lane as fp32, mrg_h0/mrg_h1 replace one half of the destination.
@@ -391,7 +400,13 @@ class Emitter:
         b = self.ineg(half(self.src(ins, 'b'), f.get('hb', '')), f['neg_b'])
         c = self.ineg(half(self.r(f['c']), f.get('hc', '')), f['neg_c'])
         shift = f.get('shift', '')
-        if shift == 'rs': self.setr(f['d'], f'(({a} + {b}) >> 16) + {c}')
+        # K4 (batch-4): .RS shifts the sum with its carry (33 bits): NVCC's mulhi idiom (XMAD lo*lo, lo*hi, hi*lo, XMAD.CHI,
+        # IADD3.RS) is exact only then; a 32-bit sum is 65536 low in 7% of random 32x32 products (play-work/explode-work2/
+        # shader-translation-b.md C; nxport crates/sass2spv/src/instructions/integer.rs:283-293 has the 32-bit form too).
+        # With a negated operand the old form stays.
+        if shift == 'rs' and IADD3_RS_CARRY and not f['neg_a'] and not f['neg_b']:
+            self.setr(f['d'], f'(uint)(((uint64_t)({a}) + (uint64_t)({b})) >> 16) + {c}')
+        elif shift == 'rs': self.setr(f['d'], f'(({a} + {b}) >> 16) + {c}')
         elif shift == 'ls': self.setr(f['d'], f'(({a} + {b}) << 16) + {c}')
         else: self.setr(f['d'], f'{a} + {b} + {c}')
     def op_iscadd(self, ins):
@@ -429,7 +444,7 @@ class Emitter:
                 'gt': f'({a} > {b})', 'ne': f'({a} != {b})', 'ge': f'({a} >= {b})'}[cmp]
     def icmp_extended(self, cmp, a, b, unsigned):
         """.X compare: the high words of a 64-bit compare whose low words were subtracted by a
-        preceding IADD.CC (CC.C = no borrow, CC.Z = low words equal); suyu ExtendedIntegerCompare."""
+        preceding IADD.CC (CC.C = no borrow, CC.Z = low words equal); nxport sass2spv int_compare.rs int_comparison_extended."""
         self.uses.add('cc')
         A, B = (f'(uint64_t){a}', f'(uint64_t){b}') if unsigned else (f'(int64_t)(int){a}', f'(int64_t)(int){b}')
         lt = f'({A} < {B} + (cc_c ? 0 : 1))'; eq = f'({a} == {b} && cc_z)'
@@ -616,13 +631,13 @@ class Emitter:
     def op_vset(self, ins):
         raise Unsupported('vset')
     def video_operand(self, value, width, sel, signed):
-        """Video instruction operand (suyu ExtractVideoOperandValue): width 0/1 byte, 2 halfword, 3 word."""
+        """Video instruction operand: width 0/1 byte, 2 halfword, 3 word (= VectorSelect >> 1, nxport helper.rs extend)."""
         if width == 3: return f'(int){value}' if signed else value
         bits = 8 if width < 2 else 16; pos = sel * bits
         if signed: return f'(((int){value} << {32 - pos - bits}) >> {32 - bits})'
         return f'(({value} >> {pos}u) & 0x{(1 << bits) - 1:x}u)'
     def op_vmnmx(self, ins):
-        # VMNMX (suyu video_minimum_maximum.cpp, field positions from the raw word): d = op(min|max(a', b'), c)
+        # VMNMX (field positions as nxport decoders/inst_decoders.rs InstVmnmx, read from the raw word): d = op(min|max(a', b'), c)
         # where a', b' are the selected byte/halfword/word of Ra and Rb (or a 16-bit immediate), the
         # first min/max takes its signedness from b, the second (MIN/MAX with Rc) from DSIGN.
         w = ins.word; f = ins.f
@@ -695,7 +710,7 @@ class Emitter:
             return
         if space == 's':
             if self.prog.stage != 'compute': raise Unsupported('shared memory outside compute')
-            # .U (bit 44) is a uniform-address hint, not a lock; suyu's LDS ignores it too
+            # .U (bit 44) is a uniform-address hint, not a lock; nxport's lds (sass2spv memory.rs) ignores it too
             self.uses.add('smem')
             base = f'({self.r(reg)} + {off & 0xffffffff}u)' if reg != 255 else f'{off & 0xffffffff}u'
             if f['size'] in ('u8', 's8', 'u16', 's16'):
@@ -788,16 +803,24 @@ class Emitter:
 
     def op_atom(self, ins):
         f = ins.f
+        # L3 (batch-4): KIL is deferred (op_kil): a killed pixel keeps running, so, like RED and STG, its atomic must not
+        # reach memory (on the source GPU the thread has ended). Only pixel shaders kill: other stages emit no guard (their
+        # text stays as before). A result register of RZ still performs the atomic (setr drops the whole call for RZ).
+        def ret(expr):
+            if not ATOM_KILL_GUARD: return self.setr(f['d'], expr)
+            g = 'if (!KILLED) ' if self.prog.stage == 'fragment' else ''
+            if f['d'] == 255: return self.emit(f'{g}{expr};')
+            self.regs.add(f['d']); self.emit(f"{g}r{f['d']} = {expr};")
         if 'op' not in f:   # atom.cas: compare b, new value b+1
             if f['size'] != 'b32': raise Unsupported(f"atom.cas {f['size']}")
             v = f['v']
-            self.setr(f['d'], f"gmem_atomic_cas({self.gaddr(ins)}, {self.r(v)}, {self.r(v + 1) if v != 255 else '0u'})"); return
+            ret(f"gmem_atomic_cas({self.gaddr(ins)}, {self.r(v)}, {self.r(v + 1) if v != 255 else '0u'})"); return
         if f['size'] not in ('u32', 's32'): raise Unsupported(f"atom {f['size']}")
         op = f['op']
         fn = {'add': 'add', 'min': 'min', 'max': 'max', 'and': 'and', 'or': 'or', 'xor': 'xor', 'exch': 'exch', 'inc': 'inc', 'dec': 'dec'}.get(op)
         if fn is None: raise Unsupported(f'atom {op}')
         signed = f['size'] == 's32' and op in ('min', 'max')
-        self.setr(f['d'], f"gmem_atomic_ret_{fn}{'_s' if signed else ''}({self.gaddr(ins)}, {self.r(f['v'])})")
+        ret(f"gmem_atomic_ret_{fn}{'_s' if signed else ''}({self.gaddr(ins)}, {self.r(f['v'])})")
 
     # compute: shared-memory atomics, barriers
     def op_atoms(self, ins):
@@ -885,7 +908,8 @@ class Emitter:
             e = 'asfloat(front_face_bits)'; self.uses.add('front_face')
         elif a in (0x2e0, 0x2e4):
             # Point sprite coordinate; D3D12 has no point sprites, the host expands points to quads
-            # and supplies the coordinate in this interpolant.
+            # and supplies the coordinate in this interpolant (G2: a geometry shader from make_point_gs.py,
+            # bound by host_gpu_render_draw.h boot_pt_apply).
             e = f'i.pointcoord.{"xy"[(a - 0x2e0) // 4]}'; self.uses.add('pointcoord')
         else: raise Unsupported(f'ipa attribute {a:#x}')
         if mode == '' : e = f"({e} * {self.rf(f['b'])})"
@@ -917,6 +941,10 @@ class Emitter:
         return f"tex_{kind}_{dim}{'a' if array is not None else ''}({', '.join(args)})"
     def op_texs(self, ins):
         f = ins.f; a, b = f['a'], f['b']
+        # L1 (batch-4): bit 59 clear is TEXS.F16 (results packed as half2 in d and d2; nxport decoders/inst_table_data.rs:
+        # 270-271, instructions/texture.rs:406-439), which texs_write would spread over four registers: unsupported until
+        # implemented (no TOTK program uses it). Same for TLDS (bit 59) and TLD4S (bit 55 set).
+        if TEX_STRICT and not bits(ins.word, 59, 1): raise Unsupported('texs.f16 (packed half results)')
         enc = bits(ins.word, 53, 4)
         h = self.tex_handle(f['tex'])
         F = self.rf
@@ -942,6 +970,10 @@ class Emitter:
         self.write_tex(ins, comps, regs, call)
     def op_tlds(self, ins):
         f = ins.f; a, b = f['a'], f['b']; enc = bits(ins.word, 53, 4); h = self.tex_handle(f['tex']); R = self.r
+        if TEX_STRICT and not bits(ins.word, 59, 1): raise Unsupported('tlds.f16 (packed half results)')   # L1 (op_texs)
+        # L2 (batch-4): 2D array LZ (enc 8): nxport (instructions/texture.rs:368-373) reads x = Rb, y = Rb+1, layer = Ra,
+        # this translator x = Ra+1, y = Rb. Unverified either way and unused by TOTK (0 of 31.8k programs): unsupported.
+        if TEX_STRICT and enc == 8: raise Unsupported('tlds 2d array lz (coordinate order unverified)')
         if enc == 0: call = self.sample_call('fetch', '1d', h, f'int({R(a)})', lod='0')
         elif enc == 1: call = self.sample_call('fetch', '1d', h, f'int({R(a)})', lod=f'int({R(b)})')
         elif enc == 2: call = self.sample_call('fetch', '2d', h, f'int2({R(a)}, {R(b)})', lod='0')
@@ -987,7 +1019,7 @@ class Emitter:
             return None
         return None
     def tex_offset(self, ins, reg, n):
-        """TEX/TLD .AOFFI operand: n signed 4-bit texel offsets packed from bit 0 (suyu MakeOffset)."""
+        """TEX/TLD .AOFFI operand: n signed 4-bit texel offsets packed from bit 0 (nxport sass2spv texture.rs emit_tex)."""
         v = self.reg_constant(reg, ins)
         if v is None: return f'aoffi{n}({self.r(reg)})'
         comps = [((v >> (4 * i)) & 0xf) - (16 if (v >> (4 * i)) & 0x8 else 0) for i in range(n)]
@@ -1021,6 +1053,7 @@ class Emitter:
     def op_tld4s(self, ins):
         f = ins.f
         if f['aoffi']: raise Unsupported('tld4s aoffi')
+        if TEX_STRICT and bits(ins.word, 55, 1): raise Unsupported('tld4s.f16 (packed half results)')   # L1 (op_texs)
         a, b = f['a'], f['b']
         coord = f'float2({self.rf(a)}, {self.rf(b if not f["dc"] else a + 1)})'
         dref = self.rf(b) if f['dc'] else None
@@ -1036,9 +1069,14 @@ class Emitter:
         for i, c in enumerate(comps): self.setr(d + i if d != 255 else 255, f'q_.{c}')
         self.indent -= 1; self.emit('}')
     def op_tmml(self, ins):
-        # TMML (suyu texture_mipmap_level.cpp): level-of-detail query at the coordinates in Ra
-        # (array index first, dropped). Results: x = level accessed, y = unclamped LOD, both
-        # 8.8 fixed point; z/w (BA results) are not implemented.
+        # TMML: level-of-detail query at the coordinates in Ra (array index first, dropped), results in 8.8 fixed point.
+        # shd-S2 (batch-4): the result order is the inverse of GLSL textureQueryLod's: x = the computed LOD (signed,
+        # unclamped), y = the level accessed (clamped to the texture's levels and the sampler's LOD range). nxport
+        # crates/sass2spv/src/instructions/texture.rs:559-562 swaps the components ("inverse of GLSL's") and converts
+        # LOD * 256 to s32; Mesa nouveau's TXLQ lowering (MIT) swaps them the same way, reading x as s16 and y as u16
+        # (semantics only, from both). TOTK reads only y (3103 sites), which was the unclamped LOD here: it differs where
+        # the LOD leaves the texture's mip range or a sampler LOD clamp applies. TOTK_SHADER_TMML_HW=0: x clamped,
+        # y unclamped, both clamped at 0 (before). z/w (BA results) are not implemented.
         f = ins.f
         if f['mask'] & 0b1100: raise Unsupported('tmml ba results')
         if f['dim'] == 't3d' and f['array']: raise Unsupported('tmml 3d array')
@@ -1055,10 +1093,13 @@ class Emitter:
         k = 0
         for i, c in enumerate('xy'):
             if f['mask'] >> i & 1:
-                self.setr(d + k if d != 255 else 255, f'(uint)(max(l_.{c}, 0.0f) * 256.0f)'); k += 1
+                if not TMML_HW_ORDER: e = f'(uint)(max(l_.{c}, 0.0f) * 256.0f)'
+                elif c == 'x': e = 'f2i_s32(l_.y * 256.0f)'   # tex_lod_*: .x clamped (accessed) LOD, .y unclamped
+                else: e = 'f2i_u32(l_.x * 256.0f)'
+                self.setr(d + k if d != 255 else 255, e); k += 1
         self.indent -= 1; self.emit('}')
     def op_txd(self, ins):
-        # TXD (suyu texture_gradient.cpp): coordinates from Ra, then the array index (low 16 bits) in
+        # TXD (Mesa NAK nak_nir_lower_tex.c, SM50 txd): coordinates from Ra, then the array index (low 16 bits) in
         # the register after them; derivatives from Rb interleaved as (ds/dx, ds/dy, dt/dx, dt/dy).
         f = ins.f; F = self.rf
         if f['aoffi']: raise Unsupported('txd aoffi')
@@ -1075,7 +1116,7 @@ class Emitter:
         comps = [c for i, c in enumerate('xyzw') if f['mask'] >> i & 1]
         d = f['d']; self.write_tex(ins, comps, [d + i if d != 255 else 255 for i in range(len(comps))], call)
     def op_tld(self, ins):
-        # TLD (suyu texture_load.cpp): integer texel coordinates from Ra (array index first, low 16
+        # TLD (Mesa NAK nak_nir_lower_tex.c, SM50 txf): integer texel coordinates from Ra (array index first, low 16
         # bits), then from Rb: LOD (.LL), packed 4-bit offsets (.AOFFI), sample index (.MS).
         f = ins.f; R = self.r
         if f['ms']: raise Unsupported('tld ms')

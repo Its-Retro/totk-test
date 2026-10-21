@@ -126,11 +126,24 @@ enum { BOOT_NVN_TOKEN_MAGIC = 0x4b544e56u, BOOT_NVN_TOKEN_BYTES = 16 };
  * submit-time snapshot that read it (boot_nvn_dsnap_take). Both change under the slot lock.
  * batch-a (TOTK_FRAME_TRACE=1): rec_thread / end_qpc = the guest thread that ended the recording and when its handle
  * was installed (boot_nvn_cmd_end_ret), for the per-submission frame trace. */
-typedef struct BootNvnDref { uint32_t off, count; uint64_t ptr; } BootNvnDref;   /* count UINT32_MAX: ptr is a CallCommands handle */
+typedef struct BootNvnDref { uint32_t off, count; uint64_t ptr, bound; } BootNvnDref;   /* count UINT32_MAX: ptr is a CallCommands handle, bound the
+                                                                                     * version bound at record time (call-bind; 0: none) */
 typedef struct BootNvnSlot {
     SRWLOCK lock; uint8_t *data; uint32_t len, cap, gen, next_free, pins, dead, closed; uint64_t token;
     BootNvnDref *dref; uint32_t dref_n, dref_cap, snap, rec_thread; uint64_t end_qpc;
+    uint32_t ver_bytes, ver_pad;   /* rerecord-work: bytes counted while it is a version (dead and pinned; store lock) */
+    /* rec-evict (see boot_nvn_ev_dead_mode): the handle it is installed under and its control / command memory ranges (guest CPU
+     * addresses; length 0 = none) as the overwrite index has them (boot_nvn_ev.lock; ev_in = indexed); ev_use / ev_reach: the
+     * present at which a submit call's walk last reached it, and how (BOOT_NVN_EV_SUBMITTED at depth 0, BOOT_NVN_EV_CALLED through
+     * CallCommands; walk, slot lock); ev_mark: dry-run marks (BOOT_NVN_EV_WOULD_*; set under the store lock, atomic). Reset by
+     * boot_nvn_slot_new_gen; ev_in and ev_mark are dropped by boot_nvn_slot_free_locked. */
+    uint64_t ev_handle, ev_ctl, ev_cmd; uint32_t ev_ctl_len, ev_cmd_len, ev_use; uint8_t ev_reach, ev_in, ev_mark, ev_pad;
+    uint32_t cb_refs, cb_bytes; uint8_t cb_flags, cb_pad[3];   /* call-bind (see "call-bind" below; store lock): bindings, held bytes, BOOT_NVN_CB_* */
 } BootNvnSlot;
+enum { BOOT_NVN_CB_VER = 1, BOOT_NVN_CB_HELD = 2, BOOT_NVN_CB_INVALID = 4, BOOT_NVN_CB_STRIPPED = 8, BOOT_NVN_CB_INPLACE = 16 };   /* call-bind: cb_flags */
+enum { BOOT_NVN_EV_SUBMITTED = 1, BOOT_NVN_EV_CALLED = 2 };                                /* rec-evict: ev_reach */
+enum { BOOT_NVN_EV_WOULD_DEAD = 1, BOOT_NVN_EV_WOULD_EVICT = 2, BOOT_NVN_EV_REUSED = 4 };   /* rec-evict: ev_mark */
+static volatile LONG boot_nvn_ev_now;   /* rec-evict: presents so far (boot_nvn_ev_present) */
 enum { BOOT_NVN_SLOT_CHUNK_BITS = 12, BOOT_NVN_SLOT_CHUNKS = 4096 };   /* 16M slots */
 #define BOOT_NVN_SLOT_FIRST_CAP 1024u
 #define BOOT_NVN_SLOT_KEEP_CAP (16u << 10)          /* buffers up to this size are kept by a released slot */
@@ -153,7 +166,16 @@ enum { BOOT_NVN_RL_RECORDS, BOOT_NVN_RL_CACHED, BOOT_NVN_RL_GROWS, BOOT_NVN_RL_R
        BOOT_NVN_RL_READS, BOOT_NVN_RL_LOCKED_READS, BOOT_NVN_RL_PINS, BOOT_NVN_RL_PIN_REPEATS,
        BOOT_NVN_RL_POOL_HITS, BOOT_NVN_RL_POOL_NEW, BOOT_NVN_RL_HINTED, BOOT_NVN_RL_TRIMS, BOOT_NVN_RL_N };   /* recfast: the last four */
 enum { BOOT_NVN_RL_STORE, BOOT_NVN_RL_SLOT, BOOT_NVN_RL_MAP, BOOT_NVN_RL_LOCKS };
-typedef struct BootNvnRlStats { _Alignas(64) uint64_t n[BOOT_NVN_RL_N]; } BootNvnRlStats;
+/* storelock-work: the store lock's call sites (boot_nvn_sl_lock; the first five hold it shared with TOTK_STORE_LOCK_V2) and the role of
+ * a thread (set by its first submit call / BeginRecording) */
+enum { BOOT_NVN_SL_PIN, BOOT_NVN_SL_CBPIN, BOOT_NVN_SL_BIND, BOOT_NVN_SL_UNPIN, BOOT_NVN_SL_DROP, BOOT_NVN_SL_UNPIN_FREE, BOOT_NVN_SL_DROP_FREE,
+       BOOT_NVN_SL_NEW, BOOT_NVN_SL_FREE, BOOT_NVN_SL_EVICT, BOOT_NVN_SL_OVERWRITE, BOOT_NVN_SL_UNBIND, BOOT_NVN_SL_N };
+enum { BOOT_NVN_SL_ROLE_OTHER, BOOT_NVN_SL_ROLE_RECORDER, BOOT_NVN_SL_ROLE_RENDER };
+typedef struct BootNvnRlStats {
+    _Alignas(64) uint64_t n[BOOT_NVN_RL_N];
+    uint64_t sl_acq[BOOT_NVN_SL_N], sl_wait[BOOT_NVN_SL_N], sl_wait_qpc[BOOT_NVN_SL_N], sl_hold_n[BOOT_NVN_SL_N], sl_hold_qpc[BOOT_NVN_SL_N], sl_hold_max[BOOT_NVN_SL_N];
+    uint32_t sl_tick, sl_role, sl_guest, sl_pad;   /* storelock-work: per thread, see boot_nvn_sl_lock */
+} BootNvnRlStats;
 static BootNvnRlStats boot_nvn_rl_slots[65];   /* one per thread, the 65th shared by any further threads */
 static volatile LONG boot_nvn_rl_next;
 static volatile LONG64 boot_nvn_rl_waits[BOOT_NVN_RL_LOCKS], boot_nvn_rl_wait_qpc[BOOT_NVN_RL_LOCKS];
@@ -173,6 +195,75 @@ static inline void boot_nvn_rl_lock(SRWLOCK *l, unsigned k) {
 static inline void boot_nvn_rl_lock_shared(SRWLOCK *l, unsigned k) {
     if (TryAcquireSRWLockShared(l)) return;
     LARGE_INTEGER a; QueryPerformanceCounter(&a); AcquireSRWLockShared(l); boot_nvn_rl_waited(k, a);
+}
+/* storelock-work (play-work/storelock-work/README.md): TOTK_STORE_LOCK_V2 (on unless =0; off with TOTK_RECLOCK=0). play-104 (25 min,
+ * 37,890 presents): 15.1 M failed try-acquires of the store lock, 29.5 s waited (0.78 ms per present summed over the threads, ~400
+ * waits of ~2 us). Per present the lock was taken ~4,700 times, all exclusively: ~1,820 by t2's submit walk (one pin per recording the
+ * call reaches, boot_nvn_handle_pin; the walk took 0.71 ms per call), ~2,640 by the recording threads' CallCommands binds (one per
+ * call record, a map lookup per handle inside, boot_nvn_cb_bind), once per call by t2's boot_nvn_unpin_all (all ~1,820 pins in one
+ * section), and a few hundred times for slot allocation, releases and rec-evict class 1 (66 recordings, 42 class 1 releases). Pins
+ * and binds only read state that changes under the exclusive lock and add one to a counter. With the switch on:
+ *   - pins (boot_nvn_handle_pin, boot_nvn_cb_pin) and binds hold the lock SHARED and add with atomics (pins, cb_refs, boot_nvn_cb.refs):
+ *     t2's walk and the recorders' binds no longer exclude each other. Every release, allocation and eviction still holds it
+ *     exclusively, so a pin or bind is still atomic with its map lookup against every free (see boot_nvn_handle_pin);
+ *   - boot_nvn_unpin_all drops its pins under the shared lock (atomic) and takes the exclusive lock only for the slots it left dead and
+ *     unpinned (versions; usually none), checked again there by generation;
+ *   - a released recording's CallCommands bindings (boot_nvn_cb_drop_bindings_locked: one unref per bound entry, ~2,640 per present, two
+ *     cache misses each, the longest part of a caller's release) are queued per thread and dropped right after the exclusive section
+ *     under the shared lock (atomic; boot_nvn_sl_flush), the versions they leave dead, unbound and unpinned freed under the exclusive
+ *     lock as boot_nvn_cb_drain_locked frees them. Such a version stays held a few microseconds longer, by the thread that released
+ *     its last caller; nothing can play it meanwhile (no live record names it, and the released caller was not pinned);
+ *   - EndRecording's release of the handle's older recording takes one exclusive section for call-bind's in-place check and the
+ *     release (boot_nvn_slot_free_ow), not two.
+ * Offline model of the play-104 frame (play-work/storelock-work/test, paced as the game): waits per frame 185 -> 62, wait time summed
+ * over the threads 0.73 -> 0.45 ms, most of it on the recording threads; t2's own waits 50 -> 16 per frame, ~0.13 ms either way (it
+ * now waits only behind the exclusive sections, ~150 per frame). Every 300 presents the line below shows the real split.
+ * =0: every site exactly as before (exclusive, unrefs inline). The counters (boot_nvn_sl_lock) run in both modes, as the A/B baseline:
+ * the "lock waits: store" field split by role, and every 300 presents a "store lock" draw-path.log line by site (boot_nvn_sl_report). */
+static inline int boot_nvn_slv2_on(void) {
+    static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_STORE_LOCK_V2", s, sizeof s); v = !(k && k < sizeof s && s[0] == '0') && boot_nvn_reclock_on(); }
+    return v;
+}
+static _Thread_local struct { uint64_t *b, *r; uint32_t n, cap, rn, rcap; int flushing; } boot_nvn_sld;   /* v2: queued binding drops (versions,
+                                                                                                         * slot | generation), reap candidates */
+static struct { volatile LONG64 deferred, drop_frees, ev_waits, ev_wait_qpc; } boot_nvn_sl_stats;
+static inline void boot_nvn_sl_flush(void);
+/* The store lock at one site, counted per thread: acquisitions, failed try-acquires and their wait (also added to the totals of the
+ * "lock waits: store" field, as boot_nvn_rl_lock did), and the hold time of every 64th acquisition of the thread. Returns the QPC to
+ * pass to boot_nvn_sl_unlock (0: not sampled). */
+static inline uint64_t boot_nvn_sl_lock(BootNvnShadowStore *s, unsigned site, int shared) {
+    BootNvnRlStats *m = boot_nvn_rl(); uint64_t t0 = 0; ++m->sl_acq[site];
+    if (!(shared ? TryAcquireSRWLockShared(&s->lock) : TryAcquireSRWLockExclusive(&s->lock))) {
+        LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+        if (shared) AcquireSRWLockShared(&s->lock); else AcquireSRWLockExclusive(&s->lock);
+        QueryPerformanceCounter(&b); t0 = (uint64_t)b.QuadPart;
+        InterlockedIncrement64(&boot_nvn_rl_waits[BOOT_NVN_RL_STORE]); InterlockedExchangeAdd64(&boot_nvn_rl_wait_qpc[BOOT_NVN_RL_STORE], b.QuadPart - a.QuadPart);
+        ++m->sl_wait[site]; m->sl_wait_qpc[site] += (uint64_t)(b.QuadPart - a.QuadPart);
+    }
+    if (++m->sl_tick & 63) return 0;
+    if (!t0) { LARGE_INTEGER q; QueryPerformanceCounter(&q); t0 = (uint64_t)q.QuadPart; }
+    return t0;
+}
+/* After an exclusive section, the binding drops its releases queued (v2) are done here, with no store / slot / map / ev lock held. */
+static inline void boot_nvn_sl_unlock(BootNvnShadowStore *s, unsigned site, int shared, uint64_t t0) {
+    if (t0) {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q); BootNvnRlStats *m = boot_nvn_rl(); const uint64_t d = (uint64_t)q.QuadPart - t0;
+        ++m->sl_hold_n[site]; m->sl_hold_qpc[site] += d; if (d > m->sl_hold_max[site]) m->sl_hold_max[site] = d;
+    }
+    if (shared) ReleaseSRWLockShared(&s->lock); else ReleaseSRWLockExclusive(&s->lock);
+    if (!shared && boot_nvn_sld.n && !boot_nvn_sld.flushing) boot_nvn_sl_flush();
+}
+/* v2, store lock held exclusively (a release): version b loses this binding right after the section. 0: drop it now (switch off, or
+ * out of host memory for the queue). */
+static inline int boot_nvn_sl_defer(uint64_t b) {
+    if (!boot_nvn_slv2_on()) return 0;
+    if (boot_nvn_sld.n == boot_nvn_sld.cap) {
+        uint32_t cap = boot_nvn_sld.cap ? boot_nvn_sld.cap * 2 : 256; uint64_t *x = cap ? (uint64_t *)realloc(boot_nvn_sld.b, (size_t)cap * sizeof *x) : NULL;
+        if (!x) return 0;
+        boot_nvn_sld.b = x; boot_nvn_sld.cap = cap;
+    }
+    boot_nvn_sld.b[boot_nvn_sld.n++] = b;
+    return 1;
 }
 /* recfast (play-work/recfast-work): play-92's line profile of the recording threads in the heavy tower view had 12-15 ms
  * of the 18-23 ms per frame that t0, t47 and t48 spend in our NVN code inside the realloc of boot_nvn_slot_append, and
@@ -280,13 +371,13 @@ static uint64_t boot_nvn_reuse_released;   /* play (62): recordings released bec
 /* A new empty slot (its shadow address in *shadow, its generation in *gen); 0 when out of host memory. */
 static inline int boot_nvn_slot_new_gen(uint64_t *shadow, uint32_t *gen) {
     BootNvnShadowStore *s = boot_nvn_shadow(); uint32_t i; int logged = 0; uint32_t live = 0;
-    boot_nvn_rl_lock(&s->lock, BOOT_NVN_RL_STORE);
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_NEW, 0);
     if (s->free_head != UINT32_MAX) { i = s->free_head; s->free_head = boot_nvn_slot_at(s, i)->next_free; }
     else {
         if (s->count == s->cap) {   /* a new chunk (zeroed: unlocked locks, no buffers, generation 0) */
             uint32_t k = s->cap >> BOOT_NVN_SLOT_CHUNK_BITS;
             BootNvnSlot *n = k < BOOT_NVN_SLOT_CHUNKS ? (BootNvnSlot *)calloc((size_t)1 << BOOT_NVN_SLOT_CHUNK_BITS, sizeof *n) : NULL;
-            if (!n) { ReleaseSRWLockExclusive(&s->lock); return 0; }
+            if (!n) { boot_nvn_sl_unlock(s, BOOT_NVN_SL_NEW, 0, sl); return 0; }
             __atomic_store_n(&s->chunk[k], n, __ATOMIC_RELEASE); s->cap += 1u << BOOT_NVN_SLOT_CHUNK_BITS;
         }
         i = s->count++;
@@ -297,23 +388,157 @@ static inline int boot_nvn_slot_new_gen(uint64_t *shadow, uint32_t *gen) {
     if (t->dref) s->dref_kept -= (uint64_t)t->dref_cap * sizeof *t->dref;   /* recfast: the index array kept at its release */
     t->len = 0; t->token = 0; t->next_free = UINT32_MAX; t->closed = 0; ++t->gen; if (!t->gen) t->gen = 1;
     t->dref_n = 0; t->snap = 0; t->rec_thread = UINT32_MAX; t->end_qpc = 0;   /* flashfix (a freed slot's index was freed with it), batch-a */
+    t->ev_handle = t->ev_ctl = t->ev_cmd = 0; t->ev_ctl_len = t->ev_cmd_len = t->ev_use = 0; t->ev_reach = t->ev_in = 0;   /* rec-evict */
+    __atomic_store_n(&t->ev_mark, 0, __ATOMIC_RELAXED);
+    t->cb_refs = t->cb_bytes = 0; t->cb_flags = 0;   /* call-bind (a freed slot has neither) */
     *gen = t->gen;
     ReleaseSRWLockExclusive(&t->lock);
     t->pins = t->dead = 0;
     if (++s->live >= 65536 && s->live >= 2 * s->live_logged) { s->live_logged = s->live; logged = 1; live = s->live; }
-    ReleaseSRWLockExclusive(&s->lock);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_NEW, 0, sl);
     if (logged) { boot_nvn_log("live command recordings", "shadow store", live);   /* growth here would be a leak */
                   boot_nvn_log("recordings released by command memory reuse so far", "shadow store", boot_nvn_reuse_released); }
     *shadow = BOOT_NVN_SHADOW | (uint64_t)i << 32;
     return 1;
 }
 static inline int boot_nvn_slot_new(uint64_t *shadow) { uint32_t gen; return boot_nvn_slot_new_gen(shadow, &gen); }
-/* Store lock held. 1: a submission still reads it (only marked dead; freed by its unpin), 0: released. */
+/* rerecord-work (TOTK_RERECORD_VERSION, see boot_nvn_rerecord_version_on): the versions held, i.e. recordings released while
+ * a submission reads them (dead and pinned, freed at its unpin), and the bytes each submission pinned (its reached set,
+ * boot_nvn_unpin_all). Written under the store lock; n and bytes are also read without it (boot_nvn_rv_decide). */
+static struct { uint64_t n, bytes, peak_n, peak_bytes, reach_bytes, reach_calls, reach_max; } boot_nvn_ver;
+static inline void boot_nvn_ver_add(BootNvnSlot *t) {   /* store lock held: t becomes a version */
+    AcquireSRWLockShared(&t->lock); uint32_t cap = t->cap; ReleaseSRWLockShared(&t->lock);
+    t->ver_bytes = cap; t->cb_flags |= BOOT_NVN_CB_VER;   /* call-bind: dead no longer means a version (bindings keep dead ones too) */
+    __atomic_store_n(&boot_nvn_ver.n, boot_nvn_ver.n + 1, __ATOMIC_RELAXED); __atomic_store_n(&boot_nvn_ver.bytes, boot_nvn_ver.bytes + cap, __ATOMIC_RELAXED);
+    if (boot_nvn_ver.n > boot_nvn_ver.peak_n) boot_nvn_ver.peak_n = boot_nvn_ver.n;
+    if (boot_nvn_ver.bytes > boot_nvn_ver.peak_bytes) boot_nvn_ver.peak_bytes = boot_nvn_ver.bytes;
+}
+static inline void boot_nvn_ev_forget_locked(BootNvnSlot *t, uint32_t i);   /* rec-evict: out of the overwrite index, dry-run marks dropped */
+/* ---------------------------------------------------------------- call-bind: CallCommands bound at record time (play-work/call-bind)
+ * NVN copies a callee's control entries (GPU pointers to its commands) into the caller when the caller records CallCommands
+ * (sdk+0x44561c walks them), so the console plays the callee as it was then. The executor resolved each called handle at the
+ * submit instead, through the handle map: a callee recorded again under the same handle between the caller's CallCommands and its
+ * submit was played in its NEW version under the caller's old state (the stage-0 trace: 12,854 such reaches in 2,622 presents; a
+ * per-mesh bind list re-recorded with new vertex buffers then drawn with the caller's old index count and base vertex is a candidate
+ * for the island "vertex explosions"). TOTK_CALL_BIND_AT_RECORD (default 1; read once, then switchable live, see
+ * boot_nvn_cb_present):
+ *   1  each CallCommands record also names the version (slot | generation) its handles had when it was recorded (record block
+ *      BOOT_NVN_CB_ARG, and its index entries); the version gets one binding per naming record, and a version re-recorded or released
+ *      while bound stays (dead) until its last binding goes: a binding goes with the record's recording (freed, re-recorded, released
+ *      by rec-evict), so callers holding old versions keep only what live callers name (TOTK_CALL_BIND_MB, default 256: over it new
+ *      calls are not bound and run as before). The submit walk pins and walks a bound version that is not the handle's current one,
+ *      and the translation plays it (boot_nvn_cb_target).
+ *   2  watch: bound the same way, but the translation plays today's live version; every call whose bound and live versions differ is
+ *      counted and logged (host_nvn_play.h boot_nvn_cb_watch: present, QPC, caller, callee, and for the first 4 per second the
+ *      vertex buffers, strides and the caller's next draw of both versions).
+ *   0  as before: nothing bound; bindings made in 1 / 2 are released when switching to 0, and a record's bound versions are ignored.
+ * A bound version rec-evict's class 1 released (its command memory written over: invalid in NVN too) is never played: its buffer goes
+ * at once (the slot stays as a marker until its last binding goes) and the call falls back to the handle, counted ("released by
+ * class 1"); a version no longer there for another reason (bindings dropped by a switch to 0) falls back the same way ("gone").
+ * Bookkeeping, all under the store lock: cb_refs (bindings), cb_flags (BOOT_NVN_CB_VER: counted as a re-record version, _HELD:
+ * counted as held by callers, _INVALID: released by class 1, _STRIPPED: its buffer is gone), cb_bytes (bytes counted while held). */
+#define BOOT_NVN_CB_ARG 0x42u   /* record block arg: the versions bound to block 0's handles (arg 2), one u64 each (0: none) */
+static volatile LONG boot_nvn_cb_mode_v = -1;   /* -1: not read yet */
+static struct {
+    uint64_t held_n, held_bytes, held_peak_n, held_peak_bytes, tombs, refs, unref_bad, reap_lost, inplace;   /* store lock (the log reads them without it) */
+    uint32_t *reap, reap_n, reap_cap; int reaping;                                                  /* store lock */
+    volatile LONG64 calls, binds, unbound_rec, budget_skip, bind_lost, ex_same, ex_diverged, ex_unbound, ex_gone, ex_invalid, ex_inplace, ex_off;
+    volatile LONG64 switches, released_by_switch, watch_events, watch_logged, watch_diffs, watch_over;
+    volatile LONG logged_fb;
+} boot_nvn_cb;
+static inline int boot_nvn_cb_mode(void) {
+    LONG v = boot_nvn_cb_mode_v;
+    if (v < 0) {
+        char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_CALL_BIND_AT_RECORD", s, sizeof s);
+        InterlockedCompareExchange(&boot_nvn_cb_mode_v, k && k < sizeof s && s[0] >= '0' && s[0] <= '2' ? s[0] - '0' : 1, -1);
+        v = boot_nvn_cb_mode_v;
+    }
+    return (int)v;
+}
+static inline uint64_t boot_nvn_cb_budget(void) {   /* bytes of versions held by callers beyond which new calls are not bound */
+    static int64_t v = -1;
+    if (v < 0) {
+        char s[16]; DWORD k = GetEnvironmentVariableA("TOTK_CALL_BIND_MB", s, sizeof s); uint64_t mb = 256;
+        if (k && k < sizeof s) { mb = 0; for (DWORD i = 0; i < k && s[i] >= '0' && s[i] <= '9' && mb < 65536; ++i) mb = mb * 10 + (uint64_t)(s[i] - '0'); }
+        v = (int64_t)((mb > 65536 ? 65536 : mb) << 20);
+    }
+    return (uint64_t)v;
+}
+static inline void boot_nvn_cb_hold_locked(BootNvnSlot *t) {   /* dead, kept by bindings only */
+    if (t->cb_flags & BOOT_NVN_CB_HELD) return;
+    t->cb_flags |= BOOT_NVN_CB_HELD; t->cb_bytes = t->cap;
+    ++boot_nvn_cb.held_n; boot_nvn_cb.held_bytes += t->cap;
+    if (boot_nvn_cb.held_n > boot_nvn_cb.held_peak_n) boot_nvn_cb.held_peak_n = boot_nvn_cb.held_n;
+    if (boot_nvn_cb.held_bytes > boot_nvn_cb.held_peak_bytes) boot_nvn_cb.held_peak_bytes = boot_nvn_cb.held_bytes;
+}
+static inline void boot_nvn_cb_unhold_locked(BootNvnSlot *t) {
+    if (!(t->cb_flags & BOOT_NVN_CB_HELD)) return;
+    t->cb_flags &= (uint8_t)~BOOT_NVN_CB_HELD; --boot_nvn_cb.held_n; boot_nvn_cb.held_bytes -= t->cb_bytes; t->cb_bytes = 0;
+}
+/* One binding to version b goes; a dead version without bindings or pins is queued for boot_nvn_cb_drain_locked. */
+static inline void boot_nvn_cb_unref_locked(BootNvnShadowStore *s, uint64_t b) {
+    const uint32_t j = boot_nvn_slot_of(b); BootNvnSlot *u = j < s->count ? boot_nvn_slot_at(s, j) : NULL;
+    if (!u || u->gen != (uint32_t)b || !u->cb_refs) { ++boot_nvn_cb.unref_bad; return; }   /* must stay 0 (the harness checks) */
+    --u->cb_refs; --boot_nvn_cb.refs;
+    if (u->cb_refs || !u->dead || u->pins) return;
+    if (boot_nvn_cb.reap_n == boot_nvn_cb.reap_cap) {
+        uint32_t cap = boot_nvn_cb.reap_cap ? boot_nvn_cb.reap_cap * 2 : 256, *x = (uint32_t *)realloc(boot_nvn_cb.reap, (size_t)cap * sizeof *x);
+        if (!x) { ++boot_nvn_cb.reap_lost; return; }   /* out of host memory: that version stays (dead) */
+        boot_nvn_cb.reap = x; boot_nvn_cb.reap_cap = cap;
+    }
+    boot_nvn_cb.reap[boot_nvn_cb.reap_n++] = j;
+}
+static inline void boot_nvn_cb_drop_bindings_locked(BootNvnShadowStore *s, BootNvnSlot *t) {   /* t's slot lock held too: its CallCommands' bindings go */
+    for (uint32_t k = 0; k < t->dref_n; ++k)   /* storelock-work: with TOTK_STORE_LOCK_V2 queued, dropped after the section (boot_nvn_sl_flush) */
+        if (t->dref[k].count == UINT32_MAX && t->dref[k].bound) { if (!boot_nvn_sl_defer(t->dref[k].bound)) boot_nvn_cb_unref_locked(s, t->dref[k].bound); t->dref[k].bound = 0; }
+}
+static inline int boot_nvn_slot_free_locked(BootNvnShadowStore *s, uint32_t i);
+static inline void boot_nvn_cb_drain_locked(BootNvnShadowStore *s) {   /* the versions whose last binding went are freed (their own bindings in turn) */
+    if (boot_nvn_cb.reaping) return;
+    boot_nvn_cb.reaping = 1;
+    while (boot_nvn_cb.reap_n) {
+        const uint32_t j = boot_nvn_cb.reap[--boot_nvn_cb.reap_n]; BootNvnSlot *u = boot_nvn_slot_at(s, j);
+        if (u->dead && !u->pins && !u->cb_refs) boot_nvn_slot_free_locked(s, j);
+    }
+    boot_nvn_cb.reaping = 0;
+}
+/* Class 1 released a version callers still name: it is never played again, so its buffer and index go now; the slot stays (a marker
+ * the callers' bindings name) until the last binding goes. */
+static inline void boot_nvn_cb_strip_locked(BootNvnShadowStore *s, BootNvnSlot *t) {
+    boot_nvn_cb_unhold_locked(t);
+    AcquireSRWLockExclusive(&t->lock);
+    boot_nvn_cb_drop_bindings_locked(s, t);
+    InterlockedExchangeAdd64(&s->bytes, -(LONG64)t->cap); if (!boot_nvn_rbuf_put(t->data, t->cap)) free(t->data);
+    t->data = NULL; t->cap = 0; t->len = 0; t->closed = 0;
+    free(t->dref); t->dref = NULL; t->dref_cap = 0; t->dref_n = 0;
+    ReleaseSRWLockExclusive(&t->lock);
+    t->cb_flags |= BOOT_NVN_CB_STRIPPED; ++boot_nvn_cb.tombs;
+}
+/* Store lock held. 1: a submission still reads it (only marked dead; freed by its unpin), 0: released, or (call-bind) kept dead while
+ * a live caller's CallCommands is bound to it (freed at its last binding; a version class 1 released keeps only its marker). */
 static inline int boot_nvn_slot_free_locked(BootNvnShadowStore *s, uint32_t i) {
     BootNvnSlot *t = boot_nvn_slot_at(s, i);
-    if (t->pins) { t->dead = 1; return 1; }   /* a submission is still reading it: freed by its unpin */
+    boot_nvn_ev_forget_locked(t, i);   /* rec-evict: every release and every marking dead passes here, after its handle is gone */
+    if (t->pins) {   /* a submission is still reading it: freed by its unpin */
+        if (!t->dead) boot_nvn_ver_add(t);
+        t->dead = 1; if (t->cb_refs) boot_nvn_cb_hold_locked(t);
+        return 1;
+    }
+    if (t->cb_flags & BOOT_NVN_CB_VER) {   /* rerecord-work: a version goes (its last unpin) */
+        __atomic_store_n(&boot_nvn_ver.n, boot_nvn_ver.n - 1, __ATOMIC_RELAXED); __atomic_store_n(&boot_nvn_ver.bytes, boot_nvn_ver.bytes - t->ver_bytes, __ATOMIC_RELAXED); t->ver_bytes = 0;
+        t->cb_flags &= (uint8_t)~BOOT_NVN_CB_VER;
+    }
+    if (t->cb_refs) {   /* call-bind: bound by a live caller's CallCommands: kept (dead) until its last binding goes */
+        t->dead = 1; boot_nvn_cb_hold_locked(t);
+        if ((t->cb_flags & (BOOT_NVN_CB_INVALID | BOOT_NVN_CB_STRIPPED)) == BOOT_NVN_CB_INVALID) { boot_nvn_cb_strip_locked(s, t); boot_nvn_cb_drain_locked(s); }
+        return 0;
+    }
+    boot_nvn_cb_unhold_locked(t);
+    if (t->cb_flags & BOOT_NVN_CB_STRIPPED) --boot_nvn_cb.tombs;
+    t->cb_flags = 0;
     t->dead = 0;
     AcquireSRWLockExclusive(&t->lock);
+    boot_nvn_cb_drop_bindings_locked(s, t);   /* call-bind: its own CallCommands' bindings go with it */
     if (boot_nvn_reclock_on() && t->data && t->cap <= BOOT_NVN_SLOT_KEEP_CAP && s->kept + t->cap <= BOOT_NVN_SLOT_KEEP_TOTAL) s->kept += t->cap;   /* for the next recording here */
     else { InterlockedExchangeAdd64(&s->bytes, -(LONG64)t->cap); if (!boot_nvn_rbuf_put(t->data, t->cap)) free(t->data); t->data = NULL; t->cap = 0; }   /* recfast: pooled */
     t->len = 0; t->token = 0; t->closed = 0;
@@ -325,15 +550,57 @@ static inline int boot_nvn_slot_free_locked(BootNvnShadowStore *s, uint32_t i) {
     t->next_free = s->free_head;
     ReleaseSRWLockExclusive(&t->lock);
     s->free_head = i; --s->live;
+    boot_nvn_cb_drain_locked(s);   /* call-bind: versions only it still bound */
     return 0;
 }
 /* 1 when a submission was reading the recording (batch-a: re-recorded under a submit call), 0 otherwise. */
 static inline int boot_nvn_slot_free(uint64_t shadow) {
     BootNvnShadowStore *s = boot_nvn_shadow(); uint32_t i = boot_nvn_slot_of(shadow); int pinned = 0;
-    boot_nvn_rl_lock(&s->lock, BOOT_NVN_RL_STORE);
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_FREE, 0);
     if (i < s->count && boot_nvn_slot_at(s, i)->next_free == UINT32_MAX && !boot_nvn_slot_at(s, i)->dead) pinned = boot_nvn_slot_free_locked(s, i);
-    ReleaseSRWLockExclusive(&s->lock);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_FREE, 0, sl);   /* (v2: then its bindings) */
     return pinned;
+}
+/* storelock-work (TOTK_STORE_LOCK_V2): the binding drops this thread's releases queued (boot_nvn_cb_drop_bindings_locked), under the
+ * shared lock: one atomic decrement each (a binding keeps its version, so its generation is stable; another thread may drop or add
+ * bindings of the same version at the same time). A version left dead, unbound and unpinned is freed under the exclusive lock if it is
+ * still that generation and still so (t2's unpin or another thread's drop may have freed it meanwhile; a dead version is pinned again
+ * only by t2's boot_nvn_cb_pin, whose unpin then frees it), as boot_nvn_cb_drain_locked frees it; those frees queue their own
+ * bindings: repeated until none is left. Called by boot_nvn_sl_unlock with no store, slot, map or ev lock held (the walk lock may be). */
+static inline void boot_nvn_sl_flush(void) {
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    boot_nvn_sld.flushing = 1;
+    while (boot_nvn_sld.n) {
+        uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_DROP, 1), dropped = 0;
+        for (uint32_t k = 0; k < boot_nvn_sld.n; ++k) {
+            const uint64_t b = boot_nvn_sld.b[k]; const uint32_t j = boot_nvn_slot_of(b);
+            BootNvnSlot *u = j < s->count ? boot_nvn_slot_at(s, j) : NULL;
+            uint32_t r = u && u->gen == (uint32_t)b ? __atomic_load_n(&u->cb_refs, __ATOMIC_RELAXED) : 0;
+            while (r && !__atomic_compare_exchange_n(&u->cb_refs, &r, r - 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+            if (!r) { __atomic_add_fetch(&boot_nvn_cb.unref_bad, 1, __ATOMIC_RELAXED); continue; }   /* must stay 0, as in boot_nvn_cb_unref_locked */
+            ++dropped;
+            if (r > 1 || !u->dead || __atomic_load_n(&u->pins, __ATOMIC_RELAXED)) continue;
+            if (boot_nvn_sld.rn == boot_nvn_sld.rcap) {
+                uint32_t cap = boot_nvn_sld.rcap ? boot_nvn_sld.rcap * 2 : 64; uint64_t *x = (uint64_t *)realloc(boot_nvn_sld.r, (size_t)cap * sizeof *x);
+                if (!x) { __atomic_add_fetch(&boot_nvn_cb.reap_lost, 1, __ATOMIC_RELAXED); continue; }   /* out of host memory: that version stays (dead) */
+                boot_nvn_sld.r = x; boot_nvn_sld.rcap = cap;
+            }
+            boot_nvn_sld.r[boot_nvn_sld.rn++] = b;
+        }
+        __atomic_sub_fetch(&boot_nvn_cb.refs, dropped, __ATOMIC_RELAXED);
+        InterlockedExchangeAdd64(&boot_nvn_sl_stats.deferred, (LONG64)boot_nvn_sld.n);
+        boot_nvn_sld.n = 0;
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_DROP, 1, sl);
+        if (!boot_nvn_sld.rn) break;
+        sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_DROP_FREE, 0);
+        for (uint32_t k = 0; k < boot_nvn_sld.rn; ++k) {
+            const uint64_t b = boot_nvn_sld.r[k]; const uint32_t j = boot_nvn_slot_of(b); BootNvnSlot *u = boot_nvn_slot_at(s, j);
+            if (u->gen == (uint32_t)b && u->dead && !u->pins && !u->cb_refs) { boot_nvn_slot_free_locked(s, j); InterlockedIncrement64(&boot_nvn_sl_stats.drop_frees); }
+        }
+        boot_nvn_sld.rn = 0;
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_DROP_FREE, 0, sl);   /* (flushing: the loop takes the bindings these frees queued) */
+    }
+    boot_nvn_sld.flushing = 0;
 }
 /* recfast, slot lock held, pool on: t's buffer replaced by one of capacity cap (a class capacity) or of the next class,
  * holding t's t->len record bytes, as realloc would; the old buffer goes to the pool (or is freed). 0: out of host
@@ -388,7 +655,8 @@ static inline uint32_t boot_nvn_slot_fit(uint64_t shadow) {
  * dref: the flashfix index entries of this record (boot_nvn_dsnap_dref), added in the same step.
  * Returns 1 appended (the generation in *gen_out), 0 out of host memory (logged), -1 not that open recording. */
 typedef struct BootNvnPart { const void *p; uint32_t n; } BootNvnPart;
-typedef struct BootNvnDrefAdd { uint32_t count, n; const uint64_t *ptr; } BootNvnDrefAdd;   /* n entries {record offset, count, ptr[k]} */
+typedef struct BootNvnDrefAdd { uint32_t count, n; const uint64_t *ptr, *bound; uint32_t *lost; } BootNvnDrefAdd;   /* n entries {record offset, count, ptr[k]
+                                                                                                                * (, bound[k]: call-bind)}; *lost set when they are not stored */
 static inline void boot_nvn_dsnap_lost(void);
 static inline void boot_nvn_slot_dref_locked(BootNvnSlot *t, uint32_t off, const BootNvnDrefAdd *d) {   /* slot lock held */
     if (t->dref_n + (uint64_t)d->n > t->dref_cap) {
@@ -397,8 +665,10 @@ static inline void boot_nvn_slot_dref_locked(BootNvnSlot *t, uint32_t off, const
         if (x) { t->dref = x; t->dref_cap = (uint32_t)cap; }
     }
     if (t->dref_n + (uint64_t)d->n <= t->dref_cap)
-        for (uint32_t k = 0; k < d->n; ++k) { t->dref[t->dref_n].off = off; t->dref[t->dref_n].count = d->count; t->dref[t->dref_n].ptr = d->ptr[k]; ++t->dref_n; }
-    else boot_nvn_dsnap_lost();
+        for (uint32_t k = 0; k < d->n; ++k) {
+            t->dref[t->dref_n].off = off; t->dref[t->dref_n].count = d->count; t->dref[t->dref_n].ptr = d->ptr[k]; t->dref[t->dref_n].bound = d->bound ? d->bound[k] : 0; ++t->dref_n;
+        }
+    else { boot_nvn_dsnap_lost(); if (d->lost) *d->lost = 1; }
 }
 static inline int boot_nvn_slot_append(uint64_t shadow, uint32_t gen, const BootNvnPart *part, unsigned parts, int close, uint32_t *gen_out, const BootNvnDrefAdd *dref) {
     BootNvnShadowStore *s = boot_nvn_shadow(); BootNvnSlot *t = boot_nvn_slot_peek(s, boot_nvn_slot_of(shadow));
@@ -514,6 +784,71 @@ static inline int boot_nvn_rerecord_wait_on(void) {
     static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_RERECORD_WAIT", s, sizeof s); v = k && k < sizeof s ? s[0] != '0' : boot_mt_overlap_on(); }
     return v;
 }
+/* rerecord-work (play-work/rerecord-work: ours.md, nxport.md, test/): TOTK_RERECORD_VERSION (on unless =0; =0: the wait
+ * above exactly as before). The rationale above does not hold here: a re-record never writes the recording a submission
+ * reads. BeginRecording always takes a fresh slot, EndRecording's return points the handle at it, and the older slot, which
+ * the call pinned, is only marked dead: closed (nothing is appended to it again), on no free list, never regrown, moved or
+ * freed until the call's boot_nvn_unpin_all. It stays an immutable version of the recording as the call found it: the model
+ * of nxport (MIT; crates/engine/src/nvn/api.rs: an Arc<RecordedCommandList> per EndRecording, walk_command_lists clones the
+ * Arcs a submit reaches) and of SMW's shared_ptr lists, neither of which waits. Which version the translation reads is
+ * decided by the handle -> recording resolution, and the submit freeze (TOTK_SUBMIT_FREEZE) keeps the call's own resolution
+ * for every handle its walk reached. So the wait was timing only: it held t0/t47/t48 (their per-thread command buffers are
+ * re-recorded 2-4 ms into every call) for the rest of the 25-40 ms call, 17.8 ms per frame in play-96 (7091 waits, 115 s
+ * of 317 s), serialising the game with the translation again.
+ * With the switch on, a thread whose re-record replaced a recording the running call reads keeps the old one as a version
+ * and goes on when the call vouches for it (boot_nvn_rv_decide), i.e. all of:
+ *   1. the call's walk has ended and covered the whole submission: freeze on, every submitted handle read (at most 4096),
+ *      none missing from the map, no freeze entry or recording index entry lost (boot_nvn_dsnap_take, boot_nvn_rv_publish);
+ *   2. the old recording was reached by this call's walk: its slot carries the call's snapshot stamp (set under the slot lock
+ *      by the walk), so its handle is in the freeze table and the translation resolves it to that slot;
+ *   3. the translation has not met a handle the walk missed (boot_nvn_freeze_resolve: such a handle takes the live map, so
+ *      from then on the call's re-records wait as before);
+ *   4. the versions held (all dead, pinned recordings) stay within TOTK_RERECORD_VERSION_MB (default 64; 0: every re-record
+ *      waits): over it the thread waits as before, which also stops it from adding more.
+ * Otherwise it waits as before (counted by reason). Why a submission still reads only what it found at its call (play-88):
+ * the translation reads records (a) at a shadow address of a slot this thread pinned (boot_nvn_pin_find: its bytes cannot
+ * change until boot_nvn_unpin_all), or (b) through a handle, which the freeze resolves to the slot the walk pinned (1, 2), or
+ * the live map for a handle the walk missed, after which nothing is waived (3); the NVN_PAR helpers decode frozen handles
+ * only. A re-record only adds a slot and moves the map entry: it changes neither (a) nor the freeze table.
+ * Memory: a version lives until the end of the call that pinned it, so the versions are part of that call's reached set
+ * ("reached per call" below) and, past the budget, at most one more per recording thread before it waits.
+ * TOTK_SNAP_ATOMIC (default: as TOTK_RERECORD_VERSION; =0 off): the walk (boot_nvn_dsnap_take, about 0.5 ms) holds
+ * boot_nvn_walk_lock exclusively and EndRecording's return holds it shared around its map change and release
+ * (boot_nvn_handle_install), so the walk sees the map at one instant, as nxport's walk under the COMMAND_LISTS lock does: a
+ * recording ended during the walk is installed after it, so the call reads the version that was current when the walk began
+ * (not the next frame's when the walk had not reached it yet), and that re-record is then covered (no wait for the call).
+ * Every 300 presents (boot_nvn_queue_present) a "re-record versions" draw-path.log line, written with the switch off too
+ * (counters only, the A/B baseline): re-records in calls, kept as versions, waits by reason and their ms, versions and bytes
+ * held (now, peak), bytes each call pinned (its reached set), walk-lock waits, and alarms (a call that kept a version and
+ * then met a handle its walk missed; must stay 0). */
+static inline int boot_nvn_rerecord_version_on(void) {
+    static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_RERECORD_VERSION", s, sizeof s); v = !(k && k < sizeof s && s[0] == '0'); }
+    return v;
+}
+static inline uint64_t boot_nvn_rerecord_budget(void) {   /* bytes of versions held beyond which a re-record waits again */
+    static int64_t v = -1;
+    if (v < 0) {
+        char s[16]; DWORD k = GetEnvironmentVariableA("TOTK_RERECORD_VERSION_MB", s, sizeof s); uint64_t mb = 64;
+        if (k && k < sizeof s) { mb = 0; for (DWORD i = 0; i < k && s[i] >= '0' && s[i] <= '9' && mb < 65536; ++i) mb = mb * 10 + (uint64_t)(s[i] - '0'); }
+        if (mb > 65536) mb = 65536;
+        v = (int64_t)(mb << 20);
+    }
+    return (uint64_t)v;
+}
+static inline int boot_nvn_snap_atomic_on(void) {
+    static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_SNAP_ATOMIC", s, sizeof s); v = k && k < sizeof s ? s[0] != '0' : boot_nvn_rerecord_version_on(); }
+    return v;
+}
+static SRWLOCK boot_nvn_walk_lock = SRWLOCK_INIT;   /* lock order: before the store, slot and map locks */
+/* A re-record in a call: kept as a version (no wait), or why it still waits. */
+enum { BOOT_NVN_RV_KEPT, BOOT_NVN_RV_OFF, BOOT_NVN_RV_UNCOVERED, BOOT_NVN_RV_UNREACHED, BOOT_NVN_RV_MISSED, BOOT_NVN_RV_BUDGET, BOOT_NVN_RV_N };
+static struct {
+    uint32_t cover;          /* under boot_nvn_sub.lock: the running call's snapshot stamp once its walk vouches for it, else 0 */
+    volatile LONG missed;    /* the running call's translation met a handle its walk had not reached */
+    uint64_t unknown0;       /* t2: boot_nvn_dsnap.fz_unknown when the walk ended */
+    volatile LONG64 n[BOOT_NVN_RV_N], kept_call, alarms, walk_waits, walk_wait_qpc;
+} boot_nvn_rv;
+static inline void boot_nvn_rv_publish(void);   /* at the end of the walk, before its lock goes (boot_nvn_dsnap_take) */
 /* batch-a: TOTK_FRAME_TRACE=1 (diagnostic, off by default): frame-trace.log (cwd), one block per nvnQueueSubmitCommands
  * (boot_nvn_ftrace_write): the submitted handles (recording thread, bytes, EndRecording time against the call), what the
  * call's walk reached, how the translation resolved handles (frozen, moved since the call, not reached), the deferred
@@ -549,6 +884,7 @@ static struct {
     /* batch-a freeze: handle -> recording as resolved at the call (fz_hash valid where fz_hstamp == stamp), the call's
      * top-level handle values, the submitting host thread; fz_on: the freeze applies to this call */
     BootNvnFzEnt *fz; uint32_t fz_n, fz_cap; uint32_t *fz_hash, *fz_hstamp, fz_hcap; uint64_t *top; uint32_t top_n, top_cap; DWORD tid; int fz_on;
+    int covered;   /* rerecord-work: this call's walk covered the whole submission (boot_nvn_dsnap_take) */
     /* batch-a cumulative: handles resolved at the call, of them not in the map then, translation lookups answered from
      * the freeze, of them where the live map had moved on (re-recorded since the call), handles the translation reached
      * that the call did not (live map), freeze entries lost (out of memory) */
@@ -570,7 +906,7 @@ static inline unsigned boot_nvn_dsnap_dref(int op, const BootNvnRecord *r, uint6
     static int deferred = -2, call = -2;
     if (deferred == -2) deferred = boot_nvn_name_index("nvnCommandBufferBindTexturesDeferred");
     if (call == -2) call = boot_nvn_name_index("nvnCommandBufferCallCommands");
-    d->count = 0; d->n = 0; d->ptr = h;
+    d->count = 0; d->n = 0; d->ptr = h; d->bound = NULL; d->lost = NULL;
     if (op == deferred) { h[0] = r->x[4]; d->count = (uint32_t)r->x[3]; d->n = 1; }
     else if (op == call && r->blocks && r->block[0].arg == 2 && r->block[0].bytes >= 8) {
         uint32_t n = r->block[0].bytes / 8 < 64 ? r->block[0].bytes / 8 : 64;
@@ -676,23 +1012,26 @@ static inline int boot_nvn_pin_add(uint32_t i, const uint8_t *data, uint32_t len
     boot_nvn_pins.last = boot_nvn_pins.n++;
     return 1;
 }
+/* rec-evict (defined before boot_nvn_handles_release_range): the submit walk's notes (last use, released handles met) */
+static inline void boot_nvn_ev_reach(BootNvnSlot *t, uint32_t i, uint32_t depth);
+static inline void boot_nvn_ev_missing(uint64_t handle, uint32_t depth);
 static inline uint64_t boot_nvn_handle_pin(uint64_t handle) {
-    BootNvnShadowStore *s = boot_nvn_shadow(); const int fast = boot_nvn_reclock_on();
+    BootNvnShadowStore *s = boot_nvn_shadow(); const int fast = boot_nvn_reclock_on(), v2 = boot_nvn_slv2_on();
     for (unsigned tries = 0; tries < 64; ++tries) {
         uint64_t shadow = boot_nvn_hmap_get(boot_nvn_handles(), handle); if (!shadow) return 0;
         uint32_t i = boot_nvn_slot_of(shadow); int ok = 0, again = 0;
         if (fast && boot_nvn_pin_find(i)) { ++boot_nvn_rl()->n[BOOT_NVN_RL_PIN_REPEATS]; return shadow; }   /* already pinned by this submission */
-        boot_nvn_rl_lock(&s->lock, BOOT_NVN_RL_STORE);
+        const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_PIN, v2);   /* storelock-work: shared with v2 (frees are exclusive), the pin atomic */
         if (boot_nvn_hmap_get(boot_nvn_handles(), handle) != shadow) again = 1;   /* replaced meanwhile: take the newer one */
         else if (i < s->count && boot_nvn_slot_at(s, i)->next_free == UINT32_MAX && !boot_nvn_slot_at(s, i)->dead) {
             BootNvnSlot *t = boot_nvn_slot_at(s, i);
             if (!fast && boot_nvn_pin_find(i)) ok = 1;   /* TOTK_RECLOCK=0: already pinned, asked under the lock as before */
             else {
                 AcquireSRWLockShared(&t->lock); const uint8_t *data = t->data; uint32_t len = t->len; ReleaseSRWLockShared(&t->lock);
-                if (boot_nvn_pin_add(i, data, len)) { ++t->pins; ok = 1; ++boot_nvn_rl()->n[BOOT_NVN_RL_PINS]; }
+                if (boot_nvn_pin_add(i, data, len)) { if (v2) __atomic_add_fetch(&t->pins, 1, __ATOMIC_RELAXED); else ++t->pins; ok = 1; ++boot_nvn_rl()->n[BOOT_NVN_RL_PINS]; }
             }
         }
-        ReleaseSRWLockExclusive(&s->lock);
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_PIN, v2, sl);
         if (ok) return shadow;
         if (!again) return 0;
     }
@@ -700,30 +1039,82 @@ static inline uint64_t boot_nvn_handle_pin(uint64_t handle) {
 }
 static inline void boot_nvn_unpin_all(void) {
     if (!boot_nvn_pins.n) return;
-    BootNvnShadowStore *s = boot_nvn_shadow();
-    boot_nvn_rl_lock(&s->lock, BOOT_NVN_RL_STORE);
+    BootNvnShadowStore *s = boot_nvn_shadow(); uint64_t reach = 0;
+    if (boot_nvn_slv2_on()) {   /* storelock-work: the pins go under the shared lock; the slots left dead and unpinned are freed after it */
+        BootNvnPin *pin = boot_nvn_pins.pin; uint32_t nf = 0;   /* entries 0..nf-1 reused for those: slot, generation (nf <= k: entry k is read first) */
+        uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_UNPIN, 1);
+        for (uint32_t k = 0; k < boot_nvn_pins.n; ++k) {
+            const uint32_t i = pin[k].slot; BootNvnSlot *t = boot_nvn_slot_at(s, i);
+            boot_nvn_pins.hash[pin[k].hpos] = 0; reach += pin[k].len;
+            if (__atomic_load_n(&t->pins, __ATOMIC_RELAXED) && !__atomic_sub_fetch(&t->pins, 1, __ATOMIC_RELAXED) && t->dead) { pin[nf].slot = i; pin[nf].len = t->gen; ++nf; }
+        }
+        __atomic_add_fetch(&boot_nvn_ver.reach_bytes, reach, __ATOMIC_RELAXED); __atomic_add_fetch(&boot_nvn_ver.reach_calls, 1, __ATOMIC_RELAXED);   /* rerecord-work */
+        for (uint64_t m = __atomic_load_n(&boot_nvn_ver.reach_max, __ATOMIC_RELAXED); reach > m && !__atomic_compare_exchange_n(&boot_nvn_ver.reach_max, &m, reach, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_UNPIN, 1, sl);
+        boot_nvn_pins.n = 0; boot_nvn_pins.last = 0;
+        if (!nf) return;
+        sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_UNPIN_FREE, 0);
+        for (uint32_t k = 0; k < nf; ++k) {   /* still that generation, dead and unpinned (another thread's binding drop may have freed it) */
+            BootNvnSlot *t = boot_nvn_slot_at(s, pin[k].slot);
+            if (t->gen == pin[k].len && t->dead && !t->pins) boot_nvn_slot_free_locked(s, pin[k].slot);
+        }
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_UNPIN_FREE, 0, sl);
+        return;
+    }
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_UNPIN, 0);
     for (uint32_t k = 0; k < boot_nvn_pins.n; ++k) {
         uint32_t i = boot_nvn_pins.pin[k].slot; BootNvnSlot *t = boot_nvn_slot_at(s, i);
         if (t->pins && !--t->pins && t->dead) boot_nvn_slot_free_locked(s, i);
-        boot_nvn_pins.hash[boot_nvn_pins.pin[k].hpos] = 0;
+        boot_nvn_pins.hash[boot_nvn_pins.pin[k].hpos] = 0; reach += boot_nvn_pins.pin[k].len;
     }
     boot_nvn_pins.n = 0; boot_nvn_pins.last = 0;
-    ReleaseSRWLockExclusive(&s->lock);
+    boot_nvn_ver.reach_bytes += reach; ++boot_nvn_ver.reach_calls; if (reach > boot_nvn_ver.reach_max) boot_nvn_ver.reach_max = reach;   /* rerecord-work */
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_UNPIN, 0, sl);
+}
+/* call-bind: the version b (slot | generation, as a CallCommands record names it) pinned for this submission like a resolved handle
+ * (boot_nvn_handle_pin), dead versions included: its shadow address, 0 when it is no longer that version or class 1 released it. */
+static inline uint64_t boot_nvn_cb_pin(uint64_t b) {
+    BootNvnShadowStore *s = boot_nvn_shadow(); const uint32_t i = boot_nvn_slot_of(b), gen = (uint32_t)b; const uint64_t sh = b & ~UINT64_C(0xffffffff);
+    const int fast = boot_nvn_reclock_on(), v2 = boot_nvn_slv2_on(); int ok = 0;
+    if (!b || !(b & BOOT_NVN_SHADOW)) return 0;
+    if (fast && boot_nvn_pin_find(i)) { const BootNvnSlot *t = boot_nvn_slot_peek(s, i); return t && t->gen == gen ? sh : 0; }   /* pinned: its generation cannot change */
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_CBPIN, v2);   /* storelock-work: as boot_nvn_handle_pin */
+    BootNvnSlot *t = i < s->count ? boot_nvn_slot_at(s, i) : NULL;
+    if (t && t->gen == gen && t->next_free == UINT32_MAX && t->closed && t->len && !(t->cb_flags & (BOOT_NVN_CB_INVALID | BOOT_NVN_CB_STRIPPED))) {
+        if (!fast && boot_nvn_pin_find(i)) ok = 1;   /* TOTK_RECLOCK=0: already pinned, asked under the lock */
+        else {
+            AcquireSRWLockShared(&t->lock); const uint8_t *data = t->data; uint32_t len = t->len; ReleaseSRWLockShared(&t->lock);
+            if (boot_nvn_pin_add(i, data, len)) { if (v2) __atomic_add_fetch(&t->pins, 1, __ATOMIC_RELAXED); else ++t->pins; ok = 1; ++boot_nvn_rl()->n[BOOT_NVN_RL_PINS]; }
+        }
+    }
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_CBPIN, v2, sl);
+    return ok ? sh : 0;
 }
 /* reclock counters, appended to the periodic "submit cpu ms total" line (host_nvn_play.h). */
 static inline void boot_nvn_rl_format(char *out, size_t cap) {
     uint64_t n[BOOT_NVN_RL_N] = {0}; double ms[BOOT_NVN_RL_LOCKS]; LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     for (unsigned t = 0; t < 65; ++t) for (unsigned k = 0; k < BOOT_NVN_RL_N; ++k) n[k] += boot_nvn_rl_slots[t].n[k];
     for (unsigned k = 0; k < BOOT_NVN_RL_LOCKS; ++k) ms[k] = f.QuadPart ? (double)boot_nvn_rl_wait_qpc[k] * 1000.0 / (double)f.QuadPart : 0.0;
+    uint64_t rw[3] = {0, 0, 0}, rq[3] = {0, 0, 0};   /* storelock-work: store lock waits by thread role (render, recorders; other = the rest) */
+    for (unsigned t = 0; t < 65; ++t) {
+        const BootNvnRlStats *b = &boot_nvn_rl_slots[t]; const unsigned r = b->sl_role == BOOT_NVN_SL_ROLE_RENDER ? 0 : b->sl_role == BOOT_NVN_SL_ROLE_RECORDER ? 1 : 2;
+        for (unsigned k = 0; k < BOOT_NVN_SL_N; ++k) { rw[r] += b->sl_wait[k]; rq[r] += b->sl_wait_qpc[k]; }
+    }
+    const uint64_t sw = (uint64_t)boot_nvn_rl_waits[BOOT_NVN_RL_STORE], sq = (uint64_t)boot_nvn_rl_wait_qpc[BOOT_NVN_RL_STORE];
+    rw[2] = sw > rw[0] + rw[1] ? sw - rw[0] - rw[1] : 0; rq[2] = sq > rq[0] + rq[1] ? sq - rq[0] - rq[1] : 0;
+    const double qms = f.QuadPart ? 1000.0 / (double)f.QuadPart : 0.0;
     BootNvnShadowStore *s = boot_nvn_shadow();
     snprintf(out, cap, "; record store (reclock %s): records %llu (cached slot %llu), buffer grows %llu, kept buffers reused %llu (%llu KiB kept, %llu KiB in all),"
              " padded blocks %llu, records read %llu (locked fetches %llu), pins %llu (repeats without lock %llu);"
-             " lock waits: store %llu (%.2f ms), recording %llu (%.2f ms), maps %llu (%.2f ms)", boot_nvn_reclock_on() ? "on" : "off",
+             " lock waits: store %llu (%.2f ms) [render %llu (%.2f ms), recorders %llu (%.2f ms), other %llu (%.2f ms); TOTK_STORE_LOCK_V2 %s], recording %llu (%.2f ms), maps %llu (%.2f ms)",
+             boot_nvn_reclock_on() ? "on" : "off",
              (unsigned long long)n[BOOT_NVN_RL_RECORDS], (unsigned long long)n[BOOT_NVN_RL_CACHED], (unsigned long long)n[BOOT_NVN_RL_GROWS],
              (unsigned long long)n[BOOT_NVN_RL_REUSED], (unsigned long long)(s->kept >> 10), (unsigned long long)((uint64_t)s->bytes >> 10),
              (unsigned long long)n[BOOT_NVN_RL_UNALIGNED], (unsigned long long)n[BOOT_NVN_RL_READS], (unsigned long long)n[BOOT_NVN_RL_LOCKED_READS],
              (unsigned long long)n[BOOT_NVN_RL_PINS], (unsigned long long)n[BOOT_NVN_RL_PIN_REPEATS],
-             (unsigned long long)boot_nvn_rl_waits[BOOT_NVN_RL_STORE], ms[BOOT_NVN_RL_STORE], (unsigned long long)boot_nvn_rl_waits[BOOT_NVN_RL_SLOT], ms[BOOT_NVN_RL_SLOT],
+             (unsigned long long)boot_nvn_rl_waits[BOOT_NVN_RL_STORE], ms[BOOT_NVN_RL_STORE], (unsigned long long)rw[0], (double)rq[0] * qms,
+             (unsigned long long)rw[1], (double)rq[1] * qms, (unsigned long long)rw[2], (double)rq[2] * qms, boot_nvn_slv2_on() ? "on" : "off",
+             (unsigned long long)boot_nvn_rl_waits[BOOT_NVN_RL_SLOT], ms[BOOT_NVN_RL_SLOT],
              (unsigned long long)boot_nvn_rl_waits[BOOT_NVN_RL_MAP], ms[BOOT_NVN_RL_MAP]);
     size_t at = strlen(out);   /* recfast */
     if (at < cap) snprintf(out + at, cap - at, "; record pool (%llu MiB, hint %s): %llu KiB pooled, taken %llu, new %llu, pooled %llu, freed (full) %llu,"
@@ -820,11 +1211,45 @@ static inline uint64_t boot_nvn_dsnap_resolve(uint64_t h) {
 static inline uint64_t boot_nvn_freeze_resolve(uint64_t h) {
     if (!boot_nvn_dsnap.active || !boot_nvn_dsnap.fz_on || boot_nvn_dsnap.tid != GetCurrentThreadId()) return 0;
     const BootNvnFzEnt *f = boot_nvn_freeze_find(h);
-    if (!f) { ++boot_nvn_dsnap.fz_unknown; return 0; }
+    if (!f) { ++boot_nvn_dsnap.fz_unknown; if (!boot_nvn_rv.missed) InterlockedExchange(&boot_nvn_rv.missed, 1); return 0; }   /* rerecord-work: no more versions in this call */
     if (!f->shadow) return 0;   /* not in the map at the call (counted as missing there) */
     ++boot_nvn_dsnap.fz_reads;
     if (boot_nvn_hmap_get(boot_nvn_handles(), h) != f->shadow) ++boot_nvn_dsnap.fz_moved;   /* recorded again since the call */
     return f->shadow;
+}
+/* call-bind, the translation of one CallCommands entry (boot_nvn_exec_handle; the submitting thread): handle h, the version b its
+ * caller bound when it recorded it (0: none). *live_sh: the recording h names for this call (the call's frozen resolution, else the
+ * live map; not pinned here), *bound_sh: b pinned (DIVERGED only). */
+enum { BOOT_NVN_CB_R_UNBOUND, BOOT_NVN_CB_R_OFF, BOOT_NVN_CB_R_SAME, BOOT_NVN_CB_R_DIVERGED, BOOT_NVN_CB_R_GONE, BOOT_NVN_CB_R_INVALID, BOOT_NVN_CB_R_INPLACE };
+static inline void boot_nvn_cb_fallback_log(uint64_t h, uint64_t b, unsigned why);
+static inline unsigned boot_nvn_cb_resolve(uint64_t h, uint64_t b, uint64_t *bound_sh, uint64_t *live_sh) {
+    *bound_sh = *live_sh = 0;
+    if (!b) { InterlockedIncrement64(&boot_nvn_cb.ex_unbound); return BOOT_NVN_CB_R_UNBOUND; }
+    if (!boot_nvn_cb_mode()) { InterlockedIncrement64(&boot_nvn_cb.ex_off); return BOOT_NVN_CB_R_OFF; }
+    const BootNvnFzEnt *f = boot_nvn_dsnap.active && boot_nvn_dsnap.fz_on && boot_nvn_dsnap.tid == GetCurrentThreadId() ? boot_nvn_freeze_find(h) : NULL;
+    const uint64_t cur = f ? f->shadow : boot_nvn_hmap_get(boot_nvn_handles(), h);
+    *live_sh = cur;
+    if (cur && boot_nvn_slot_of(cur) == boot_nvn_slot_of(b)) {   /* the same slot: the same version while b's binding holds it (else stale: check) */
+        const BootNvnSlot *t = boot_nvn_slot_peek(boot_nvn_shadow(), boot_nvn_slot_of(cur));
+        if (t && t->gen == (uint32_t)b) { InterlockedIncrement64(&boot_nvn_cb.ex_same); return BOOT_NVN_CB_R_SAME; }
+    }
+    const uint64_t sh = boot_nvn_cb_pin(b);
+    if (!sh) {   /* not playable: class 1 released it, it was recorded again in place (its marker says so), or it is no longer there */
+        const BootNvnSlot *t = boot_nvn_slot_peek(boot_nvn_shadow(), boot_nvn_slot_of(b));
+        const unsigned why = !t || t->gen != (uint32_t)b || !(t->cb_flags & (BOOT_NVN_CB_INVALID | BOOT_NVN_CB_STRIPPED)) ? BOOT_NVN_CB_R_GONE :
+                             (t->cb_flags & BOOT_NVN_CB_INPLACE) ? BOOT_NVN_CB_R_INPLACE : BOOT_NVN_CB_R_INVALID;
+        InterlockedIncrement64(why == BOOT_NVN_CB_R_INVALID ? &boot_nvn_cb.ex_invalid : why == BOOT_NVN_CB_R_INPLACE ? &boot_nvn_cb.ex_inplace : &boot_nvn_cb.ex_gone);
+        boot_nvn_cb_fallback_log(h, b, why);
+        return why;
+    }
+    *bound_sh = sh; InterlockedIncrement64(&boot_nvn_cb.ex_diverged);
+    return BOOT_NVN_CB_R_DIVERGED;
+}
+/* The address the translation plays for that entry: mode 1 the bound version when it is not the handle's current one, otherwise (and
+ * in mode 2, which only watches) the handle, as before. */
+static inline uint64_t boot_nvn_cb_target(uint64_t h, uint64_t b, unsigned *how, uint64_t *bound_sh, uint64_t *live_sh) {
+    const unsigned r = boot_nvn_cb_resolve(h, b, bound_sh, live_sh); *how = r;
+    return r == BOOT_NVN_CB_R_DIVERGED && boot_nvn_cb_mode() == 1 ? *bound_sh : h;
 }
 /* nvnQueueSubmitCommands(queue, count, handles), first thing (renderer lock held): every deferred bind the submitted
  * recordings reach, directly or through CallCommands (8 levels, as the executor), copied now. Each recording reached
@@ -832,7 +1257,7 @@ static inline uint64_t boot_nvn_freeze_resolve(uint64_t h) {
  * batch-a: with the freeze the handle resolutions and the submitted handle values are kept too (see above); the index
  * and stamp of a slot are read under its own lock (reclock), not the store lock. */
 static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t handles, uint64_t count) {
-    boot_nvn_dsnap.active = 0; boot_nvn_dsnap.fz_on = 0; boot_nvn_dsnap.top_n = 0;
+    boot_nvn_dsnap.active = 0; boot_nvn_dsnap.fz_on = 0; boot_nvn_dsnap.top_n = 0; boot_nvn_dsnap.covered = 0;
     boot_nvn_dsnap.ft_latest_end = 0; boot_nvn_dsnap.ft_latest_thread = UINT32_MAX; boot_nvn_dsnap.ft_recent = 0;
     if (!count || !boot_nvn_dsnap_wanted()) return;
     LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
@@ -842,6 +1267,9 @@ static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t h
     const int trace = boot_nvn_ftrace_on(); int top_ok = 1; uint64_t recent = 0;
     if (trace) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); recent = (uint64_t)f.QuadPart / 1000; }   /* frame trace: 1 ms */
     BootNvnShadowStore *s = boot_nvn_shadow();
+    /* rerecord-work: TOTK_SNAP_ATOMIC: no EndRecording changes the handle map during the walk (boot_nvn_handle_install) */
+    const int atomic = boot_nvn_dsnap.fz_on && boot_nvn_snap_atomic_on(); const uint64_t lost0 = boot_nvn_dsnap.fz_lost, missing0 = boot_nvn_dsnap.fz_missing;
+    if (atomic) AcquireSRWLockExclusive(&boot_nvn_walk_lock);
     for (uint64_t k = 0; k < count && k < 4096; ++k) {
         uint64_t h = 0, sh;
         if (boot_nvn_peek(c, self, handles + 8 * k, &h, 8) != 8) { top_ok = 0; continue; }
@@ -850,6 +1278,7 @@ static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t h
             if (top) { boot_nvn_dsnap.top = top; top[boot_nvn_dsnap.top_n++] = h; } else top_ok = 0;
         }
         if (h && (sh = boot_nvn_dsnap_resolve(h)) != 0) boot_nvn_dsnap_push(sh, 0);
+        else if (h) boot_nvn_ev_missing(h, 0);   /* rec-evict: a released handle submitted again? */
     }
     while (boot_nvn_dsnap.wn) {
         BootNvnDsnapWork w = boot_nvn_dsnap.work[--boot_nvn_dsnap.wn];
@@ -857,6 +1286,7 @@ static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t h
         BootNvnSlot *t = boot_nvn_slot_peek(s, i);
         if (!t) continue;
         AcquireSRWLockExclusive(&t->lock);
+        if (t->next_free == UINT32_MAX) boot_nvn_ev_reach(t, i, w.depth);   /* rec-evict: last use, and submitted or called */
         if (t->next_free == UINT32_MAX && t->snap != boot_nvn_dsnap.stamp) {
             t->snap = boot_nvn_dsnap.stamp; ++boot_nvn_dsnap.slots;
             if (trace && t->end_qpc) {   /* frame trace: the newest recording the call reached */
@@ -871,10 +1301,21 @@ static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t h
         for (uint32_t k = 0; k < nr; ++k) {   /* guest reads and pins outside the slot lock */
             const BootNvnDref *d = &boot_nvn_dsnap.refs[k];
             if (d->count != UINT32_MAX) { boot_nvn_dsnap_add(c, self, base + d->off, d->ptr, d->count); continue; }
-            uint64_t sh;
-            if (w.depth < 8 && d->ptr && (sh = boot_nvn_dsnap_resolve(d->ptr)) != 0) boot_nvn_dsnap_push(sh, w.depth + 1);
+            const uint64_t sh = w.depth < 8 && d->ptr ? boot_nvn_dsnap_resolve(d->ptr) : 0;
+            if (sh) boot_nvn_dsnap_push(sh, w.depth + 1);
+            else if (w.depth < 8 && d->ptr) boot_nvn_ev_missing(d->ptr, w.depth + 1);   /* rec-evict: a released handle called again? */
+            if (w.depth < 8 && d->bound && boot_nvn_cb_mode() && (!sh || boot_nvn_slot_of(sh) != boot_nvn_slot_of(d->bound))) {
+                const uint64_t bsh = boot_nvn_cb_pin(d->bound);   /* call-bind: the version the caller bound, re-recorded since: pinned and walked too */
+                if (bsh) boot_nvn_dsnap_push(bsh, w.depth + 1);
+            }
         }
     }
+    /* rerecord-work: the walk reached all the translation can reach and the freeze holds every answer (index_lost: since boot,
+     * a recording whose index lost an entry stays incomplete). Published before the walk lock goes, so a recording ended
+     * during the walk (installed right after it) is covered. */
+    boot_nvn_dsnap.covered = boot_nvn_dsnap.fz_on && top_ok && count <= 4096 && boot_nvn_dsnap.fz_lost == lost0 && boot_nvn_dsnap.fz_missing == missing0 && !boot_nvn_dsnap.index_lost;
+    boot_nvn_rv_publish();
+    if (atomic) ReleaseSRWLockExclusive(&boot_nvn_walk_lock);
     QueryPerformanceCounter(&q1); boot_nvn_dsnap.take_qpc += (uint64_t)(q1.QuadPart - q0.QuadPart);
 }
 /* End of the submit call: the table is no longer current; the pins taken by the snapshot and the translation go. */
@@ -893,20 +1334,61 @@ static struct {
 } boot_nvn_sub;   /* zero: SRWLOCK_INIT / CONDITION_VARIABLE_INIT */
 static inline uint64_t boot_nvn_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (uint64_t)q.QuadPart; }
 static inline uint64_t boot_nvn_qpf(void) { static uint64_t f; if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart > 0 ? (uint64_t)q.QuadPart : 1; } return f; }
+/* rerecord-work: at the end of the walk (t2, inside the call, still holding the walk lock: lock order walk lock, then
+ * boot_nvn_sub.lock): from now on a re-record of a recording this walk reached may be kept as a version
+ * (boot_nvn_rv_decide) when the walk covered the whole submission. */
+static inline void boot_nvn_rv_publish(void) {
+    boot_nvn_rv.unknown0 = boot_nvn_dsnap.fz_unknown; InterlockedExchange64(&boot_nvn_rv.kept_call, 0); InterlockedExchange(&boot_nvn_rv.missed, 0);
+    uint32_t cover = boot_nvn_rerecord_version_on() && boot_nvn_dsnap.active && boot_nvn_dsnap.covered ? boot_nvn_dsnap.stamp : 0;
+    if (!cover) return;
+    AcquireSRWLockExclusive(&boot_nvn_sub.lock);
+    if (boot_nvn_sub.seq & 1) boot_nvn_rv.cover = cover;
+    ReleaseSRWLockExclusive(&boot_nvn_sub.lock);
+}
+/* rerecord-work: may the re-record that made `old` a version go on without waiting? cover: read with the call's seq.
+ * BOOT_NVN_RV_KEPT, or why it waits (see TOTK_RERECORD_VERSION). `old` may have been freed and reused since (the call
+ * ended): then nothing reads it any more and either answer is safe. */
+static inline unsigned boot_nvn_rv_decide(uint64_t old, uint32_t cover) {
+    if (!boot_nvn_rerecord_version_on()) return BOOT_NVN_RV_OFF;
+    if (!cover) return BOOT_NVN_RV_UNCOVERED;   /* the walk still runs, or did not cover the whole submission */
+    BootNvnSlot *t = boot_nvn_slot_peek(boot_nvn_shadow(), boot_nvn_slot_of(old)); uint32_t snap = 0;
+    if (t) { AcquireSRWLockShared(&t->lock); snap = t->snap; ReleaseSRWLockShared(&t->lock); }
+    if (snap != cover) return BOOT_NVN_RV_UNREACHED;   /* pinned by the translation through the live map, not by the walk */
+    if (__atomic_load_n(&boot_nvn_rv.missed, __ATOMIC_SEQ_CST)) return BOOT_NVN_RV_MISSED;
+    if (__atomic_load_n(&boot_nvn_ver.bytes, __ATOMIC_RELAXED) > boot_nvn_rerecord_budget()) return BOOT_NVN_RV_BUDGET;
+    return BOOT_NVN_RV_KEPT;
+}
+/* rerecord-work, end of a submit call (t2): a call that kept a version and whose translation then met a handle its walk had not
+ * reached is an alarm (the released thread could have re-recorded that handle before the translation took it from the live
+ * map; not expected: the walk follows what the executor follows). Counted, the first 16 logged. */
+static inline void boot_nvn_rv_call_end(void) {
+    LONG64 kept = InterlockedExchange64(&boot_nvn_rv.kept_call, 0);
+    if (!kept || boot_nvn_dsnap.fz_unknown == boot_nvn_rv.unknown0) return;
+    LONG64 n = InterlockedIncrement64(&boot_nvn_rv.alarms);
+#ifdef TOTK_DRAW_PATH
+    if (n <= 16) boot_draw_log("nvn native: re-record versions ALARM: a call kept %s%llu versions and then reached %llu handles its walk had not", "", (uint64_t)kept, boot_nvn_dsnap.fz_unknown - boot_nvn_rv.unknown0);
+#else
+    (void)n;
+#endif
+}
 static inline void boot_nvn_sub_begin(BootContext *c) {
     unsigned th = boot_nvn_guest_thread(c);
+    { BootNvnRlStats *m = boot_nvn_rl(); m->sl_role = BOOT_NVN_SL_ROLE_RENDER; m->sl_guest = th; }   /* storelock-work: the render thread's counters */
     AcquireSRWLockExclusive(&boot_nvn_sub.lock);
     if (!(boot_nvn_sub.seq & 1)) ++boot_nvn_sub.seq;
     boot_nvn_sub.tid = GetCurrentThreadId(); boot_nvn_sub.thread = th;
     boot_nvn_sub.prev_call_qpc = boot_nvn_sub.call_qpc; boot_nvn_sub.call_qpc = boot_nvn_qpc(); boot_nvn_sub.ev_n = boot_nvn_sub.ev_lost = 0;
+    boot_nvn_rv.cover = 0;   /* rerecord-work: no versions until this call's walk vouches (boot_nvn_rv_publish) */
     ReleaseSRWLockExclusive(&boot_nvn_sub.lock);
     if (boot_nvn_ftrace_on()) { __atomic_store_n(&boot_mt_ft.thread, (LONG)th, __ATOMIC_RELAXED); __atomic_store_n(&boot_mt_ft.on, 1, __ATOMIC_RELEASE); }
 }
 static inline void boot_nvn_sub_end(void) {
     AcquireSRWLockExclusive(&boot_nvn_sub.lock);
     if (boot_nvn_sub.seq & 1) ++boot_nvn_sub.seq;
+    boot_nvn_rv.cover = 0;   /* rerecord-work */
     ReleaseSRWLockExclusive(&boot_nvn_sub.lock);
     WakeAllConditionVariable(&boot_nvn_sub.cv);
+    boot_nvn_rv_call_end();
 }
 /* batch-a: EndRecording returned handle `handle` again while a submission had its older recording `old` pinned (the
  * old slot is only marked dead, so the call still reads it; with the freeze its translation keeps reading it). Noted
@@ -916,7 +1398,7 @@ static inline void boot_nvn_rerecorded(BootContext *c, uint64_t handle, uint64_t
     InterlockedIncrement64(&boot_nvn_sub.rerecords);
     AcquireSRWLockExclusive(&boot_nvn_sub.lock);
     LONG64 seq = boot_nvn_sub.seq; int inside = (seq & 1) && boot_nvn_sub.tid != GetCurrentThreadId();
-    uint64_t call = boot_nvn_sub.call_qpc; unsigned submitter = boot_nvn_sub.thread;
+    uint64_t call = boot_nvn_sub.call_qpc; unsigned submitter = boot_nvn_sub.thread; uint32_t cover = boot_nvn_rv.cover;   /* rerecord-work: with seq */
     if (inside) {
         if (boot_nvn_sub.ev_n < BOOT_NVN_SUB_EVENTS) { BootNvnSubEvent *e = &boot_nvn_sub.ev[boot_nvn_sub.ev_n++]; e->handle = handle; e->qpc = now; e->thread = me; e->pad = 0; }
         else ++boot_nvn_sub.ev_lost;
@@ -924,17 +1406,21 @@ static inline void boot_nvn_rerecorded(BootContext *c, uint64_t handle, uint64_t
     ReleaseSRWLockExclusive(&boot_nvn_sub.lock);
     if (!inside) { InterlockedIncrement64(&boot_nvn_sub.outside); return; }   /* the call had just ended (its pins were going) */
     const int wait = boot_nvn_rerecord_wait_on();
+    const unsigned rv = wait ? boot_nvn_rv_decide(old, cover) : BOOT_NVN_RV_N;   /* rerecord-work: BOOT_NVN_RV_KEPT: kept as a version, no wait */
 #ifdef TOTK_DRAW_PATH
     if (InterlockedIncrement64(&boot_nvn_sub.logged) <= 16) {
         char t[200]; snprintf(t, sizeof t, " (batch-a): handle %llx by t%u, %.2f ms after the submit call of t%u began (older recording slot %u)%s", (unsigned long long)handle, me,
-                              (double)(now - call) * 1000.0 / (double)f, submitter, boot_nvn_slot_of(old), wait ? ", the thread waits for the call" : "");
+                              (double)(now - call) * 1000.0 / (double)f, submitter, boot_nvn_slot_of(old),
+                              !wait ? "" : rv == BOOT_NVN_RV_KEPT ? ", kept as a version: the thread goes on" : ", the thread waits for the call");
         boot_draw_log("nvn native: recording replaced while a submission reads it%s (event %llu of the first 16, %llu so far)", t, (uint64_t)boot_nvn_sub.logged, (uint64_t)boot_nvn_sub.rerecords);
     }
 #else
     (void)submitter; (void)old; (void)call;
 #endif
     if (!wait) return;
+    if (rv == BOOT_NVN_RV_KEPT) { InterlockedIncrement64(&boot_nvn_rv.n[BOOT_NVN_RV_KEPT]); InterlockedIncrement64(&boot_nvn_rv.kept_call); return; }   /* rerecord-work */
     if (boot_mt.active) { CRITICAL_SECTION *cs = boot_render_cs(); if ((DWORD)(uintptr_t)cs->OwningThread == GetCurrentThreadId()) return; }   /* never under the renderer lock */
+    InterlockedIncrement64(&boot_nvn_rv.n[rv]);   /* rerecord-work: why it still waits */
     BootCore *k = boot_mt.active && boot_mt_core_ctx(c) ? (BootCore *)(void *)c : NULL;
     if (k) __atomic_store_n(&k->in_guest, 0, __ATOMIC_SEQ_CST);   /* outside guest code: a quiescing kernel need not wait for it */
     uint64_t t0 = boot_nvn_qpc(), cap = (uint64_t)BOOT_NVN_RERECORD_CAP_MS * f / 1000, t1 = t0; int capped = 0;
@@ -959,6 +1445,98 @@ static inline void boot_nvn_slot_mark_end(const BootContext *c, uint64_t shadow)
     AcquireSRWLockExclusive(&t->lock);
     if (t->next_free == UINT32_MAX) { t->rec_thread = th; t->end_qpc = now; }
     ReleaseSRWLockExclusive(&t->lock);
+}
+/* EndRecording's return (boot_nvn_cmd_end_ret): handle -> slot, and the older recording of that handle released (only marked
+ * dead, a version, while a submission reads it: batch-a's re-record, boot_nvn_rerecorded), in that order as before.
+ * rerecord-work: with TOTK_SNAP_ATOMIC both steps hold boot_nvn_walk_lock shared, so a submit call's walk sees both or
+ * neither. 0: out of host memory (slot released). */
+/* rec-evict: with rg (EndRecording's return, TOTK_REC_EVICT_DEAD / TOTK_REC_EVICT not both 0), inside the same walk-lock section:
+ * the recordings this one was written over are released and this one is indexed (boot_nvn_ev_installed). */
+typedef struct BootNvnEvRange { uint64_t ctl, cmd; uint32_t ctl_len, cmd_len; } BootNvnEvRange;   /* guest CPU ranges; length 0 = none */
+static inline void boot_nvn_ev_installed(uint64_t handle, uint64_t slot, const BootNvnEvRange *rg);
+/* EndRecording's return, a handle recorded again (boot_nvn_handle_install_ev, before the older recording is released): when the new
+ * recording wrote over the older one's commands (a list re-recorded in place, TOTK_REC_EVICT_DEAD tracking its ranges), a caller bound
+ * to the older one would, on the console, run the new bytes: that version is marked so the call plays the handle ("recorded again in
+ * place", counted with the fallbacks). Overlap with either range of the new recording. */
+static inline void boot_nvn_cb_overwritten_locked(BootNvnShadowStore *s, uint64_t old, const BootNvnEvRange *rg) {   /* store lock held exclusively */
+    const uint32_t i = boot_nvn_slot_of(old); BootNvnSlot *t = i < s->count ? boot_nvn_slot_at(s, i) : NULL;
+    if (t && t->cb_refs && t->ev_cmd_len &&
+        ((rg->cmd_len && t->ev_cmd < rg->cmd + rg->cmd_len && rg->cmd < t->ev_cmd + t->ev_cmd_len) || (rg->ctl_len && t->ev_cmd < rg->ctl + rg->ctl_len && rg->ctl < t->ev_cmd + t->ev_cmd_len))) {
+        t->cb_flags |= BOOT_NVN_CB_INVALID | BOOT_NVN_CB_INPLACE; ++boot_nvn_cb.inplace;
+    }
+}
+static inline void boot_nvn_cb_overwritten(uint64_t old, const BootNvnEvRange *rg) {
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_OVERWRITE, 0);   /* storelock-work: exclusive (a bind's lookup and count stay on one side of it) */
+    boot_nvn_cb_overwritten_locked(s, old, rg);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_OVERWRITE, 0, sl);
+}
+/* storelock-work (TOTK_STORE_LOCK_V2): EndRecording's return, the older recording of a handle: boot_nvn_cb_overwritten (ow: its ranges, or
+ * NULL) and boot_nvn_slot_free in ONE exclusive section (one of the orders the two sections could already run in: the older recording is
+ * out of the handle map before either, so no pin or bind can reach it through the map in between). */
+static inline int boot_nvn_slot_free_ow(uint64_t shadow, const BootNvnEvRange *ow) {
+    BootNvnShadowStore *s = boot_nvn_shadow(); uint32_t i = boot_nvn_slot_of(shadow); int pinned = 0;
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_FREE, 0);
+    if (ow) boot_nvn_cb_overwritten_locked(s, shadow, ow);
+    if (i < s->count && boot_nvn_slot_at(s, i)->next_free == UINT32_MAX && !boot_nvn_slot_at(s, i)->dead) pinned = boot_nvn_slot_free_locked(s, i);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_FREE, 0, sl);   /* (then its bindings) */
+    return pinned;
+}
+static inline int boot_nvn_handle_install_ev(BootContext *c, uint64_t handle, uint64_t slot, const BootNvnEvRange *rg) {
+    const int atomic = boot_nvn_snap_atomic_on(); int pinned = 0; BootCore *k = NULL;
+    if (atomic && !TryAcquireSRWLockShared(&boot_nvn_walk_lock)) {   /* a walk runs (about 0.5 ms): outside guest code meanwhile */
+        k = boot_mt.active && boot_mt_core_ctx(c) ? (BootCore *)(void *)c : NULL;
+        if (k) __atomic_store_n(&k->in_guest, 0, __ATOMIC_SEQ_CST);
+        uint64_t t0 = boot_nvn_qpc(); AcquireSRWLockShared(&boot_nvn_walk_lock);
+        InterlockedIncrement64(&boot_nvn_rv.walk_waits); InterlockedExchangeAdd64(&boot_nvn_rv.walk_wait_qpc, (LONG64)(boot_nvn_qpc() - t0));
+    }
+    uint64_t old = boot_nvn_hmap_put(boot_nvn_handles(), handle, slot);
+    if (old != UINT64_MAX && old && old != slot) {
+        const BootNvnEvRange *ow = rg && boot_nvn_cb_mode() ? rg : NULL;   /* call-bind: recorded again over its own commands? */
+        if (boot_nvn_slv2_on()) pinned = boot_nvn_slot_free_ow(old, ow);   /* storelock-work: both in one exclusive section */
+        else { if (ow) boot_nvn_cb_overwritten(old, ow); pinned = boot_nvn_slot_free(old); }
+    }
+    if (old != UINT64_MAX && rg) boot_nvn_ev_installed(handle, slot, rg);   /* rec-evict: overwritten recordings released, this one indexed */
+    if (atomic) ReleaseSRWLockShared(&boot_nvn_walk_lock);
+    if (k) boot_mt_guest_enter(k);   /* after the release: never in a quiesce wait while the walk waits for us */
+    if (old == UINT64_MAX) { boot_nvn_slot_free(slot); return 0; }
+    if (pinned) boot_nvn_rerecorded(c, handle, old);   /* batch-a: a submission was reading the older one */
+    return 1;
+}
+static inline int boot_nvn_handle_install(BootContext *c, uint64_t handle, uint64_t slot) { return boot_nvn_handle_install_ev(c, handle, slot, NULL); }
+/* rerecord-work: every 300 presents (boot_nvn_queue_present) the "re-record versions" line (see TOTK_RERECORD_VERSION). */
+static inline void boot_nvn_rv_present(void) {
+#ifdef TOTK_DRAW_PATH
+    static volatile LONG64 presents; static uint64_t l_re, l_out, l_n[BOOT_NVN_RV_N], l_wq, l_ww, l_wwq, l_rb, l_rc, l_al;
+    uint64_t p = (uint64_t)InterlockedIncrement64(&presents);
+    if (p % 300) return;
+    uint64_t f = boot_nvn_qpf(), n[BOOT_NVN_RV_N], vn, vb, pn, pb, rb, rc, rm, waits = 0;
+    for (unsigned k = 0; k < BOOT_NVN_RV_N; ++k) { n[k] = (uint64_t)boot_nvn_rv.n[k]; if (k != BOOT_NVN_RV_KEPT) waits += n[k] - l_n[k]; }
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    AcquireSRWLockExclusive(&s->lock);
+    vn = boot_nvn_ver.n; vb = boot_nvn_ver.bytes; pn = boot_nvn_ver.peak_n; pb = boot_nvn_ver.peak_bytes;
+    rb = boot_nvn_ver.reach_bytes; rc = boot_nvn_ver.reach_calls; rm = boot_nvn_ver.reach_max;
+    boot_nvn_ver.peak_n = vn; boot_nvn_ver.peak_bytes = vb; boot_nvn_ver.reach_max = 0;
+    ReleaseSRWLockExclusive(&s->lock);
+    uint64_t re = (uint64_t)boot_nvn_sub.rerecords, out = (uint64_t)boot_nvn_sub.outside, wq = (uint64_t)boot_nvn_sub.wait_qpc;
+    uint64_t ww = (uint64_t)boot_nvn_rv.walk_waits, wwq = (uint64_t)boot_nvn_rv.walk_wait_qpc, al = (uint64_t)boot_nvn_rv.alarms;
+    double ms = 1000.0 / (double)f; char line[1000];
+    snprintf(line, sizeof line, " (rerecord-work; TOTK_RERECORD_VERSION %s, budget %llu MiB, TOTK_SNAP_ATOMIC %s, TOTK_RERECORD_WAIT %s) last 300 presents:"
+             " recordings replaced while a call read them %llu (after its call %llu), kept as versions without a wait %llu, waits %llu (%.1f ms; why: switch off %llu,"
+             " call not covered %llu, not reached by the call's walk %llu, the call met a handle its walk missed %llu, over budget %llu); versions held now %llu (%llu KiB),"
+             " peak %llu (%llu KiB); pinned per call %.1f KiB (max %llu KiB, %llu calls); walk-lock waits %llu (%.2f ms); alarms %llu; totals: kept %llu, waits %llu, alarms %llu;",
+             boot_nvn_rerecord_version_on() ? "on" : "off", (unsigned long long)(boot_nvn_rerecord_budget() >> 20), boot_nvn_snap_atomic_on() ? "on" : "off",
+             boot_nvn_rerecord_wait_on() ? "on" : "off", (unsigned long long)(re - l_re), (unsigned long long)(out - l_out),
+             (unsigned long long)(n[BOOT_NVN_RV_KEPT] - l_n[BOOT_NVN_RV_KEPT]), (unsigned long long)waits, (double)(wq - l_wq) * ms,
+             (unsigned long long)(n[BOOT_NVN_RV_OFF] - l_n[BOOT_NVN_RV_OFF]), (unsigned long long)(n[BOOT_NVN_RV_UNCOVERED] - l_n[BOOT_NVN_RV_UNCOVERED]),
+             (unsigned long long)(n[BOOT_NVN_RV_UNREACHED] - l_n[BOOT_NVN_RV_UNREACHED]), (unsigned long long)(n[BOOT_NVN_RV_MISSED] - l_n[BOOT_NVN_RV_MISSED]),
+             (unsigned long long)(n[BOOT_NVN_RV_BUDGET] - l_n[BOOT_NVN_RV_BUDGET]), (unsigned long long)vn, (unsigned long long)(vb >> 10), (unsigned long long)pn,
+             (unsigned long long)(pb >> 10), rc > l_rc ? (double)(rb - l_rb) / 1024.0 / (double)(rc - l_rc) : 0.0, (unsigned long long)(rm >> 10),
+             (unsigned long long)(rc - l_rc), (unsigned long long)(ww - l_ww), (double)(wwq - l_wwq) * ms, (unsigned long long)(al - l_al),
+             (unsigned long long)n[BOOT_NVN_RV_KEPT], (unsigned long long)(uint64_t)boot_nvn_sub.waits, (unsigned long long)al);
+    boot_draw_log("nvn native: re-record versions%s present %llu %llu", line, p, 0);
+    l_re = re; l_out = out; memcpy(l_n, n, sizeof l_n); l_wq = wq; l_ww = ww; l_wwq = wwq; l_rb = rb; l_rc = rc; l_al = al;
+#endif
 }
 /* The periodic counters line (host_nvn_play.h, every 100 submissions). */
 static inline void boot_nvn_batch_a_format(char *out, size_t cap) {
@@ -1216,7 +1794,8 @@ BOOT_NVN_FN(boot_nvn_buffer_finalize) { BOOT_NVN_UNUSED; uint64_t address = c->x
  * bypass the API, so they are switched off: the driver's nvnPrivate0 (sdk+0xdbb9a8, which the game reads
  * through its GOT 0x45586e8 before every inline path) is cleared after the driver sets it. */
 #define BOOT_NVN_INLINE_FLAG ((UINT64_C(3) << 28) | UINT64_C(0xdbb9a8))
-enum { BOOT_NVN_CMD_PASS = 0, BOOT_NVN_CMD_RECORD = 1, BOOT_NVN_CMD_BEGIN = 2, BOOT_NVN_CMD_END = 3, BOOT_NVN_CMD_RESET = 4, BOOT_NVN_CMD_ADD_MEMORY = 5 };
+enum { BOOT_NVN_CMD_PASS = 0, BOOT_NVN_CMD_RECORD = 1, BOOT_NVN_CMD_BEGIN = 2, BOOT_NVN_CMD_END = 3, BOOT_NVN_CMD_RESET = 4, BOOT_NVN_CMD_ADD_MEMORY = 5,
+       BOOT_NVN_CMD_ADD_CONTROL = 6 };   /* rec-evict: AddControlMemory (driver only, as before) */
 static inline uint8_t *boot_nvn_cmd_kinds(void) { static uint8_t k[BOOT_NVN_NAME_COUNT]; return k; }
 static inline void boot_nvn_inline_off(BootContext *c, uint64_t self) {
     uint64_t a = boot_address(c, BOOT_NVN_INLINE_FLAG); uint32_t v = 0, zero = 0;
@@ -1310,6 +1889,747 @@ static inline int boot_nvn_record_write(uint64_t slot, uint32_t gen, const BootN
     }
     return boot_nvn_slot_append(slot, gen, part, n, 0, gen_out, dref);
 }
+/* ---- call-bind: record time, switches, log (see "call-bind" above) */
+/* Record time (boot_nvn_cmd_observe), a CallCommands of n handles (its index entries h): each handle's recording now gets a binding
+ * and is named in out[k] (slot | generation; 0: no recording yet) and in the record (block BOOT_NVN_CB_ARG). Returns n when any was
+ * bound (the caller passes out to the record's index and calls boot_nvn_cb_unbind if that index is not stored), else 0 (the record
+ * unchanged: resolved at the submit as before). */
+static inline unsigned boot_nvn_cb_bind(BootNvnRecord *r, const uint64_t *h, uint32_t n, uint64_t *out) {
+    unsigned got = 0;
+    if (!boot_nvn_cb_mode() || !n || n > 64 || r->blocks != 1) return 0;
+    InterlockedIncrement64(&boot_nvn_cb.calls);
+    if (boot_nvn_cb.held_bytes > boot_nvn_cb_budget()) { InterlockedExchangeAdd64(&boot_nvn_cb.budget_skip, n); return 0; }
+    BootNvnShadowStore *s = boot_nvn_shadow(); const int v2 = boot_nvn_slv2_on();
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_BIND, v2);   /* storelock-work: shared with v2 (other recorders bind the same callees: atomic) */
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint64_t sh = h[k] && !(h[k] & BOOT_NVN_SHADOW) ? boot_nvn_hmap_get(boot_nvn_handles(), h[k]) : 0; const uint32_t i = boot_nvn_slot_of(sh);
+        BootNvnSlot *t = sh && i < s->count ? boot_nvn_slot_at(s, i) : NULL;
+        out[k] = 0;
+        if (!t || t->next_free != UINT32_MAX || t->dead || !t->closed) continue;
+        if (v2) __atomic_add_fetch(&t->cb_refs, 1, __ATOMIC_RELAXED); else { ++t->cb_refs; ++boot_nvn_cb.refs; }
+        out[k] = sh | t->gen; ++got;
+        if (!(__atomic_load_n(&t->ev_reach, __ATOMIC_RELAXED) & BOOT_NVN_EV_CALLED)) __atomic_or_fetch(&t->ev_reach, BOOT_NVN_EV_CALLED, __ATOMIC_RELAXED);   /* rec-evict: called */
+    }
+    if (v2 && got) __atomic_add_fetch(&boot_nvn_cb.refs, got, __ATOMIC_RELAXED);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_BIND, v2, sl);
+    InterlockedExchangeAdd64(&boot_nvn_cb.binds, got); InterlockedExchangeAdd64(&boot_nvn_cb.unbound_rec, n - got);
+    if (!got) return 0;
+    r->block[1].arg = BOOT_NVN_CB_ARG; r->block[1].bytes = 8 * n; r->block[1].data = (const uint8_t *)out; r->blocks = 2;
+    r->words += (8 + 8 * n) / 4;
+    return n;
+}
+static inline void boot_nvn_cb_unbind(const uint64_t *b, uint32_t n) {   /* bindings the record's index does not hold (not stored) */
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_UNBIND, 0);
+    for (uint32_t k = 0; k < n; ++k) if (b[k]) boot_nvn_cb_unref_locked(s, b[k]);
+    boot_nvn_cb_drain_locked(s);
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_UNBIND, 0, sl);
+    InterlockedIncrement64(&boot_nvn_cb.bind_lost);
+}
+/* Switched to 0: every binding goes (the versions only bindings kept are freed). In chunks of 4096 slots under the store lock; a
+ * record keeps naming its versions, but in mode 0 they are ignored and later checked by generation. Returns the bindings released. */
+static inline uint64_t boot_nvn_cb_unbind_all(void) {
+    BootNvnShadowStore *s = boot_nvn_shadow(); uint64_t n = 0;
+    for (uint32_t base = 0;; base += 4096) {
+        const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_UNBIND, 0);
+        const uint32_t end = s->count - base < 4096 ? s->count : base + 4096;
+        for (uint32_t i = base; i < end; ++i) {
+            BootNvnSlot *t = boot_nvn_slot_at(s, i);
+            if (!t->dref_n) continue;
+            AcquireSRWLockExclusive(&t->lock);
+            for (uint32_t k = 0; k < t->dref_n; ++k) if (t->dref[k].count == UINT32_MAX && t->dref[k].bound) { boot_nvn_cb_unref_locked(s, t->dref[k].bound); t->dref[k].bound = 0; ++n; }
+            ReleaseSRWLockExclusive(&t->lock);
+        }
+        boot_nvn_cb_drain_locked(s);
+        const int more = end < s->count;
+        boot_nvn_sl_unlock(s, BOOT_NVN_SL_UNBIND, 0, sl);
+        if (!more) break;
+    }
+    return n;
+}
+static inline void boot_nvn_cb_fallback_log(uint64_t h, uint64_t b, unsigned why) {
+#ifdef TOTK_DRAW_PATH
+    if (InterlockedIncrement(&boot_nvn_cb.logged_fb) > 16) return;
+    char line[300]; snprintf(line, sizeof line, " (call-bind, TOTK_CALL_BIND_AT_RECORD %d): handle %llx, bound version slot %u gen %u %s; played through the handle (present %u)",
+                             boot_nvn_cb_mode(), (unsigned long long)h, boot_nvn_slot_of(b), (uint32_t)b,
+                             why == BOOT_NVN_CB_R_INVALID ? "was released by rec-evict class 1 (its command memory written over: invalid in NVN too)" :
+                             why == BOOT_NVN_CB_R_INPLACE ? "was recorded again over its own commands (the console runs the new bytes)" : "is gone",
+                             (unsigned)boot_nvn_ev_now);
+    boot_draw_log("nvn native: call-bind fallback%s %llu %llu", line, (uint64_t)boot_nvn_cb.ex_invalid, (uint64_t)boot_nvn_cb.ex_gone);
+#else
+    (void)h; (void)b; (void)why;
+#endif
+}
+/* Every present (boot_nvn_ev_present, renderer lock held, no submit running): the live switch frames\callbind-mode.request (one digit
+ * 0 / 1 / 2; applied from the next submit on, the file deleted, the change logged), and every 300 presents the "call bind" line. */
+static inline void boot_nvn_cb_report(uint32_t now) {
+#ifdef TOTK_DRAW_PATH
+    static uint64_t l_div, l_binds, l_inv, l_gone, l_ev;
+    const int m = boot_nvn_cb_mode(); char line[1200];
+    const uint64_t div = (uint64_t)boot_nvn_cb.ex_diverged, binds = (uint64_t)boot_nvn_cb.binds, inv = (uint64_t)boot_nvn_cb.ex_invalid, gone = (uint64_t)boot_nvn_cb.ex_gone, ev = (uint64_t)boot_nvn_cb.watch_events;
+    snprintf(line, sizeof line, " (call-bind; TOTK_CALL_BIND_AT_RECORD %d: %s; budget %llu MiB): CallCommands handles bound at record %llu last 300 presents, %llu in all"
+             " (not bound: no recording yet %llu, held versions over the budget %llu, index lost %llu); translated calls: same version %llu,"
+             " callee re-recorded before its caller's submit %llu last 300 presents, %llu in all (%s), fallbacks: bound version released by class 1 %llu, recorded again in place %llu (marked %llu), gone %llu"
+             " (last 300: %llu, %llu), unbound %llu, ignored (mode 0) %llu; versions held alive by callers now %llu (%llu MiB), peak %llu (%llu MiB), markers %llu,"
+             " bindings %llu (bad releases %llu, lost %llu); watch events %llu last 300 (logged %llu, with differences %llu, over the per-second limit %llu); switches %llu"
+             " (bindings released by switches %llu)",
+             m, m == 1 ? "bound versions played" : m == 2 ? "watch: live versions played, differences logged" : "off", (unsigned long long)(boot_nvn_cb_budget() >> 20),
+             (unsigned long long)(binds - l_binds), (unsigned long long)binds, (unsigned long long)boot_nvn_cb.unbound_rec, (unsigned long long)boot_nvn_cb.budget_skip,
+             (unsigned long long)boot_nvn_cb.bind_lost, (unsigned long long)boot_nvn_cb.ex_same, (unsigned long long)(div - l_div), (unsigned long long)div,
+             m == 1 ? "played as recorded" : "played live", (unsigned long long)inv, (unsigned long long)boot_nvn_cb.ex_inplace, (unsigned long long)boot_nvn_cb.inplace, (unsigned long long)gone, (unsigned long long)(inv - l_inv), (unsigned long long)(gone - l_gone),
+             (unsigned long long)boot_nvn_cb.ex_unbound, (unsigned long long)boot_nvn_cb.ex_off, (unsigned long long)boot_nvn_cb.held_n,
+             (unsigned long long)(boot_nvn_cb.held_bytes >> 20), (unsigned long long)boot_nvn_cb.held_peak_n, (unsigned long long)(boot_nvn_cb.held_peak_bytes >> 20),
+             (unsigned long long)boot_nvn_cb.tombs, (unsigned long long)boot_nvn_cb.refs, (unsigned long long)boot_nvn_cb.unref_bad, (unsigned long long)boot_nvn_cb.reap_lost,
+             (unsigned long long)(ev - l_ev), (unsigned long long)boot_nvn_cb.watch_logged, (unsigned long long)boot_nvn_cb.watch_diffs, (unsigned long long)boot_nvn_cb.watch_over,
+             (unsigned long long)boot_nvn_cb.switches, (unsigned long long)boot_nvn_cb.released_by_switch);
+    boot_draw_log("nvn native: call bind%s present %llu %llu", line, now, 0);
+    l_div = div; l_binds = binds; l_inv = inv; l_gone = gone; l_ev = ev;
+#else
+    (void)now;
+#endif
+}
+static inline void boot_nvn_cb_present(uint32_t now) {
+    if (GetFileAttributesA("frames\\callbind-mode.request") != INVALID_FILE_ATTRIBUTES) {
+        int want = -1; FILE *q = fopen("frames\\callbind-mode.request", "r");
+        if (q) { int ch = fgetc(q); while (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == 0xef || ch == 0xbb || ch == 0xbf) ch = fgetc(q); if (ch >= '0' && ch <= '2') want = ch - '0'; fclose(q); }
+        DeleteFileA("frames\\callbind-mode.request");
+        const int was = boot_nvn_cb_mode(); uint64_t dropped = 0;
+        if (want >= 0 && want != was) {
+            InterlockedExchange(&boot_nvn_cb_mode_v, want); InterlockedIncrement64(&boot_nvn_cb.switches);
+            if (!want) { dropped = boot_nvn_cb_unbind_all(); InterlockedExchangeAdd64(&boot_nvn_cb.released_by_switch, (LONG64)dropped); }
+        }
+        char line[200]; snprintf(line, sizeof line, " (frames\\callbind-mode.request): TOTK_CALL_BIND_AT_RECORD %d -> %d at present %u%s (bindings released %llu; held versions now %llu)",
+                                 was, want < 0 ? was : want, now, want < 0 ? ", not a digit 0-2: ignored" : want == was ? ", unchanged" : "",
+                                 (unsigned long long)dropped, (unsigned long long)boot_nvn_cb.held_n);
+#ifdef TOTK_DRAW_PATH
+        boot_draw_log("nvn native: call-bind mode switch%s %llu %llu", line, now, 0);
+#endif
+        boot_nvn_log(line, "call-bind", now);
+    }
+    if (!(now % 300)) boot_nvn_cb_report(now);
+}
+/* ---------------------------------------------------------------- rec-evict: record store eviction (play-work/rec-evict) */
+/* The host copy of every recording (the slots above) was freed only when the driver returned the same handle again. TotK records
+ * most lists into memory it hands out afresh (each model's lists into its own heap, the measuring passes into one shared 4 MiB
+ * block), so the store kept nearly everything ever recorded: play-96 4.7 GiB (+0.6 GiB/min exploring), the play-97 dry run 145558
+ * live recordings / 4450 MiB after 8 minutes, enough to drive this 16 GB PC to its commit limit. mem-work batch A (TOTK_REC_KILL)
+ * assumed a handle is its command memory address plus a constant and never proved it ("proven linear 0 / not 405137"); this
+ * replaces it.
+ *
+ * The driver's handle, decoded from the translated driver (sdk+0x444530 nvnCommandBufferEndRecording; the CallCommands worker
+ * sdk+0x44561c decodes it the same way) and checked against the stage-0 trace (nvn-trace.bin: all 140936 EndRecording returns lie
+ * in the control block the game added, at the offsets below). The driver's NVNcommandBuffer keeps (guest CPU addresses; +0x58 is the
+ * command block's GPU address, from the pool's +0x18; the CPU one is the pool's storage, pool+0x30):
+ *   +0x00 command write pointer   +0x18 command block end - reserve   +0x30 command block start   +0x40 recording's segment start
+ *   +0x20 control write pointer   +0x28 control block end - 0x10      +0x38 control block start   +0x48 recording's control start
+ * BeginRecording writes a 16-byte header {0xffffffffffffff01, 0} (sdk+0xa9dd90) at the control write pointer; EndRecording appends
+ * the recording's command segments as control entries (an 8-byte group header, then {GPU address, CPU address, words, type 3} per
+ * segment) and an end entry (type 2), and returns ctl_start + 0x10, or, for one group of segments (count < 65536), the packed form
+ * (count << 48) | (ctl_start + 0x18) | 1. A handle is an address in CONTROL memory (bits 0-47; bit 0 = packed, bits 48-63 = segment
+ * count): play-97's sample "handle 2007400151291, begin 7400151278" is ctl_start 0x7400151278 with two segments, and batch A's
+ * cmd+0x20 was the control write pointer.
+ *
+ * Class 1 (LIST_DEAD in nxport's terms; nxport, MIT, crates/engine/src/nvn/api.rs: COMMAND_LISTS 2195-2215, kill_overlapping_lists
+ * 2361-2400, command_list_recorded 2420-2432): a recording whose COMMAND memory a newer recording has written (with its commands
+ * or its control entries) is invalid in NVN, and so is every list that called it: CallCommands copies the callee's control
+ * entries, i.e. GPU pointers into the callee's command memory, into the caller when the caller is recorded (sdk+0x44561c walks
+ * them). Nothing can validly execute it again, so it is freed at once (one a submission has pinned: marked dead, freed at its
+ * unpin, as a replaced recording). Not freed:
+ *  - a recording whose CONTROL memory alone was written over: its handle is dead for new submits and calls, but a caller recorded
+ *    before holds the copied entries and stays valid, and the executor resolves a caller's callees by handle at the submit. In the
+ *    trace the per-frame list 7604339030 reached 8256 callees whose control memory had been reused between its CallCommands and
+ *    its submit (a ring of per-frame control memory): freeing those would drop their draws. Counted ("control only").
+ *  - AddCommandMemory / AddControlMemory over its range: nothing is written (nxport: TotK re-adds a block to re-record its first
+ *    list and keeps calling the list after it in the same block).
+ * Also class 1: the recordings whose commands lie in a memory pool the game finalizes (nvnMemoryPoolFinalize, observed while class 1
+ * is on): that memory is no longer mapped for the GPU.
+ * Replaying this rule over the trace (play-work/rec-evict/sim.py): 28909 recordings freed, none used again, no submitted list
+ * reaching a freed callee.
+ * Mechanics: BeginRecording (before the driver) notes the command write pointer; EndRecording's return reads the command buffer
+ * and takes [that pointer, +0x00) as the command range and [ctl_start from the handle, +0x20) as the control range, each checked
+ * against its block (+0x30..+0x18, +0x38..+0x28), plus the header and the end entry in guest memory. A layout surprise, an
+ * AddCommandMemory / AddControlMemory while recording (the out-of-memory callback: two blocks), a range over 16 MiB or no
+ * BeginRecording seen leaves the recording untracked: it frees nothing and is only freed as before. An index of pages (4 KiB for
+ * ranges up to 64 KiB, 1 MiB above) finds the recordings whose command range a new one overlaps.
+ *
+ * Class 2 (TOTK_REC_EVICT; nxport's 512 MiB budget, LIST_SUBMITTED): while the store is over TOTK_REC_BUDGET_MB (512), recordings
+ * that submit walks only ever reached as submitted handles (never through CallCommands: nxport's per-mesh lists, whose plain-LRU
+ * eviction drew meshes with the previous draw's vertex buffers, as geometry streaks) and that no submission reached for
+ * TOTK_REC_EVICT_AGE presents (600) are freed oldest first, down to 3/4 of the budget, at most once per 30 presents (300 after a
+ * sweep that found nothing to take), on the presenting thread. Never: a pinned recording, one no walk reached yet (LIST_NEW), one called through CallCommands (with
+ * TOTK_REC_EVICT=1 also marked when a CallCommands naming it is recorded).
+ *
+ * A released handle used again (submitted, or reached through CallCommands) cannot be played. The executor used to stop the game at
+ * "bad record"; now its commands are skipped (boot_nvn_ev_skip), counted per class, and the first 16 are logged with their history
+ * ("REC-EVICT released handle used again"). In a dry run nothing is released; a marked recording reached again by a submission is
+ * counted and logged ("would-be-released ... reached again"): that boot shows whether switching the class on is safe.
+ *
+ * Switches: TOTK_REC_EVICT_DEAD 1 (default) class 1 on, 2 dry run, 0 off (no tracking at all). TOTK_REC_EVICT 2 (default) dry run,
+ * 1 on, 0 off. TOTK_REC_BUDGET_MB (512), TOTK_REC_EVICT_AGE (600 presents). Both 0: the store exactly as before (but for the skip of
+ * a released handle, which then never happens). Every 300 presents a draw-path.log line "record store eviction": live recordings
+ * and MiB by class, freed / would free per class (last 300 presents and in all), released handles used again, tracking and index
+ * counters. nvn-native.log gets the first 24 tracked recordings ("rec evict sample"), the first 8 untracked ones and the first 8
+ * class 1 releases ("rec evict release"). TOTK_REC_KILL (batch A) is gone; set, it is logged once. */
+static inline int boot_nvn_ev_env(const char *name, int def) {   /* 0, 1 or 2 from the first character; def when unset or other */
+    char s[8]; DWORD k = GetEnvironmentVariableA(name, s, sizeof s);
+    if (!k || k >= sizeof s) return def;
+    return s[0] == '0' ? 0 : s[0] == '1' ? 1 : s[0] == '2' ? 2 : def;
+}
+static inline uint64_t boot_nvn_ev_env_u(const char *name, uint64_t def, uint64_t max) {
+    char s[16]; DWORD k = GetEnvironmentVariableA(name, s, sizeof s); uint64_t v = def;
+    if (k && k < sizeof s && s[0] >= '0' && s[0] <= '9') { v = 0; for (DWORD i = 0; i < k && s[i] >= '0' && s[i] <= '9' && v <= max; ++i) v = v * 10 + (uint64_t)(s[i] - '0'); }
+    return v > max ? max : v;
+}
+static inline int boot_nvn_ev_dead_mode(void) { static int v = -1; if (v < 0) v = boot_nvn_ev_env("TOTK_REC_EVICT_DEAD", 1); return v; }
+static inline int boot_nvn_ev_lru_mode(void) { static int v = -1; if (v < 0) v = boot_nvn_ev_env("TOTK_REC_EVICT", 2); return v; }
+static inline int boot_nvn_ev_on(void) { return boot_nvn_ev_dead_mode() || boot_nvn_ev_lru_mode(); }
+static inline uint64_t boot_nvn_ev_budget(void) { static int64_t v = -1; if (v < 0) v = (int64_t)(boot_nvn_ev_env_u("TOTK_REC_BUDGET_MB", 512, 65536) << 20); return (uint64_t)v; }
+static inline uint32_t boot_nvn_ev_age(void) { static int64_t v = -1; if (v < 0) v = (int64_t)boot_nvn_ev_env_u("TOTK_REC_EVICT_AGE", 600, UINT32_C(1) << 30); return (uint32_t)v; }
+#define BOOT_NVN_EV_MAX (UINT64_C(16) << 20)                      /* a longer range is not tracked */
+#define BOOT_NVN_EV_SMALL (UINT64_C(64) << 10)                    /* ranges up to this are indexed by 4 KiB page, longer ones by 1 MiB page */
+#define BOOT_NVN_EV_GONE_MAX (UINT32_C(1) << 19)                  /* released handles remembered (a 16 MiB map); then the memory starts over */
+#define BOOT_NVN_EV_CTL_HEADER UINT64_C(0xffffffffffffff01)       /* BeginRecording's first control word (sdk+0xa9dd90) */
+#define BOOT_NVN_EV_BATCH 256u                                    /* recordings released per pass */
+enum { BOOT_NVN_EV_DEAD = 1, BOOT_NVN_EV_EVICT = 2 };             /* classes; the released-handle memory holds class | present << 8 */
+enum { BOOT_NVN_EV_U_NO_BEGIN, BOOT_NVN_EV_U_SWITCHED, BOOT_NVN_EV_U_OBJECT, BOOT_NVN_EV_U_CONTROL, BOOT_NVN_EV_U_COMMAND, BOOT_NVN_EV_U_N };   /* why untracked */
+typedef struct BootNvnEvPage { uint64_t key; uint32_t *s; uint32_t n, cap; } BootNvnEvPage;   /* key: (page << 1 | level) + 1, 0 = empty; s: slot indices */
+static struct {
+    SRWLOCK lock;   /* the index and every slot's ev_handle / ranges / ev_in. Order: walk lock, store lock, this, map locks */
+    BootNvnEvPage *tab; uint32_t cap, used; uint64_t entries, index_bytes, index_lost;
+    volatile LONG64 ended, tracked, with_cmd, untracked[BOOT_NVN_EV_U_N];
+    volatile LONG64 dead_n, dead_bytes, dead_pinned, dead_skipped, ctl_only, would_dead_n, would_dead_bytes, pools, pool_lists;
+    volatile LONG64 lru_n, lru_bytes, would_lru_n, would_lru_bytes, sweeps, sweep_qpc;
+    volatile LONG64 virt_dead, virt_lru;   /* dry runs: bytes of marked recordings still live (taken off the budget's count) */
+    volatile LONG64 reuse_walk[3], reuse_skip, reuse_unknown, would_reuse[3], would_reach, gone_clears;
+    volatile LONG logged_use, logged_would, logged_skip, logged_rel, samples, samples_bad, released_any;   /* released_any: set before the first real release */
+    uint32_t next_sweep;   /* present of the next sweep: +30 after one that found candidates, +300 after one that found none */
+} boot_nvn_ev;   /* zero: SRWLOCK_INIT */
+static inline BootNvnHostMap *boot_nvn_ev_begins(void) { static BootNvnHostMap m = {SRWLOCK_INIT, NULL, NULL, 0, 0}; return &m; }   /* cmd -> command write pointer at BeginRecording | 1 (| 2: a block added since), while it records */
+static inline BootNvnHostMap *boot_nvn_ev_gone(void) { static BootNvnHostMap m = {SRWLOCK_INIT, NULL, NULL, 0, 0}; return &m; }     /* released handle -> class | present << 8 */
+/* The control memory address a driver handle names (see above), and where its recording's control entries start. */
+static inline uint64_t boot_nvn_ev_ctl_start(uint64_t h) { uint64_t a = h & UINT64_C(0x0000fffffffffffe); return (h & 1) ? a - 0x18 : a - 0x10; }
+static inline const char *boot_nvn_ev_class_name(unsigned cls) { return cls == BOOT_NVN_EV_DEAD ? "dead: command memory overwritten" : cls == BOOT_NVN_EV_EVICT ? "budget: submitted only, unused" : "?"; }
+static inline void boot_nvn_ev_note(const char *fmt, ...) {   /* one line to nvn-native.log */
+    FILE *f = fopen("nvn-native.log", "a"); if (!f) return;
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fputc('\n', f); fclose(f);
+}
+/* ---- the overwrite index (ev lock held) */
+static inline unsigned boot_nvn_ev_shift(unsigned level) { return level ? 20u : 12u; }
+static inline uint64_t boot_nvn_ev_key(uint64_t page, unsigned level) { return (page << 1 | level) + 1; }
+static inline BootNvnEvPage *boot_nvn_ev_page_locked(uint64_t key, int create) {
+    if (boot_nvn_ev.cap) for (uint32_t j = boot_nvn_hmap_hash(key, boot_nvn_ev.cap); boot_nvn_ev.tab[j].key; j = (j + 1) & (boot_nvn_ev.cap - 1))
+        if (boot_nvn_ev.tab[j].key == key) return &boot_nvn_ev.tab[j];
+    if (!create) return NULL;
+    if ((boot_nvn_ev.used + 1) * 4 > boot_nvn_ev.cap * 3) {   /* load <= 3/4 */
+        uint32_t cap = boot_nvn_ev.cap ? boot_nvn_ev.cap * 2 : 4096;
+        BootNvnEvPage *t = (BootNvnEvPage *)calloc(cap, sizeof *t);
+        if (!t) return NULL;
+        for (uint32_t i = 0; i < boot_nvn_ev.cap; ++i) if (boot_nvn_ev.tab[i].key) {
+            uint32_t j = boot_nvn_hmap_hash(boot_nvn_ev.tab[i].key, cap); while (t[j].key) j = (j + 1) & (cap - 1);
+            t[j] = boot_nvn_ev.tab[i];
+        }
+        boot_nvn_ev.index_bytes += (uint64_t)(cap - boot_nvn_ev.cap) * sizeof *t;
+        free(boot_nvn_ev.tab); boot_nvn_ev.tab = t; boot_nvn_ev.cap = cap;
+    }
+    uint32_t j = boot_nvn_hmap_hash(key, boot_nvn_ev.cap); while (boot_nvn_ev.tab[j].key) j = (j + 1) & (boot_nvn_ev.cap - 1);
+    BootNvnEvPage *p = &boot_nvn_ev.tab[j]; p->key = key; p->s = NULL; p->n = p->cap = 0; ++boot_nvn_ev.used;
+    return p;
+}
+static inline void boot_nvn_ev_page_drop_locked(BootNvnEvPage *p) {   /* an empty page leaves the table (backward-shift deletion) */
+    const uint32_t mask = boot_nvn_ev.cap - 1; uint32_t j = (uint32_t)(p - boot_nvn_ev.tab);
+    boot_nvn_ev.index_bytes -= (uint64_t)p->cap * sizeof *p->s; free(p->s);
+    p->key = 0; p->s = NULL; p->n = p->cap = 0; --boot_nvn_ev.used;
+    for (uint32_t i = (j + 1) & mask; boot_nvn_ev.tab[i].key; i = (i + 1) & mask) {
+        uint32_t home = boot_nvn_hmap_hash(boot_nvn_ev.tab[i].key, boot_nvn_ev.cap);
+        if (((i - home) & mask) >= ((i - j) & mask)) {
+            boot_nvn_ev.tab[j] = boot_nvn_ev.tab[i]; boot_nvn_ev.tab[i].key = 0; boot_nvn_ev.tab[i].s = NULL; boot_nvn_ev.tab[i].n = boot_nvn_ev.tab[i].cap = 0; j = i;
+        }
+    }
+}
+static inline int boot_nvn_ev_add_locked(uint32_t i, uint64_t a, uint64_t len) {   /* slot i on every page of [a, a+len); 0: out of host memory */
+    if (!len) return 1;
+    const unsigned lv = len > BOOT_NVN_EV_SMALL, sh = boot_nvn_ev_shift(lv);
+    for (uint64_t pg = a >> sh, last = (a + len - 1) >> sh; pg <= last; ++pg) {
+        BootNvnEvPage *p = boot_nvn_ev_page_locked(boot_nvn_ev_key(pg, lv), 1);
+        if (!p) return 0;
+        if (p->n == p->cap) {
+            uint32_t cap = p->cap ? p->cap * 2 : 4; uint32_t *x = (uint32_t *)realloc(p->s, (size_t)cap * sizeof *x);
+            if (!x) return 0;
+            boot_nvn_ev.index_bytes += (uint64_t)(cap - p->cap) * sizeof *x; p->s = x; p->cap = cap;
+        }
+        p->s[p->n++] = i; ++boot_nvn_ev.entries;
+    }
+    return 1;
+}
+static inline void boot_nvn_ev_del_locked(uint32_t i, uint64_t a, uint64_t len) {   /* slot i off the pages of [a, a+len) (absent: nothing) */
+    if (!len) return;
+    const unsigned lv = len > BOOT_NVN_EV_SMALL, sh = boot_nvn_ev_shift(lv);
+    for (uint64_t pg = a >> sh, last = (a + len - 1) >> sh; pg <= last; ++pg) {
+        BootNvnEvPage *p = boot_nvn_ev_page_locked(boot_nvn_ev_key(pg, lv), 0);
+        if (!p) continue;
+        for (uint32_t k = 0; k < p->n; ) if (p->s[k] == i) { p->s[k] = p->s[--p->n]; --boot_nvn_ev.entries; } else ++k;
+        if (!p->n) boot_nvn_ev_page_drop_locked(p);
+    }
+}
+static inline void boot_nvn_ev_unindex_locked(BootNvnSlot *t, uint32_t i) {
+    if (!t->ev_in) return;
+    boot_nvn_ev_del_locked(i, t->ev_ctl, t->ev_ctl_len); boot_nvn_ev_del_locked(i, t->ev_cmd, t->ev_cmd_len); t->ev_in = 0;
+}
+/* Store lock held (boot_nvn_slot_free_locked): the slot is released or marked dead, its handle already gone. */
+static inline void boot_nvn_ev_forget_locked(BootNvnSlot *t, uint32_t i) {
+    uint8_t m = __atomic_exchange_n(&t->ev_mark, 0, __ATOMIC_RELAXED);
+    if (m & BOOT_NVN_EV_WOULD_DEAD) InterlockedExchangeAdd64(&boot_nvn_ev.virt_dead, -(LONG64)t->cap);
+    if (m & BOOT_NVN_EV_WOULD_EVICT) InterlockedExchangeAdd64(&boot_nvn_ev.virt_lru, -(LONG64)t->cap);
+    if (!boot_nvn_ev_on()) return;
+    if (!TryAcquireSRWLockExclusive(&boot_nvn_ev.lock)) {   /* always (ev_in is written under this lock by another thread's install) */
+        const uint64_t q0 = boot_nvn_qpc(); AcquireSRWLockExclusive(&boot_nvn_ev.lock);   /* storelock-work: counted (the store lock is held meanwhile) */
+        InterlockedIncrement64(&boot_nvn_sl_stats.ev_waits); InterlockedExchangeAdd64(&boot_nvn_sl_stats.ev_wait_qpc, (LONG64)(boot_nvn_qpc() - q0));
+    }
+    boot_nvn_ev_unindex_locked(t, i);
+    __atomic_store_n(&t->ev_handle, 0, __ATOMIC_RELAXED); t->ev_reach = 0;   /* no longer installed (the census and the sweep read these) */
+    ReleaseSRWLockExclusive(&boot_nvn_ev.lock);
+}
+static inline void boot_nvn_hmap_clear(BootNvnHostMap *m) {
+    boot_nvn_rl_lock(&m->lock, BOOT_NVN_RL_MAP);
+    if (m->cap) { memset(m->key, 0, (size_t)m->cap * sizeof *m->key); memset(m->val, 0, (size_t)m->cap * sizeof *m->val); }
+    m->used = 0;
+    ReleaseSRWLockExclusive(&m->lock);
+}
+/* k removed only while it still maps to v (an EndRecording on another thread may have installed a newer recording). 1: removed. */
+static inline int boot_nvn_hmap_remove_if(BootNvnHostMap *m, uint64_t k, uint64_t v) {
+    int done = 0; if (!k || !v) return 0;
+    boot_nvn_rl_lock(&m->lock, BOOT_NVN_RL_MAP);
+    if (m->cap) {
+        uint32_t j = boot_nvn_hmap_hash(k, m->cap);
+        while (m->key[j] && m->key[j] != k) j = (j + 1) & (m->cap - 1);
+        if (m->key[j] == k && m->val[j] == v) {   /* backward-shift deletion, as boot_nvn_hmap_put */
+            m->key[j] = 0; m->val[j] = 0; --m->used; done = 1;
+            for (uint32_t i = (j + 1) & (m->cap - 1); m->key[i]; i = (i + 1) & (m->cap - 1)) {
+                uint32_t home = boot_nvn_hmap_hash(m->key[i], m->cap);
+                if (((i - home) & (m->cap - 1)) >= ((i - j) & (m->cap - 1))) {
+                    m->key[j] = m->key[i]; m->val[j] = m->val[i]; m->key[i] = 0; m->val[i] = 0; j = i;
+                }
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&m->lock);
+    return done;
+}
+static inline void boot_nvn_ev_remember(uint64_t h, unsigned cls) {   /* a released handle, for "used again" */
+    BootNvnHostMap *g = boot_nvn_ev_gone();
+    if (g->used >= BOOT_NVN_EV_GONE_MAX) { boot_nvn_hmap_clear(g); InterlockedIncrement64(&boot_nvn_ev.gone_clears); }
+    if (boot_nvn_hmap_put(g, h, cls | (uint64_t)(uint32_t)boot_nvn_ev_now << 8) == UINT64_MAX) boot_nvn_hmap_put(g, h, 0);
+}
+/* Release (or, dry, mark) slot i if it still is the recording of handle h with generation gen. Takes the store lock (walk lock
+ * shared may be held). 1 released, 2 released while a submission reads it (freed at its unpin), 3 marked (dry run), 0 skipped
+ * (no longer that recording; or pinned, for class 2). *bytes: its buffer. */
+static inline int boot_nvn_ev_release(uint32_t i, uint32_t gen, uint64_t h, unsigned cls, int dry, uint64_t *bytes) {
+    BootNvnShadowStore *s = boot_nvn_shadow(); const uint64_t sh = BOOT_NVN_SHADOW | (uint64_t)i << 32; int r = 0;
+    *bytes = 0;
+    const uint64_t sl = boot_nvn_sl_lock(s, BOOT_NVN_SL_EVICT, 0);
+    BootNvnSlot *t = i < s->count ? boot_nvn_slot_at(s, i) : NULL;
+    if (t && t->next_free == UINT32_MAX && !t->dead && t->gen == gen && t->closed && __atomic_load_n(&t->ev_handle, __ATOMIC_RELAXED) == h &&
+        !(cls == BOOT_NVN_EV_EVICT && (t->pins || t->cb_refs))) {   /* call-bind: a version a caller is bound to is a called list */
+        if (dry) {
+            if (!(__atomic_load_n(&t->ev_mark, __ATOMIC_RELAXED) & (BOOT_NVN_EV_WOULD_DEAD | BOOT_NVN_EV_WOULD_EVICT)) && boot_nvn_hmap_get(boot_nvn_handles(), h) == sh) {
+                *bytes = t->cap; r = 3;
+                __atomic_or_fetch(&t->ev_mark, cls == BOOT_NVN_EV_DEAD ? BOOT_NVN_EV_WOULD_DEAD : BOOT_NVN_EV_WOULD_EVICT, __ATOMIC_RELAXED);
+                InterlockedExchangeAdd64(cls == BOOT_NVN_EV_DEAD ? &boot_nvn_ev.virt_dead : &boot_nvn_ev.virt_lru, (LONG64)t->cap);
+                if (cls == BOOT_NVN_EV_DEAD) {   /* counted once: out of the index (a would-be-evicted one stays: class 1 may still free it) */
+                    AcquireSRWLockExclusive(&boot_nvn_ev.lock); boot_nvn_ev_unindex_locked(t, i); ReleaseSRWLockExclusive(&boot_nvn_ev.lock);
+                }
+            }
+        } else {
+            if (!boot_nvn_ev.released_any) InterlockedExchange(&boot_nvn_ev.released_any, 1);   /* before the first map removal (boot_nvn_ev_skip) */
+            if (boot_nvn_hmap_remove_if(boot_nvn_handles(), h, sh)) {
+                if (cls == BOOT_NVN_EV_DEAD) t->cb_flags |= BOOT_NVN_CB_INVALID;   /* call-bind: invalid in NVN: a caller bound to it falls back to the handle */
+                *bytes = t->cap; r = boot_nvn_slot_free_locked(s, i) ? 2 : 1;
+            }
+        }
+    }
+    boot_nvn_sl_unlock(s, BOOT_NVN_SL_EVICT, 0, sl);   /* (v2: then its bindings) */
+    if (r == 1 || r == 2) boot_nvn_ev_remember(h, cls);
+    return r;
+}
+/* ---- recording hooks (boot_nvn_cmd_observe, boot_nvn_cmd_end_ret) */
+static inline void boot_nvn_ev_begin(BootContext *c, uint64_t self, uint64_t cmd) {   /* BeginRecording, before the driver */
+    uint64_t w = 0;
+    if (!cmd) return;
+    int ok = boot_nvn_peek(c, self, cmd, &w, sizeof w) == sizeof w && !(w & 3);
+    if (boot_nvn_hmap_put(boot_nvn_ev_begins(), cmd, ok ? w | 1 : 0) == UINT64_MAX) boot_nvn_hmap_put(boot_nvn_ev_begins(), cmd, 0);
+}
+static inline void boot_nvn_ev_switch(uint64_t cmd) {   /* AddCommandMemory / AddControlMemory (before the driver): a block switch while recording? */
+    if (!cmd || !boot_nvn_ev_begins()->used) return;
+    uint64_t v = boot_nvn_hmap_get(boot_nvn_ev_begins(), cmd);
+    if (v && !(v & 2)) boot_nvn_hmap_put(boot_nvn_ev_begins(), cmd, v | 2);
+}
+static inline void boot_nvn_ev_reset(uint64_t cmd) { if (cmd && boot_nvn_ev_begins()->used) boot_nvn_hmap_put(boot_nvn_ev_begins(), cmd, 0); }   /* Initialize / Finalize */
+/* EndRecording's return, before the install: the recording's control and command ranges (zero lengths: untracked). */
+static inline void boot_nvn_ev_ranges(BootContext *c, uint64_t self, uint64_t cmd, uint64_t h, BootNvnEvRange *rg) {
+    memset(rg, 0, sizeof *rg);
+    const uint64_t v = cmd && boot_nvn_ev_begins()->used ? boot_nvn_hmap_put(boot_nvn_ev_begins(), cmd, 0) : 0;   /* taken: cmd no longer records */
+    if (!h || !boot_nvn_ev_dead_mode()) return;
+    InterlockedIncrement64(&boot_nvn_ev.ended);
+    uint64_t w[10] = {0}, hd[2] = {0, 0}; const uint64_t ctl_s = boot_nvn_ev_ctl_start(h), cmd_s = v & ~UINT64_C(3); uint64_t ctl_e = 0, cmd_e = 0; int why = -1;
+    if (!v) why = BOOT_NVN_EV_U_NO_BEGIN;
+    else if (v & 2) why = BOOT_NVN_EV_U_SWITCHED;
+    else if (boot_nvn_peek(c, self, cmd, w, sizeof w) != sizeof w || w[9] != w[4]) why = BOOT_NVN_EV_U_OBJECT;   /* +0x48 = +0x20 after EndRecording */
+    else {
+        ctl_e = w[4];
+        if (!(w[7] <= ctl_s && ctl_s + 0x18 <= ctl_e && ctl_e <= w[5] + 0x10 && ctl_e - ctl_s <= BOOT_NVN_EV_MAX) ||
+            boot_nvn_peek(c, self, ctl_s, &hd[0], 8) != 8 || hd[0] != BOOT_NVN_EV_CTL_HEADER ||
+            boot_nvn_peek(c, self, ctl_e - 8, &hd[1], 8) != 8 || (hd[1] & 0xff) != 2) why = BOOT_NVN_EV_U_CONTROL;
+        else if ((cmd_e = w[0]) != cmd_s && !(cmd_s && w[6] <= cmd_s && cmd_s < cmd_e && cmd_e <= w[3] + 0x400 && cmd_e - cmd_s <= BOOT_NVN_EV_MAX))
+            why = BOOT_NVN_EV_U_COMMAND;
+    }
+    if (why >= 0) {
+        InterlockedIncrement64(&boot_nvn_ev.untracked[why]);
+        if (InterlockedIncrement(&boot_nvn_ev.samples_bad) <= 8)
+            boot_nvn_ev_note("nvn native: rec evict untracked (%s): cmd %llx handle %llx begin %llx object %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx control words %llx %llx",
+                             why == BOOT_NVN_EV_U_NO_BEGIN ? "no BeginRecording seen" : why == BOOT_NVN_EV_U_SWITCHED ? "block added while recording" : why == BOOT_NVN_EV_U_OBJECT ? "command buffer layout" :
+                             why == BOOT_NVN_EV_U_CONTROL ? "control layout" : "command range", (unsigned long long)cmd, (unsigned long long)h, (unsigned long long)v,
+                             (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5],
+                             (unsigned long long)w[6], (unsigned long long)w[7], (unsigned long long)w[8], (unsigned long long)w[9], (unsigned long long)hd[0], (unsigned long long)hd[1]);
+        return;
+    }
+    rg->ctl = ctl_s; rg->ctl_len = (uint32_t)(ctl_e - ctl_s);
+    if (cmd_e > cmd_s) { rg->cmd = cmd_s; rg->cmd_len = (uint32_t)(cmd_e - cmd_s); InterlockedIncrement64(&boot_nvn_ev.with_cmd); }
+    InterlockedIncrement64(&boot_nvn_ev.tracked);
+    if (InterlockedIncrement(&boot_nvn_ev.samples) <= 24)
+        boot_nvn_ev_note("nvn native: rec evict sample (TOTK_REC_EVICT_DEAD %d): cmd %llx handle %llx (%s, %llu segments) control %llx +%x (block %llx..%llx) commands %llx +%x (block %llx..%llx)",
+                         boot_nvn_ev_dead_mode(), (unsigned long long)cmd, (unsigned long long)h, (h & 1) ? "packed" : "plain", (unsigned long long)((h & 1) ? h >> 48 : 0),
+                         (unsigned long long)rg->ctl, rg->ctl_len, (unsigned long long)w[7], (unsigned long long)(w[5] + 0x10), (unsigned long long)rg->cmd, rg->cmd_len,
+                         (unsigned long long)w[6], (unsigned long long)w[3]);
+}
+/* ev lock held: the indexed recordings (not slot self) on page p whose COMMAND range overlaps [a, e), added to vi / vg / vh (*n, no
+ * duplicates); *ctl_only counts entries whose control range alone overlaps. 1: the batch is full. */
+static inline int boot_nvn_ev_scan_page_locked(const BootNvnEvPage *p, uint64_t a, uint64_t e, uint32_t self, uint32_t *vi, uint32_t *vg, uint64_t *vh, unsigned *n, unsigned *ctl_only) {
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    for (uint32_t k = 0; k < p->n; ++k) {
+        const uint32_t j = p->s[k]; const BootNvnSlot *u = j == self ? NULL : boot_nvn_slot_peek(s, j);
+        if (!u) continue;
+        if (!(u->ev_cmd_len && u->ev_cmd < e && a < u->ev_cmd + u->ev_cmd_len)) {   /* control memory only: kept (see above) */
+            if (u->ev_ctl_len && u->ev_ctl < e && a < u->ev_ctl + u->ev_ctl_len) ++*ctl_only;
+            continue;
+        }
+        unsigned d = 0; while (d < *n && vi[d] != j) ++d;
+        if (d < *n) continue;
+        if (*n == BOOT_NVN_EV_BATCH) return 1;
+        vi[*n] = j; vg[*n] = u->gen; vh[*n] = __atomic_load_n(&u->ev_handle, __ATOMIC_RELAXED); ++*n;
+    }
+    return 0;
+}
+/* ev lock held: the recordings whose command range overlaps [a, a+len), at both page sizes (a range with more pages than the table
+ * has entries, a whole memory pool, walks the table instead). 1: the batch is full (release these, then ask again). */
+static inline int boot_nvn_ev_collect_locked(uint64_t a, uint64_t len, uint32_t self, uint32_t *vi, uint32_t *vg, uint64_t *vh, unsigned *n, unsigned *ctl_only) {
+    if (!len) return 0;
+    const uint64_t e = a + len;
+    for (unsigned lv = 0; lv < 2; ++lv) {
+        const unsigned sh = boot_nvn_ev_shift(lv); const uint64_t p0 = a >> sh, p1 = (e - 1) >> sh;
+        if (p1 - p0 >= (uint64_t)boot_nvn_ev.cap) {
+            for (uint32_t it = 0; it < boot_nvn_ev.cap; ++it) {
+                const BootNvnEvPage *p = &boot_nvn_ev.tab[it]; const uint64_t key = p->key - 1;
+                if (p->key && (key & 1) == lv && (key >> 1) >= p0 && (key >> 1) <= p1 && boot_nvn_ev_scan_page_locked(p, a, e, self, vi, vg, vh, n, ctl_only)) return 1;
+            }
+        } else for (uint64_t pg = p0; pg <= p1; ++pg) {
+            const BootNvnEvPage *p = boot_nvn_ev_page_locked(boot_nvn_ev_key(pg, lv), 0);
+            if (p && boot_nvn_ev_scan_page_locked(p, a, e, self, vi, vg, vh, n, ctl_only)) return 1;
+        }
+    }
+    return 0;
+}
+/* Class 1 releases of a batch found by boot_nvn_ev_collect_locked (no ev lock held; the walk lock shared may be). by: the new
+ * recording's handle (rg its ranges), or the finalized pool (rg NULL), for the log. */
+static inline void boot_nvn_ev_release_dead(const uint32_t *vi, const uint32_t *vg, const uint64_t *vh, unsigned n, uint64_t by, const BootNvnEvRange *rg) {
+    const int dry = boot_nvn_ev_dead_mode() == 2;
+    for (unsigned k = 0; k < n; ++k) {
+        uint64_t b; const int r = boot_nvn_ev_release(vi[k], vg[k], vh[k], BOOT_NVN_EV_DEAD, dry, &b);
+        if (r == 1 || r == 2) { InterlockedIncrement64(&boot_nvn_ev.dead_n); InterlockedExchangeAdd64(&boot_nvn_ev.dead_bytes, (LONG64)b); if (r == 2) InterlockedIncrement64(&boot_nvn_ev.dead_pinned); }
+        else if (r == 3) { InterlockedIncrement64(&boot_nvn_ev.would_dead_n); InterlockedExchangeAdd64(&boot_nvn_ev.would_dead_bytes, (LONG64)b); }
+        else InterlockedIncrement64(&boot_nvn_ev.dead_skipped);
+        if (r && InterlockedIncrement(&boot_nvn_ev.logged_rel) <= 8) {
+            const char *how = r == 3 ? "dry run, would free: " : r == 2 ? "pinned, freed at its unpin: " : "";
+            if (rg) boot_nvn_ev_note("nvn native: rec evict release (%s%s): handle %llx (slot %u, %llu bytes) written over by handle %llx (control %llx +%x, commands %llx +%x)",
+                                     how, boot_nvn_ev_class_name(BOOT_NVN_EV_DEAD), (unsigned long long)vh[k], vi[k], (unsigned long long)b, (unsigned long long)by,
+                                     (unsigned long long)rg->ctl, rg->ctl_len, (unsigned long long)rg->cmd, rg->cmd_len);
+            else boot_nvn_ev_note("nvn native: rec evict release (%s%s): handle %llx (slot %u, %llu bytes), its memory pool %llx finalized",
+                                  how, boot_nvn_ev_class_name(BOOT_NVN_EV_DEAD), (unsigned long long)vh[k], vi[k], (unsigned long long)b, (unsigned long long)by);
+        }
+    }
+}
+/* Inside boot_nvn_handle_install_ev (walk lock shared when TOTK_SNAP_ATOMIC): handle -> slot is installed. The recordings whose
+ * command range this one's ranges overlap are released (class 1) and this one is indexed; with class 2 only, its handle is noted. */
+static inline void boot_nvn_ev_installed(uint64_t handle, uint64_t slot, const BootNvnEvRange *rg) {
+    BootNvnShadowStore *s = boot_nvn_shadow(); const uint32_t self = boot_nvn_slot_of(slot); BootNvnSlot *t = boot_nvn_slot_peek(s, self);
+    if (!t) return;
+    if (boot_nvn_ev_gone()->used) boot_nvn_hmap_put(boot_nvn_ev_gone(), handle, 0);   /* issued again: a valid handle */
+    const int track = boot_nvn_ev_dead_mode() && (rg->ctl_len || rg->cmd_len);
+    uint32_t vi[BOOT_NVN_EV_BATCH], vg[BOOT_NVN_EV_BATCH]; uint64_t vh[BOOT_NVN_EV_BATCH];
+    for (unsigned pass = 0; pass < 64; ++pass) {
+        unsigned n = 0, ctl_only = 0; int more = 0;
+        AcquireSRWLockExclusive(&boot_nvn_ev.lock);
+        if (boot_nvn_hmap_get(boot_nvn_handles(), handle) != slot) { ReleaseSRWLockExclusive(&boot_nvn_ev.lock); return; }   /* replaced or released meanwhile */
+        if (!pass) __atomic_store_n(&t->ev_handle, handle, __ATOMIC_RELAXED);
+        if (track) {
+            more = boot_nvn_ev_collect_locked(rg->ctl, rg->ctl_len, self, vi, vg, vh, &n, &ctl_only) || boot_nvn_ev_collect_locked(rg->cmd, rg->cmd_len, self, vi, vg, vh, &n, &ctl_only);
+            if (!more && !t->ev_in) {   /* indexed once, after the recordings it overwrote are out */
+                t->ev_ctl = rg->ctl; t->ev_ctl_len = rg->ctl_len; t->ev_cmd = rg->cmd; t->ev_cmd_len = rg->cmd_len;
+                if (boot_nvn_ev_add_locked(self, rg->ctl, rg->ctl_len) && boot_nvn_ev_add_locked(self, rg->cmd, rg->cmd_len)) t->ev_in = 1;
+                else { boot_nvn_ev_del_locked(self, rg->ctl, rg->ctl_len); boot_nvn_ev_del_locked(self, rg->cmd, rg->cmd_len); ++boot_nvn_ev.index_lost; }
+            }
+        }
+        ReleaseSRWLockExclusive(&boot_nvn_ev.lock);
+        if (ctl_only) InterlockedExchangeAdd64(&boot_nvn_ev.ctl_only, ctl_only);
+        boot_nvn_ev_release_dead(vi, vg, vh, n, handle, rg);
+        if (!more) return;
+    }
+}
+/* nvnMemoryPoolFinalize, before the driver (hybrid observe, registered NOLOCK: no renderer lock; the walk / store / index locks are
+ * taken here as an EndRecording's return takes them): every recording with commands in the pool's storage
+ * is dead in NVN (its commands are no longer mapped): class 1. The pool's CPU storage and size are pool+0x30 / +0x38 (stage-0 trace
+ * dumps of nvnMemoryPoolInitialize: storage 760845d000 size 400000 for pool 760885d060). In the trace TotK finalized no pool that had
+ * held command memory (loading only); streaming areas out may. */
+static inline void boot_nvn_ev_pool_final(BootContext *c, uint64_t self, uint64_t pool) {
+    uint64_t w[2] = {0, 0};
+    if (!boot_nvn_ev_dead_mode() || !pool || boot_nvn_peek(c, self, pool + 0x30, w, sizeof w) != sizeof w || !w[0] || !w[1] || w[1] > (UINT64_C(16) << 30) || w[0] + w[1] < w[0]) return;
+    InterlockedIncrement64(&boot_nvn_ev.pools);
+    const int atomic = boot_nvn_snap_atomic_on(); const uint64_t d0 = (uint64_t)boot_nvn_ev.dead_n + (uint64_t)boot_nvn_ev.would_dead_n;
+    if (atomic) AcquireSRWLockShared(&boot_nvn_walk_lock);   /* as an EndRecording's map change */
+    uint32_t vi[BOOT_NVN_EV_BATCH], vg[BOOT_NVN_EV_BATCH]; uint64_t vh[BOOT_NVN_EV_BATCH];
+    for (unsigned pass = 0; pass < 65536; ++pass) {
+        unsigned n = 0, ctl_only = 0;
+        AcquireSRWLockExclusive(&boot_nvn_ev.lock);
+        const int more = boot_nvn_ev_collect_locked(w[0], w[1], UINT32_MAX, vi, vg, vh, &n, &ctl_only);
+        ReleaseSRWLockExclusive(&boot_nvn_ev.lock);
+        boot_nvn_ev_release_dead(vi, vg, vh, n, pool, NULL);
+        if (!more) break;
+    }
+    if (atomic) ReleaseSRWLockShared(&boot_nvn_walk_lock);
+    InterlockedExchangeAdd64(&boot_nvn_ev.pool_lists, (LONG64)((uint64_t)boot_nvn_ev.dead_n + (uint64_t)boot_nvn_ev.would_dead_n - d0));
+}
+/* TOTK_REC_EVICT=1: a CallCommands naming these handles was recorded: they are never budget candidates. */
+static inline void boot_nvn_ev_called(const uint64_t *h, uint32_t n) {
+    BootNvnShadowStore *s = boot_nvn_shadow();
+    for (uint32_t k = 0; k < n; ++k) {
+        uint64_t sh = h[k] ? boot_nvn_hmap_get(boot_nvn_handles(), h[k]) : 0;
+        BootNvnSlot *t = sh ? boot_nvn_slot_peek(s, boot_nvn_slot_of(sh)) : NULL;   /* a slot reused meanwhile only gets the safe mark */
+        if (t && !(__atomic_load_n(&t->ev_reach, __ATOMIC_RELAXED) & BOOT_NVN_EV_CALLED)) __atomic_or_fetch(&t->ev_reach, BOOT_NVN_EV_CALLED, __ATOMIC_RELAXED);
+    }
+}
+/* ---- "used again" */
+static inline void boot_nvn_ev_would_reused(BootNvnSlot *t, uint32_t i, uint32_t depth, uint8_t m) {   /* the walk (slot lock held) */
+    InterlockedIncrement64(&boot_nvn_ev.would_reach);
+    if (m & BOOT_NVN_EV_REUSED) return;
+    __atomic_or_fetch(&t->ev_mark, BOOT_NVN_EV_REUSED, __ATOMIC_RELAXED);
+    const unsigned cls = (m & BOOT_NVN_EV_WOULD_DEAD) ? BOOT_NVN_EV_DEAD : BOOT_NVN_EV_EVICT;
+    InterlockedIncrement64(&boot_nvn_ev.would_reuse[cls]);
+#ifdef TOTK_DRAW_PATH
+    if (InterlockedIncrement(&boot_nvn_ev.logged_would) <= 16) {
+        char line[400]; snprintf(line, sizeof line, " (rec-evict dry run, %s): handle %llx (slot %u, %u bytes, last reached at present %u, now %u) reached %s (depth %u);"
+                                 " with the class on its commands would be skipped", boot_nvn_ev_class_name(cls), (unsigned long long)t->ev_handle, i, t->cap, t->ev_use,
+                                 (unsigned)boot_nvn_ev_now, depth ? "through CallCommands" : "as a submitted handle", depth);
+        boot_draw_log("nvn native: REC-EVICT would-be-released recording reached again%s %llu %llu", line, (uint64_t)boot_nvn_ev.would_reuse[cls], (uint64_t)boot_nvn_ev.would_reach);
+    }
+#else
+    (void)i; (void)depth;
+#endif
+}
+static inline void boot_nvn_ev_reach(BootNvnSlot *t, uint32_t i, uint32_t depth) {   /* the submit walk reached slot i (slot lock held) */
+    const uint8_t r = depth ? BOOT_NVN_EV_CALLED : BOOT_NVN_EV_SUBMITTED, m = __atomic_load_n(&t->ev_mark, __ATOMIC_RELAXED);
+    t->ev_use = (uint32_t)boot_nvn_ev_now;
+    if ((__atomic_load_n(&t->ev_reach, __ATOMIC_RELAXED) & r) != r) __atomic_or_fetch(&t->ev_reach, r, __ATOMIC_RELAXED);
+    if (m & (BOOT_NVN_EV_WOULD_DEAD | BOOT_NVN_EV_WOULD_EVICT)) boot_nvn_ev_would_reused(t, i, depth, m);
+}
+/* The submit walk could not resolve handle h: a handle rec-evict released? */
+static inline void boot_nvn_ev_missing(uint64_t h, uint32_t depth) {
+    BootNvnHostMap *g = boot_nvn_ev_gone(); uint64_t v;
+    if (!g->used || !(v = boot_nvn_hmap_get(g, h))) return;
+    const unsigned cls = (unsigned)(v & 0xff) == BOOT_NVN_EV_EVICT ? BOOT_NVN_EV_EVICT : BOOT_NVN_EV_DEAD; const uint32_t at = (uint32_t)(v >> 8);
+    InterlockedIncrement64(&boot_nvn_ev.reuse_walk[cls]);
+#ifdef TOTK_DRAW_PATH
+    if (InterlockedIncrement(&boot_nvn_ev.logged_use) <= 16) {
+        char line[400]; snprintf(line, sizeof line, " (rec-evict, %s): handle %llx (control %llx, %s, %llu segments), released at present %u (%u presents ago), reached %s (depth %u)"
+                                 " by the submit call; its commands are skipped (the frame misses them)", boot_nvn_ev_class_name(cls), (unsigned long long)h,
+                                 (unsigned long long)boot_nvn_ev_ctl_start(h), (h & 1) ? "packed" : "plain", (unsigned long long)((h & 1) ? h >> 48 : 0), at, (uint32_t)boot_nvn_ev_now - at,
+                                 depth ? "through CallCommands" : "as a submitted handle", depth);
+        boot_draw_log("nvn native: REC-EVICT released handle used again%s %llu %llu", line, (uint64_t)boot_nvn_ev.reuse_walk[cls], 0);
+    }
+#else
+    (void)depth; (void)at;
+#endif
+}
+/* The executor met handle h that no longer resolves (it would stop the game: "bad record"). 1: skip its commands (rec-evict has
+ * released recordings this boot, so it is one of those, remembered or not); 0: the old behaviour. */
+static inline int boot_nvn_ev_skip(uint64_t h, unsigned depth) {
+    if (!__atomic_load_n(&boot_nvn_ev.released_any, __ATOMIC_SEQ_CST)) return 0;   /* nothing was ever released: not ours (set before the first map removal) */
+    BootNvnHostMap *g = boot_nvn_ev_gone(); const uint64_t v = g->used ? boot_nvn_hmap_get(g, h) : 0;
+    InterlockedIncrement64(v ? &boot_nvn_ev.reuse_skip : &boot_nvn_ev.reuse_unknown);
+#ifdef TOTK_DRAW_PATH
+    if (InterlockedIncrement(&boot_nvn_ev.logged_skip) <= 16) {
+        char line[300]; snprintf(line, sizeof line, " (rec-evict, %s): handle %llx at depth %u, present %u: its commands are skipped", v ? boot_nvn_ev_class_name((unsigned)(v & 0xff)) :
+                                 "not remembered (released before the memory of released handles started over, or not ours)", (unsigned long long)h, depth, (unsigned)boot_nvn_ev_now);
+        boot_draw_log("nvn native: REC-EVICT unresolvable handle skipped in the translation%s %llu %llu", line, (uint64_t)boot_nvn_ev.reuse_skip, (uint64_t)boot_nvn_ev.reuse_unknown);
+    }
+#else
+    (void)depth;
+#endif
+    return 1;
+}
+/* ---- class 2: the budget sweep (presenting thread) */
+static inline int boot_nvn_ev_candidate(const BootNvnSlot *t, uint32_t now, uint32_t age, uint32_t *idle) {   /* read without locks; boot_nvn_ev_release checks again */
+    if (t->next_free != UINT32_MAX || t->dead || !t->closed || t->pins || t->cb_refs || !__atomic_load_n(&t->ev_handle, __ATOMIC_RELAXED)) return 0;
+    if (__atomic_load_n(&t->ev_reach, __ATOMIC_RELAXED) != BOOT_NVN_EV_SUBMITTED || (__atomic_load_n(&t->ev_mark, __ATOMIC_RELAXED) & (BOOT_NVN_EV_WOULD_DEAD | BOOT_NVN_EV_WOULD_EVICT))) return 0;
+    const uint32_t a = now - t->ev_use;
+    if (a < age || a > (UINT32_C(1) << 31)) return 0;
+    *idle = a - age; return 1;
+}
+static inline unsigned boot_nvn_ev_bucket(uint32_t x) { unsigned b = 0; while (x) { ++b; x >>= 1; } return b; }   /* 0..32 */
+static inline int64_t boot_nvn_ev_effective(void) { return (int64_t)boot_nvn_shadow()->bytes - boot_nvn_ev.virt_dead - boot_nvn_ev.virt_lru; }
+static inline int boot_nvn_ev_sweep(uint32_t now) {   /* 1: there were candidates */
+    BootNvnShadowStore *s = boot_nvn_shadow(); const uint64_t budget = boot_nvn_ev_budget(); const uint32_t age = boot_nvn_ev_age(); const int dry = boot_nvn_ev_lru_mode() == 2;
+    const int64_t eff = boot_nvn_ev_effective();
+    if (eff <= (int64_t)budget) return 1;
+    const uint64_t need = (uint64_t)eff - budget / 4 * 3; uint64_t hist[33] = {0}, sum = 0, freed = 0; uint32_t idle; unsigned cut = 33;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    const uint32_t n = __atomic_load_n(&s->count, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < n; ++i) { const BootNvnSlot *t = boot_nvn_slot_peek(s, i); if (t && boot_nvn_ev_candidate(t, now, age, &idle)) hist[boot_nvn_ev_bucket(idle)] += t->cap; }
+    while (cut > 0 && sum < need) sum += hist[--cut];   /* the oldest buckets that cover the excess */
+    if (sum) {
+        const int atomic = boot_nvn_snap_atomic_on();
+        if (atomic) AcquireSRWLockShared(&boot_nvn_walk_lock);   /* as an EndRecording's map change: a submit walk sees the map at one instant */
+        for (uint32_t i = 0; i < n && freed < need; ++i) {
+            const BootNvnSlot *t = boot_nvn_slot_peek(s, i);
+            if (!t || !boot_nvn_ev_candidate(t, now, age, &idle) || boot_nvn_ev_bucket(idle) < cut) continue;
+            uint64_t b; const int r = boot_nvn_ev_release(i, t->gen, __atomic_load_n(&t->ev_handle, __ATOMIC_RELAXED), BOOT_NVN_EV_EVICT, dry, &b);
+            if (r == 1 || r == 2) { InterlockedIncrement64(&boot_nvn_ev.lru_n); InterlockedExchangeAdd64(&boot_nvn_ev.lru_bytes, (LONG64)b); freed += b; }
+            else if (r == 3) { InterlockedIncrement64(&boot_nvn_ev.would_lru_n); InterlockedExchangeAdd64(&boot_nvn_ev.would_lru_bytes, (LONG64)b); freed += b; }
+        }
+        if (atomic) ReleaseSRWLockShared(&boot_nvn_walk_lock);
+    }
+    QueryPerformanceCounter(&q1);
+    InterlockedIncrement64(&boot_nvn_ev.sweeps); InterlockedExchangeAdd64(&boot_nvn_ev.sweep_qpc, q1.QuadPart - q0.QuadPart);
+    return sum != 0;
+}
+/* ---- every present (boot_nvn_queue_present) */
+static inline void boot_nvn_ev_report(uint32_t now) {
+#ifdef TOTK_DRAW_PATH
+    static uint64_t l_dn, l_db, l_wdn, l_wdb, l_ln, l_lb, l_wln, l_wlb;
+    BootNvnShadowStore *s = boot_nvn_shadow(); uint64_t cn[4] = {0}, cb[4] = {0}, vn = 0, vb = 0, open = 0;   /* new, submitted only, called; versions */
+    const uint32_t n = __atomic_load_n(&s->count, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < n; ++i) {   /* census, read without locks (approximate) */
+        const BootNvnSlot *t = boot_nvn_slot_peek(s, i);
+        if (!t || t->next_free != UINT32_MAX) continue;
+        if (t->dead) { ++vn; vb += t->cap; continue; }
+        if (!t->closed) { if (t->len) ++open; continue; }   /* a recording in progress (a free slot at the bottom of the free list also has next_free UINT32_MAX) */
+        if (!__atomic_load_n(&t->ev_handle, __ATOMIC_RELAXED)) continue;
+        const uint8_t r = __atomic_load_n(&t->ev_reach, __ATOMIC_RELAXED); const unsigned k = (r & BOOT_NVN_EV_CALLED) ? 2 : (r & BOOT_NVN_EV_SUBMITTED) ? 1 : 0;
+        ++cn[k]; cb[k] += t->cap;
+    }
+    const int dm = boot_nvn_ev_dead_mode(), lm = boot_nvn_ev_lru_mode(); LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t dn = (uint64_t)boot_nvn_ev.dead_n, db = (uint64_t)boot_nvn_ev.dead_bytes, wdn = (uint64_t)boot_nvn_ev.would_dead_n, wdb = (uint64_t)boot_nvn_ev.would_dead_bytes;
+    const uint64_t ln = (uint64_t)boot_nvn_ev.lru_n, lb = (uint64_t)boot_nvn_ev.lru_bytes, wln = (uint64_t)boot_nvn_ev.would_lru_n, wlb = (uint64_t)boot_nvn_ev.would_lru_bytes;
+    const uint64_t c1n = dm == 2 ? wdn : dn, c1b = dm == 2 ? wdb : db, p1n = dm == 2 ? l_wdn : l_dn, p1b = dm == 2 ? l_wdb : l_db;
+    const uint64_t c2n = lm == 2 ? wln : ln, c2b = lm == 2 ? wlb : lb, p2n = lm == 2 ? l_wln : l_ln, p2b = lm == 2 ? l_wlb : l_lb;
+    uint32_t pages; uint64_t entries, ibytes;
+    AcquireSRWLockShared(&boot_nvn_ev.lock); pages = boot_nvn_ev.used; entries = boot_nvn_ev.entries; ibytes = boot_nvn_ev.index_bytes; ReleaseSRWLockShared(&boot_nvn_ev.lock);
+    char line[1900];
+    snprintf(line, sizeof line, " (rec-evict; TOTK_REC_EVICT_DEAD %d%s, TOTK_REC_EVICT %d%s, budget %llu MiB, age %u presents): live recordings %u, %llu MiB in all (effective %lld MiB);"
+             " by class: new %llu (%llu MiB), submitted only %llu (%llu MiB), called %llu (%llu MiB), versions %llu (%llu MiB), open %llu;"
+             " class 1 dead (command memory written over): %s %llu (%llu MiB) last 300 presents, %llu (%llu MiB) in all, pinned at release %llu, gone meanwhile %llu,"
+             " control memory only written over (kept) %llu, memory pools finalized %llu (their recordings %llu); class 2 budget (submitted only, unused %u presents): %s %llu (%llu MiB) last 300, %llu (%llu MiB) in all, sweeps %llu (%.1f ms);"
+             " released handles used again: dead %llu, budget %llu (submit walk), skipped in the translation %llu (not remembered %llu);"
+             " dry runs, marked recordings reached again: dead %llu, budget %llu (reaches %llu);"
+             " recordings ended %llu: tracked %llu (with commands %llu), untracked: no BeginRecording %llu, block added while recording %llu, object layout %llu,"
+             " control layout %llu, command range %llu; index %u pages, %llu entries, %llu KiB (lost %llu); released handles remembered %u (memory started over %llu)",
+             dm, dm == 2 ? " dry run" : dm ? "" : " off", lm, lm == 2 ? " dry run" : lm ? "" : " off", (unsigned long long)(boot_nvn_ev_budget() >> 20), boot_nvn_ev_age(),
+             s->live, (unsigned long long)((uint64_t)s->bytes >> 20), (long long)(boot_nvn_ev_effective() >> 20),
+             (unsigned long long)cn[0], (unsigned long long)(cb[0] >> 20), (unsigned long long)cn[1], (unsigned long long)(cb[1] >> 20), (unsigned long long)cn[2],
+             (unsigned long long)(cb[2] >> 20), (unsigned long long)vn, (unsigned long long)(vb >> 20), (unsigned long long)open,
+             dm == 2 ? "would free" : "freed", (unsigned long long)(c1n - p1n), (unsigned long long)((c1b - p1b) >> 20), (unsigned long long)c1n, (unsigned long long)(c1b >> 20),
+             (unsigned long long)boot_nvn_ev.dead_pinned, (unsigned long long)boot_nvn_ev.dead_skipped, (unsigned long long)boot_nvn_ev.ctl_only,
+             (unsigned long long)boot_nvn_ev.pools, (unsigned long long)boot_nvn_ev.pool_lists, boot_nvn_ev_age(),
+             lm == 2 ? "would free" : "freed", (unsigned long long)(c2n - p2n), (unsigned long long)((c2b - p2b) >> 20), (unsigned long long)c2n, (unsigned long long)(c2b >> 20),
+             (unsigned long long)boot_nvn_ev.sweeps, (double)boot_nvn_ev.sweep_qpc * 1000.0 / (double)(f.QuadPart ? f.QuadPart : 1),
+             (unsigned long long)boot_nvn_ev.reuse_walk[BOOT_NVN_EV_DEAD], (unsigned long long)boot_nvn_ev.reuse_walk[BOOT_NVN_EV_EVICT], (unsigned long long)boot_nvn_ev.reuse_skip,
+             (unsigned long long)boot_nvn_ev.reuse_unknown, (unsigned long long)boot_nvn_ev.would_reuse[BOOT_NVN_EV_DEAD], (unsigned long long)boot_nvn_ev.would_reuse[BOOT_NVN_EV_EVICT],
+             (unsigned long long)boot_nvn_ev.would_reach, (unsigned long long)boot_nvn_ev.ended, (unsigned long long)boot_nvn_ev.tracked, (unsigned long long)boot_nvn_ev.with_cmd,
+             (unsigned long long)boot_nvn_ev.untracked[BOOT_NVN_EV_U_NO_BEGIN], (unsigned long long)boot_nvn_ev.untracked[BOOT_NVN_EV_U_SWITCHED],
+             (unsigned long long)boot_nvn_ev.untracked[BOOT_NVN_EV_U_OBJECT], (unsigned long long)boot_nvn_ev.untracked[BOOT_NVN_EV_U_CONTROL],
+             (unsigned long long)boot_nvn_ev.untracked[BOOT_NVN_EV_U_COMMAND], pages, (unsigned long long)entries, (unsigned long long)(ibytes >> 10),
+             (unsigned long long)boot_nvn_ev.index_lost, boot_nvn_ev_gone()->used, (unsigned long long)boot_nvn_ev.gone_clears);
+    boot_draw_log("nvn native: record store eviction%s present %llu %llu", line, now, 0);
+    l_dn = dn; l_db = db; l_wdn = wdn; l_wdb = wdb; l_ln = ln; l_lb = lb; l_wln = wln; l_wlb = wlb;
+#else
+    (void)now;
+#endif
+}
+/* storelock-work: every 300 presents (boot_nvn_ev_present) the "store lock" line, per present over the last 300 (both modes, the A/B
+ * baseline): acquisitions (those held shared), failed try-acquires and their wait by thread role (and the three recording threads that
+ * waited longest, by guest thread) and by site, the sampled hold time by site (average and max of every 64th acquisition of a thread,
+ * us; the max over the window), the binding drops done after the exclusive sections and the versions they freed, and the ev lock
+ * waits of releases (the store lock held meanwhile: a release that waits there makes every other user of the store lock wait). */
+static inline void boot_nvn_sl_report(uint32_t now) {
+#ifdef TOTK_DRAW_PATH
+    static const char *const name[BOOT_NVN_SL_N] = {"pin", "bound pin", "bind", "unpin", "drop", "unpin free", "drop free", "new", "free", "evict", "overwrite", "unbind"};
+    static uint64_t l_acq[BOOT_NVN_SL_N], l_w[BOOT_NVN_SL_N], l_wq[BOOT_NVN_SL_N], l_hn[BOOT_NVN_SL_N], l_hq[BOOT_NVN_SL_N], l_bw[65], l_bq[65], l_def, l_df, l_ew, l_ewq;
+    uint64_t acq[BOOT_NVN_SL_N] = {0}, w[BOOT_NVN_SL_N] = {0}, wq[BOOT_NVN_SL_N] = {0}, hn[BOOT_NVN_SL_N] = {0}, hq[BOOT_NVN_SL_N] = {0}, hm[BOOT_NVN_SL_N] = {0};
+    uint64_t bw[65], bq[65], rw[3] = {0, 0, 0}, rq[3] = {0, 0, 0}, topq[3] = {0, 0, 0}; unsigned top[3] = {65, 65, 65};
+    for (unsigned t = 0; t < 65; ++t) {
+        BootNvnRlStats *b = &boot_nvn_rl_slots[t]; bw[t] = bq[t] = 0;
+        for (unsigned k = 0; k < BOOT_NVN_SL_N; ++k) {
+            acq[k] += b->sl_acq[k]; w[k] += b->sl_wait[k]; wq[k] += b->sl_wait_qpc[k]; hn[k] += b->sl_hold_n[k]; hq[k] += b->sl_hold_qpc[k];
+            if (b->sl_hold_max[k] > hm[k]) hm[k] = b->sl_hold_max[k];
+            b->sl_hold_max[k] = 0;   /* per window (a racy reset: diagnostic only) */
+            bw[t] += b->sl_wait[k]; bq[t] += b->sl_wait_qpc[k];
+        }
+        const uint64_t dw = bw[t] - l_bw[t], dq = bq[t] - l_bq[t];
+        const unsigned r = b->sl_role == BOOT_NVN_SL_ROLE_RENDER ? 0 : b->sl_role == BOOT_NVN_SL_ROLE_RECORDER ? 1 : 2;
+        rw[r] += dw; rq[r] += dq;
+        if (r == 1 && dw) for (unsigned j = 0; j < 3; ++j) if (top[j] == 65 || dq > topq[j]) {
+            for (unsigned m = 2; m > j; --m) { top[m] = top[m - 1]; topq[m] = topq[m - 1]; }
+            top[j] = t; topq[j] = dq; break;
+        }
+    }
+    unsigned render = UINT32_MAX; for (unsigned t = 0; t < 65; ++t) if (boot_nvn_rl_slots[t].sl_role == BOOT_NVN_SL_ROLE_RENDER) { render = boot_nvn_rl_slots[t].sl_guest; break; }
+    const int v2 = boot_nvn_slv2_on(); const double per = 1.0 / 300.0, ms = 1000.0 / (double)boot_nvn_qpf(), us = 1e6 / (double)boot_nvn_qpf();
+    uint64_t ta = 0, tsh = 0, tw = 0, twq = 0;
+    for (unsigned k = 0; k < BOOT_NVN_SL_N; ++k) { ta += acq[k] - l_acq[k]; if (v2 && k <= BOOT_NVN_SL_DROP) tsh += acq[k] - l_acq[k]; tw += w[k] - l_w[k]; twq += wq[k] - l_wq[k]; }
+    const uint64_t def = (uint64_t)boot_nvn_sl_stats.deferred, df = (uint64_t)boot_nvn_sl_stats.drop_frees, ew = (uint64_t)boot_nvn_sl_stats.ev_waits, ewq = (uint64_t)boot_nvn_sl_stats.ev_wait_qpc;
+    char line[2400]; size_t at = 0;
+#define BOOT_NVN_SL_CAT(...) do { if (at < sizeof line) { int k_ = snprintf(line + at, sizeof line - at, __VA_ARGS__); if (k_ > 0) at += (size_t)k_; } } while (0)
+    BOOT_NVN_SL_CAT(" (storelock-work; TOTK_STORE_LOCK_V2 %s%s) last 300 presents, per present: taken %.0f (%.0f shared), waits %.1f (%.3f ms); by role: render t%d %.1f (%.3f ms),"
+                    " recorders %.1f (%.3f ms", v2 ? "on" : "off", v2 ? ": pins, binds, unpins and binding drops shared" : "", (double)ta * per, (double)tsh * per,
+                    (double)tw * per, (double)twq * per * ms, render == UINT32_MAX ? -1 : (int)render, (double)rw[0] * per, (double)rq[0] * per * ms, (double)rw[1] * per, (double)rq[1] * per * ms);
+    for (unsigned j = 0; j < 3; ++j) if (top[j] < 65)
+        BOOT_NVN_SL_CAT("%s t%u %.1f (%.3f ms)", j ? "," : ":", boot_nvn_rl_slots[top[j]].sl_guest, (double)(bw[top[j]] - l_bw[top[j]]) * per, (double)topq[j] * per * ms);
+    BOOT_NVN_SL_CAT("), other %.1f (%.3f ms); by site (taken, waits, wait ms per present; hold us avg/max of every 64th):", (double)rw[2] * per, (double)rq[2] * per * ms);
+    for (unsigned k = 0; k < BOOT_NVN_SL_N; ++k) if (acq[k] != l_acq[k])
+        BOOT_NVN_SL_CAT(" %s %.1f %.2f %.3f %.2f/%.1f,", name[k], (double)(acq[k] - l_acq[k]) * per, (double)(w[k] - l_w[k]) * per, (double)(wq[k] - l_wq[k]) * per * ms,
+                        hn[k] != l_hn[k] ? (double)(hq[k] - l_hq[k]) * us / (double)(hn[k] - l_hn[k]) : 0.0, (double)hm[k] * us);
+    BOOT_NVN_SL_CAT(" binding drops after the section %llu (versions they freed %llu), ev lock waits inside the store lock %llu (%.3f ms) per present %.1f (%.3f ms)",
+                    (unsigned long long)(def - l_def), (unsigned long long)(df - l_df), (unsigned long long)(ew - l_ew), (double)(ewq - l_ewq) * ms,
+                    (double)(ew - l_ew) * per, (double)(ewq - l_ewq) * per * ms);
+#undef BOOT_NVN_SL_CAT
+    boot_draw_log("nvn native: store lock%s present %llu %llu", line, now, 0);
+    memcpy(l_acq, acq, sizeof l_acq); memcpy(l_w, w, sizeof l_w); memcpy(l_wq, wq, sizeof l_wq); memcpy(l_hn, hn, sizeof l_hn); memcpy(l_hq, hq, sizeof l_hq);
+    memcpy(l_bw, bw, sizeof l_bw); memcpy(l_bq, bq, sizeof l_bq); l_def = def; l_df = df; l_ew = ew; l_ewq = ewq;
+#else
+    (void)now;
+#endif
+}
+static inline void boot_nvn_ev_present(void) {
+    const uint32_t now = (uint32_t)InterlockedIncrement(&boot_nvn_ev_now);
+#ifdef TOTK_DRAW_PATH
+    boot_render_present_no = (LONG)now;   /* call-bind: the vbounds diagnostic lines carry it */
+#endif
+    boot_nvn_cb_present(now);   /* call-bind: the live switch and its 300-present line */
+    if (!(now % 300)) boot_nvn_sl_report(now);   /* storelock-work */
+    if (now == 1) { char k[8]; if (GetEnvironmentVariableA("TOTK_REC_KILL", k, sizeof k)) boot_nvn_log("TOTK_REC_KILL (mem-work batch A) is gone: see TOTK_REC_EVICT_DEAD / TOTK_REC_EVICT", "rec-evict", 0); }
+    if (!boot_nvn_ev_on()) return;
+    if (boot_nvn_ev_lru_mode() && (int32_t)(now - boot_nvn_ev.next_sweep) >= 0 && boot_nvn_ev_effective() > (int64_t)boot_nvn_ev_budget())
+        boot_nvn_ev.next_sweep = now + (boot_nvn_ev_sweep(now) ? 30u : 300u);   /* over the budget with nothing to take (all called / new): look again later */
+    if (!(now % 300)) boot_nvn_ev_report(now);
+}
 /* play (62): recordings whose handles lie in [lo, lo+size) are dead (their command memory is being reused):
  * removed from the handle map, their slots released (pinned ones at their unpin). Returns how many. */
 static uint64_t boot_nvn_reuse_released;
@@ -1351,6 +2671,7 @@ BOOT_NVN_FN(boot_nvn_cmd_observe) {
     switch (boot_nvn_cmd_kinds()[op]) {
     case BOOT_NVN_CMD_ADD_MEMORY:   /* the driver would fault on it: name the call instead */
         if (!c->x[1]) return boot_nvn_fail(c, self, "NULL memory pool (the game's GPU memory allocation failed)", 0);
+        if (boot_nvn_ev_dead_mode()) boot_nvn_ev_switch(cmd);   /* rec-evict: a block added while recording leaves that recording untracked */
         {   /* play (62): (cmd, pool, offset, size): recordings in that memory are dead */
             BootNvnPool p; uint64_t off = c->x[2], size = c->x[3];
             if (boot_nvn_peek(c, self, c->x[1], &p, sizeof p) == sizeof p && p.magic == BOOT_NVN_MAGIC_POOL && off < p.size) {
@@ -1360,12 +2681,18 @@ BOOT_NVN_FN(boot_nvn_cmd_observe) {
             } else { static LONG logged; if (!InterlockedExchange(&logged, 1)) boot_nvn_log("command memory reuse: pool not recognised (recordings kept)", "nvnCommandBufferAddCommandMemory", c->x[1]); }
         }
         break;
+    case BOOT_NVN_CMD_ADD_CONTROL:   /* rec-evict: AddControlMemory, passed to the driver */
+        if (boot_nvn_ev_dead_mode()) boot_nvn_ev_switch(cmd);
+        break;
     case BOOT_NVN_CMD_RESET: {
+        if (boot_nvn_ev_dead_mode()) boot_nvn_ev_reset(cmd);   /* rec-evict */
         uint64_t old = boot_nvn_hmap_put(slots, cmd, 0); if (old) boot_nvn_slot_free(old);
         if (boot_nvn_rec.cmd == cmd) boot_nvn_rec.cmd = 0;
         break; }
     case BOOT_NVN_CMD_BEGIN: {
         boot_nvn_inline_off(c, self);
+        { BootNvnRlStats *m = boot_nvn_rl(); if (m->sl_role != BOOT_NVN_SL_ROLE_RENDER) { m->sl_role = BOOT_NVN_SL_ROLE_RECORDER; m->sl_guest = boot_nvn_guest_thread(c); } }   /* storelock-work */
+        if (boot_nvn_ev_dead_mode()) boot_nvn_ev_begin(c, self, cmd);   /* rec-evict: the driver's command write pointer (cmd+0x00) before it starts */
         if (boot_nvn_rec.cmd == cmd) boot_nvn_rec.cmd = 0;
         uint64_t slot; uint32_t gen; if (!boot_nvn_slot_new_gen(&slot, &gen)) return boot_nvn_fail(c, self, "out of host memory for records", cmd);
         uint64_t old = boot_nvn_hmap_put(slots, cmd, slot);
@@ -1382,12 +2709,17 @@ BOOT_NVN_FN(boot_nvn_cmd_observe) {
         if (!boot_nvn_record_build(c, self, op, &r, scratch, sizeof scratch)) return BOOT_HOST_STOP;
         /* flashfix: the record's deferred bind / called handles, indexed by its own append */
         uint64_t dh[64]; BootNvnDrefAdd da; const BootNvnDrefAdd *dref = boot_nvn_dsnap_wanted() && boot_nvn_dsnap_dref(op, &r, dh, &da) ? &da : NULL;
+        if (dref && dref->count == UINT32_MAX && boot_nvn_ev_lru_mode() == 1) boot_nvn_ev_called(dref->ptr, dref->n);   /* rec-evict: called lists are never budget candidates */
+        /* call-bind: a CallCommands binds its callees' current versions (in the record and its index) */
+        uint64_t cbb[64]; uint32_t cb_lost = 0; const unsigned cbn = dref && dref->count == UINT32_MAX ? boot_nvn_cb_bind(&r, dh, da.n, cbb) : 0;
+        if (cbn) { da.bound = cbb; da.lost = &cb_lost; }
         int ok = boot_nvn_record_write(slot, gen, &r, &now, dref);
         if (ok < 0 && gen) {   /* ended or released by another thread meanwhile: the map decides, as without the cache */
             boot_nvn_rec.cmd = 0;
-            if (!(slot = boot_nvn_rec_open(c, self, op, cmd))) return BOOT_HOST_STOP;
+            if (!(slot = boot_nvn_rec_open(c, self, op, cmd))) { if (cbn) boot_nvn_cb_unbind(cbb, cbn); return BOOT_HOST_STOP; }
             ok = boot_nvn_record_write(slot, 0, &r, &now, dref);
         } else if (ok > 0 && gen) ++boot_nvn_rl()->n[BOOT_NVN_RL_CACHED];
+        if (cbn && (ok <= 0 || cb_lost)) boot_nvn_cb_unbind(cbb, cbn);   /* call-bind: not in a stored index: nothing would release them */
         if (ok <= 0) { boot_nvn_rec.cmd = 0; return boot_nvn_fail(c, self, "record storage", (uint64_t)op); }
         ++boot_nvn_rl()->n[BOOT_NVN_RL_RECORDS];
         if (cmd) { boot_nvn_rec.cmd = cmd; boot_nvn_rec.slot = slot; boot_nvn_rec.gen = now; }
@@ -1409,12 +2741,11 @@ BOOT_NVN_FN(boot_nvn_cmd_observe) {
 BOOT_NVN_FN(boot_nvn_cmd_end_ret) {   /* x0 = the driver's handle */
     (void)user; uint64_t cmd = 0, slot = 0;
     if (!boot_host_frame_pop(c, self, target, &cmd, &slot)) return BOOT_HOST_STOP;
-    (void)cmd;
+    BootNvnEvRange rg; const int ev = boot_nvn_ev_on();   /* rec-evict: the recording's ranges, read before the install (guest reads only) */
+    if (ev) boot_nvn_ev_ranges(c, self, cmd, c->x[0], &rg);
     if (!c->x[0]) { boot_nvn_slot_free(slot); return BOOT_HOST_DONE; }
     if (boot_nvn_ftrace_on()) boot_nvn_slot_mark_end(c, slot);   /* batch-a frame trace: who ended it, when */
-    uint64_t old = boot_nvn_hmap_put(boot_nvn_handles(), c->x[0], slot);
-    if (old == UINT64_MAX) { boot_nvn_slot_free(slot); return boot_nvn_fail(c, self, "out of host memory for records", c->x[0]); }
-    if (old && old != slot && boot_nvn_slot_free(old)) boot_nvn_rerecorded(c, c->x[0], old);   /* batch-a: a submission was reading the older one */
+    if (!boot_nvn_handle_install_ev(c, c->x[0], slot, ev ? &rg : NULL)) return boot_nvn_fail(c, self, "out of host memory for records", c->x[0]);   /* rerecord-work: same steps; rec-evict inside */
     return BOOT_HOST_DONE;
 }
 /* nvnpar-work (TOTK_RECORD_ZERO_COPY, default on; =0: copied as below). A record of a recording this thread has pinned
@@ -1489,7 +2820,7 @@ static inline int boot_nvn_walk(BootContext *c, uint64_t self, uint64_t handle, 
     if (depth > 8) return 0;
     for (uint64_t at = handle, n = 0; n < (UINT64_C(1) << 24); ++n) {
         BootNvnRecord r; uint64_t size = boot_nvn_record_read(c, self, at, &r, scratch, sizeof scratch);
-        if (!size) return 0;
+        if (!size) return !n && at == handle && boot_nvn_ev_skip(handle, depth);   /* rec-evict: a released handle used again: skipped */
         if (r.op == BOOT_NVN_OP_END) return 1;
         if (r.op == BOOT_NVN_OP_JUMP) { at = r.x[1]; continue; }
         ++st->records; ++st->by_op[r.op];
@@ -1529,6 +2860,10 @@ static inline int boot_nvn_queue_load(BootContext *c, uint64_t self, uint64_t ad
     if (q->magic != BOOT_NVN_MAGIC_QUEUE) { boot_nvn_fail(c, self, "not a queue", address); return 0; }
     return 1;
 }
+#ifdef TOTK_DRAW_PATH
+static inline void boot_sd_call_end(BootContext *c);   /* suspect-diag (host_nvn_exec.h): TOTK_SUSPECT_DIAG end-of-call re-hash */
+static inline void boot_ds_call_end(BootContext *c);   /* data-snapshot (host_nvn_exec.h): the detector's end-of-call check */
+#endif
 #ifdef TOTK_DRAW_PATH   /* overlap-work P3: every return of the submit ends its in-submit stretch */
 #define BOOT_NVN_FF_END() boot_ff_submit_end(c)
 #else
@@ -1538,6 +2873,9 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
     BOOT_NVN_UNUSED; BootNvnQueue q; uint64_t address = c->x[0];
     if (!boot_nvn_queue_load(c, self, address, &q)) return BOOT_HOST_STOP;
     boot_nvn_sub_begin(c);   /* batch-a: a submit call runs (re-record wait, frame trace) */
+#ifdef TOTK_DRAW_PATH
+    boot_ds_call_begin();   /* data-snapshot (host_gpu_render.h): a new call (call-start copy due, detector records reset) */
+#endif
     /* flashfix: the deferred-bind handles as the driver reads them, at the call, before anything below can let other
      * guest threads run; the recordings it reaches stay pinned until the end of the call (boot_nvn_dsnap_end) */
     boot_nvn_dsnap_take(c, self, c->x[2], c->x[1]);
@@ -1556,6 +2894,10 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
         ++q.submitted;
     }
     if (boot_nvn_ftrace_on()) boot_nvn_ftrace_write(c, c->x[1], 1);   /* batch-a: before the pins go */
+#ifdef TOTK_DRAW_PATH
+    boot_sd_call_end(c);   /* suspect-diag: TOTK_SUSPECT_DIAG (off: one cached branch) */
+    boot_ds_call_end(c);   /* data-snapshot: TOTK_DATA_SNAPSHOT (=0: one cached branch) */
+#endif
     boot_nvn_dsnap_end();
     boot_nvn_sub_end();
     BOOT_NVN_FF_END();
@@ -1631,6 +2973,8 @@ static inline int boot_nvn_window_presented(BootContext *c, uint64_t self, uint6
 BOOT_NVN_FN(boot_nvn_queue_present) {   /* (queue, window, texture index) */
     BOOT_NVN_UNUSED; BootNvnBackend *be = boot_nvn_backend();
     if (!be->present(be->ctx, c, c->x[0], c->x[1], (uint32_t)c->x[2])) return boot_nvn_fail(c, self, "present", c->x[1]);
+    boot_nvn_rv_present();   /* rerecord-work: the 300-present line */
+    boot_nvn_ev_present();   /* rec-evict: the budget sweep and its 300-present line */
     return boot_nvn_window_presented(c, self, c->x[1], c->x[2]) ? BOOT_HOST_DONE : BOOT_HOST_STOP;
 }
 
@@ -1716,11 +3060,35 @@ static inline uint64_t boot_nvn_window_texture(BootContext *c, uint64_t window, 
     if (!boot_nvn_peek(c, window, window, &wn, sizeof wn) || wn.magic != BOOT_NVN_MAGIC_WINDOW || index >= wn.count) return 0;
     return wn.textures[index];
 }
+/* N2 diagnostics (stderr): every present-interval change the game makes, with its caller and the last 10
+ * present-to-present times (QPC of the newest presents, noted by boot_nvn_exec_present), and every 300 presents the
+ * present-interval waits (host_nvn_play.h boot_nvn_present_note). A change to 3 while frames take under 33 ms is TotK's
+ * frame pacer locking 20 fps (nxport crates/engine/src/nvn/api.rs:6365-6367). TOTK_PACE_LOG=0: silent. */
+#define BOOT_NVN_PRESENT_RING 11
+static volatile int64_t boot_nvn_present_qpc[BOOT_NVN_PRESENT_RING]; static volatile uint32_t boot_nvn_present_count;
+static inline int boot_nvn_pace_log_on(void) {
+    static int on = -1;
+    if (on < 0) { char v[8]; DWORD n = GetEnvironmentVariableA("TOTK_PACE_LOG", v, sizeof v); on = !(n && n < sizeof v && v[0] == '0'); }
+    return on;
+}
+static inline void boot_nvn_interval_changed(BootContext *c, uint32_t from, uint32_t to) {
+    if (!boot_nvn_pace_log_on()) return;
+    LARGE_INTEGER f, now; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+    char ms[128]; size_t n = 0; ms[0] = 0; uint32_t k = boot_nvn_present_count;
+    for (uint32_t i = 0; i < 10 && i + 1 < k; ++i) {
+        int64_t d = boot_nvn_present_qpc[(k - 1 - i) % BOOT_NVN_PRESENT_RING] - boot_nvn_present_qpc[(k - 2 - i) % BOOT_NVN_PRESENT_RING];
+        int w = snprintf(ms + n, sizeof ms - n, " %.1f", (double)d * 1000.0 / (double)f.QuadPart);
+        if (w < 0 || (size_t)w >= sizeof ms - n) break;
+        n += (size_t)w;
+    }
+    fprintf(stderr, "nvn native: present interval %u -> %u at qpc %lld, caller %llx (logical %llx), after %u presents; present-to-present ms, newest first:%s\n",
+            from, to, (long long)now.QuadPart, (unsigned long long)c->x[30], (unsigned long long)boot_offset(c, c->x[30]), k, ms);
+}
 BOOT_NVN_FN(boot_nvn_window_set) {   /* user: 0 crop(x, y, w, h), 1 present interval, 2 active textures, 3 finalize */
     (void)target; uint64_t address = c->x[0]; BootNvnWindow wn; BOOT_NVN_GET(wn);
     switch ((int)(intptr_t)user) {
         case 0: for (unsigned k = 0; k < 4; ++k) wn.crop[k] = (int32_t)c->x[1 + k]; break;
-        case 1: wn.interval = (uint32_t)c->x[1]; break; case 2: wn.active = (uint32_t)c->x[1]; break; default: wn.magic = 0;
+        case 1: if (wn.interval != (uint32_t)c->x[1]) boot_nvn_interval_changed(c, wn.interval, (uint32_t)c->x[1]); wn.interval = (uint32_t)c->x[1]; break; case 2: wn.active = (uint32_t)c->x[1]; break; default: wn.magic = 0;
     }
     BOOT_NVN_PUT(wn); return BOOT_HOST_DONE;
 }
@@ -1734,6 +3102,21 @@ BOOT_NVN_FN(boot_nvn_window_get) {   /* user: 0 present interval, 1 active textu
  * after its guest vsync deadline; acquiring it earlier sleeps the calling guest thread until then (svc
  * SleepThread through the kernel entry, as the display client blocks on the producer event in the emulated
  * path), so guest time advances one display interval per frame. */
+#ifdef TOTK_DRAW_PATH
+/* N2: where the present-interval wait (host_nvn_play.h boot_present_interval_pace) runs. nxport (MIT, behaviour only:
+ * crates/engine/src/nvn/api.rs:6365-6367, wait in 6060-6104) found that TotK's frame pacer measures its update + draw
+ * time without a wait in nvnWindowAcquireTexture but with one in nvnQueuePresentTexture, so the wait at present made a
+ * frame that fits interval 2 measure as 2 vblanks or more and locked the game at 20 fps. TOTK's GPU thread calls
+ * Present and then AcquireTexture (host_nvn_overlap.h P3), so its frame period is unchanged; only the pacer's
+ * measurement is. Default: the wait in acquire (as the display hands a texture back), unless the present hold (dilated
+ * clock) paces acquire already. TOTK_PACE_AT=present (or 0): the wait at present, as before. */
+static inline void boot_present_interval_pace_at(BootContext *c, uint64_t window, uint32_t interval);
+static inline int boot_present_pace_at_acquire(void) {
+    static int at = -1;
+    if (at < 0) { char v[16]; DWORD n = GetEnvironmentVariableA("TOTK_PACE_AT", v, sizeof v); at = !(n && n < sizeof v && (!_stricmp(v, "present") || !strcmp(v, "0"))); }
+    return at && !boot_present_hold_enabled();
+}
+#endif
 BOOT_NVN_FN(boot_nvn_window_acquire) {
     (void)user; uint64_t address = c->x[0]; BootNvnWindow wn; BOOT_NVN_GET(wn);
     if (wn.magic != BOOT_NVN_MAGIC_WINDOW || !wn.active) return boot_nvn_fail(c, self, "not a window", address);
@@ -1757,6 +3140,9 @@ BOOT_NVN_FN(boot_nvn_window_acquire) {
             c->x[0] = 0;
         }
     }
+#ifdef TOTK_DRAW_PATH
+    if (boot_present_pace_at_acquire()) boot_present_interval_pace_at(c, 0, wn.interval);   /* N2 (x0 stays 0) */
+#endif
     return BOOT_HOST_DONE;
 }
 /* Guest tick a texture presented now is released at (0: no hold; wall clock or TOTK_PRESENT_HOLD=0). */
@@ -1785,6 +3171,15 @@ BOOT_NVN_FN(boot_nvn_unimplemented) {
     (void)target; boot_nvn_log("unimplemented", boot_nvn_names[(intptr_t)user].name, (uint64_t)self);
     boot_fault(c, BOOT_TARGET, self, self, 0); return BOOT_HOST_STOP;
 }
+/* data-snapshot (host_gpu_render.h boot_ds_pool_fn): nvnMemoryPoolBuilderSetDefaults/SetFlags/SetStorage, nvnMemoryPoolInitialize
+ * and Finalize are observed (pool flags by storage address); TOTK_DATA_SNAPSHOT=0 or TOTK_DATA_SNAPSHOT_POOLS=0: passed as before. */
+static inline int boot_nvn_ds_pool(const char *n) {
+#ifdef TOTK_DRAW_PATH
+    return boot_ds_pool_fn(n);
+#else
+    (void)n; return 0;
+#endif
+}
 /* Hybrid native mode: who implements each NVN entry point. */
 enum { BOOT_NVN_PASS = 0, BOOT_NVN_OWN = 1, BOOT_NVN_OBSERVE = 2 };
 static inline int boot_nvn_policy(const char *n) {
@@ -1795,6 +3190,12 @@ static inline int boot_nvn_policy(const char *n) {
         !strcmp(n, "nvnDeviceSetWindowOriginMode") || !strcmp(n, "nvnTexturePoolRegisterTexture") || !strcmp(n, "nvnSamplerPoolRegisterSampler") ||
         !strcmp(n, "nvnTextureWriteTexels") || !strcmp(n, "nvnTextureWriteTexelsStrided"))   /* render-32 */
         return BOOT_NVN_OBSERVE;
+#ifdef TOTK_DRAW_PATH
+    if (!strcmp(n, "nvnTextureFlushTexels") && boot_nvn_flush_texels_on()) return BOOT_NVN_OBSERVE;   /* batch-3 N6 */
+    if (boot_frt_name(n)) return BOOT_NVN_OBSERVE;   /* fence-read trace (TOTK_FENCE_READ_TRACE=1): pool/buffer invalidate and flush, timestamps */
+#endif
+    if (!strcmp(n, "nvnMemoryPoolFinalize") && boot_nvn_ev_dead_mode()) return BOOT_NVN_OBSERVE;   /* rec-evict: its recordings are dead */
+    if (boot_nvn_ds_pool(n)) return BOOT_NVN_OBSERVE;   /* data-snapshot: memory pool flags */
     return BOOT_NVN_PASS;
 }
 static inline uint64_t boot_nvn_hybrid_address(BootContext *c, int index) {
@@ -1916,6 +3317,97 @@ static inline int boot_nvn_tic_from_texture(const uint8_t o[0x80], const uint8_t
     }
     return 1;
 }
+/* batch-3 N5 diagnostic (TOTK_STATE_DIAG; log only): the descriptor boot_nvn_tic_from_texture builds, against the TIC
+ * words the driver writes into the pool for the same registration. nvnTexturePoolRegisterTexture is observed before the
+ * driver runs, so each registration is queued (a later one of the same entry replaces it) and compared at the second
+ * present after it (host_nvn_exec.h boot_nvn_state_diag_present), when the driver has written it. Settles whether a view
+ * swizzle replaces the texture's own swizzle (ours, above) or is composed on top of it (nxport,
+ * crates/engine/src/metal/translated.rs:722-738), and checks the other fields. Logged: the first 32 source (swizzle)
+ * mismatches and the first 16 other mismatches, with a field mask: 1 undecodable, 2 address, 4 components/types,
+ * 8 layout class (buffer / pitch / block-linear), 0x10 width/type/srgb, 0x20 height/depth, 0x40 block height/depth or
+ * pitch, 0x80 levels, 0x100 base layer, 0x200 normalized/depth texture. */
+#define BOOT_NVN_TIC_DIAG 256
+typedef struct BootNvnTicDiagEnt { uint64_t pool; uint32_t id, epoch, format; uint16_t swizzle; uint8_t view[16]; BootTic ours; } BootNvnTicDiagEnt;
+static struct { SRWLOCK lock; uint32_t n, epoch; unsigned src_logged, other_logged; BootNvnTicDiagEnt q[BOOT_NVN_TIC_DIAG]; } boot_nvn_tic_diag;
+static inline void boot_nvn_tic_diag_note(uint64_t pool, uint32_t id, const uint8_t o[0x80], const uint8_t v[16], const BootTic *t) {
+    if (!boot_render_state_diag_on()) return;
+    uint16_t fmt16, sw; uint32_t format; memcpy(&fmt16, o + 0x2a, 2); memcpy(&sw, o + 0x2c, 2); format = fmt16 & 0x1ffu;
+    if (v[7] & 4) memcpy(&format, v + 8, 4);   /* the view's format, as boot_nvn_tic_from_texture */
+    AcquireSRWLockExclusive(&boot_nvn_tic_diag.lock);
+    uint32_t i = 0, n = boot_nvn_tic_diag.n;
+    while (i < n && !(boot_nvn_tic_diag.q[i].pool == pool && boot_nvn_tic_diag.q[i].id == id)) ++i;
+    if (i == n && n == BOOT_NVN_TIC_DIAG) ++boot_state_diag.tic_dropped;
+    else {
+        BootNvnTicDiagEnt *q = &boot_nvn_tic_diag.q[i];
+        if (i == n) boot_nvn_tic_diag.n = n + 1;
+        q->pool = pool; q->id = id; q->epoch = boot_nvn_tic_diag.epoch; q->format = format; q->swizzle = sw; memcpy(q->view, v, 16); q->ours = *t;
+    }
+    ReleaseSRWLockExclusive(&boot_nvn_tic_diag.lock);
+}
+/* The sources of the composed rule (nxport translated.rs:722-738: the texture's swizzle, identity when unset, with the
+ * view's on top: a view channel selecting R/G/B/A picks the texture's already-swizzled channel). */
+static inline void boot_nvn_tic_diag_compose(uint32_t format, uint16_t sw, const uint8_t v[16], uint32_t out[4]) {
+    uint32_t fw = format < 161 ? boot_nvn_format_tic[format] : 0, eff[4], sel[4], fsrc[4];
+    for (unsigned c = 0; c < 4; ++c) { eff[c] = (sw >> (3 * c)) & 7u; fsrc[c] = (fw >> (19 + 3 * c)) & 7u; }
+    if (!(eff[0] | eff[1] | eff[2] | eff[3])) for (unsigned c = 0; c < 4; ++c) eff[c] = 2 + c;
+    for (unsigned c = 0; c < 4; ++c) sel[c] = !(v[7] & 8) ? eff[c] : v[12 + c] >= 2 && v[12 + c] <= 5 ? eff[v[12 + c] - 2] : v[12 + c];
+    for (unsigned c = 0; c < 4; ++c) out[c] = sel[c] == 0 ? 0 : sel[c] == 1 ? 7 : sel[c] <= 5 ? fsrc[sel[c] - 2] : 0;
+}
+static inline void boot_nvn_tic_diag_check(BootWindow *w) {
+    if (!boot_nvn_tic_diag.n || !w || !w->render) return;   /* racy read: a registration now is checked at a later present */
+    AcquireSRWLockExclusive(&w->lock);   /* the renderer's page table (boot_render_diag_guest) */
+    AcquireSRWLockExclusive(&boot_nvn_tic_diag.lock);
+    BootRender *r = w->render; BootStateDiag *g = &boot_state_diag;
+    uint32_t keep = 0, n = boot_nvn_tic_diag.n, epoch = boot_nvn_tic_diag.epoch++;
+    for (uint32_t i = 0; i < n; ++i) {
+        BootNvnTicDiagEnt *q = &boot_nvn_tic_diag.q[i];
+        if (q->epoch == epoch || !r) { if (keep != i) boot_nvn_tic_diag.q[keep] = *q; ++keep; continue; }   /* queued since the last present */
+        const uint8_t *p = boot_render_diag_guest(r, q->pool + (uint64_t)q->id * 32, 32);
+        if (!p) { ++g->tic_unreadable; continue; }
+        uint32_t wd[8]; memcpy(wd, p, 32);
+        BootTic d; int ok = boot_tic_decode(wd, &d); const BootTic *o = &q->ours; unsigned bad = 0;
+        ++g->tic_checked;
+        if (!ok) bad |= 1;
+        if (o->address != d.address) bad |= 2;
+        if (o->components != d.components || memcmp(o->data_type, d.data_type, sizeof d.data_type)) bad |= 4;
+        if ((o->header_version == 0) != (d.header_version == 0) || (o->header_version >= 3) != (d.header_version >= 3)) bad |= 8;
+        if (o->width != d.width || o->texture_type != d.texture_type || o->srgb != d.srgb) bad |= 0x10;
+        if (o->header_version && d.header_version) {   /* not a buffer texture */
+            if (o->height != d.height || o->depth != d.depth) bad |= 0x20;
+            if (o->log_gob_h != d.log_gob_h || o->log_gob_d != d.log_gob_d || o->pitch != d.pitch) bad |= 0x40;
+            if (o->max_mip != d.max_mip || o->view_min_mip != d.view_min_mip || o->view_max_mip != d.view_max_mip) bad |= 0x80;
+            if (o->base_layer != d.base_layer) bad |= 0x100;
+            if (o->normalized != d.normalized || o->depth_texture != d.depth_texture) bad |= 0x200;
+        }
+        uint32_t comp[4]; boot_nvn_tic_diag_compose(q->format, q->swizzle, q->view, comp);
+        int src = memcmp(o->source, d.source, sizeof d.source) != 0, comp_ok = !memcmp(comp, d.source, sizeof comp), differ = memcmp(comp, o->source, sizeof comp) != 0;
+        if (!src && !bad) ++g->tic_same;
+        if (src) { ++g->tic_source_bad; if (comp_ok) ++g->tic_compose; else ++g->tic_neither; }
+        else if (differ) ++g->tic_replace;   /* the driver agrees with ours where the composed rule would not */
+        if (bad) ++g->tic_other_bad;
+        if ((src || differ) && boot_nvn_tic_diag.src_logged < 32) {
+            ++boot_nvn_tic_diag.src_logged;
+            boot_gp_log("nvn native: N5 TIC source %s: pool %llx id %u format %u, texture swizzle %03x (+0x2c), view mask %02x swizzle %u %u %u %u; "
+                        "ours %u%u%u%u, driver %u%u%u%u, composed %u%u%u%u", src ? (comp_ok ? "= composed rule" : "= neither rule") : "= ours (replace rule)",
+                        (unsigned long long)q->pool, q->id, q->format, q->swizzle & 0xfffu, q->view[7], q->view[12], q->view[13], q->view[14], q->view[15],
+                        o->source[0], o->source[1], o->source[2], o->source[3], d.source[0], d.source[1], d.source[2], d.source[3], comp[0], comp[1], comp[2], comp[3]);
+        }
+        if (bad && boot_nvn_tic_diag.other_logged < 16) {
+            ++boot_nvn_tic_diag.other_logged;
+            boot_gp_log("nvn native: N5 TIC field mismatch %x: pool %llx id %u format %u view mask %02x; driver words %08x %08x %08x %08x %08x %08x %08x %08x; "
+                        "ours/driver: address %llx/%llx, %ux%ux%u / %ux%ux%u, type %u/%u, header %u/%u, levels %u %u-%u / %u %u-%u, layer %u/%u, "
+                        "block %u.%u/%u.%u, pitch %u/%u, srgb %u/%u, normalized %u/%u, depth %u/%u", bad, (unsigned long long)q->pool, q->id, q->format, q->view[7],
+                        wd[0], wd[1], wd[2], wd[3], wd[4], wd[5], wd[6], wd[7], (unsigned long long)o->address, (unsigned long long)d.address,
+                        o->width, o->height, o->depth, d.width, d.height, d.depth, o->texture_type, d.texture_type, o->header_version, d.header_version,
+                        o->max_mip, o->view_min_mip, o->view_max_mip, d.max_mip, d.view_min_mip, d.view_max_mip, o->base_layer, d.base_layer,
+                        o->log_gob_h, o->log_gob_d, d.log_gob_h, d.log_gob_d, o->pitch, d.pitch, o->srgb, d.srgb, o->normalized, d.normalized,
+                        o->depth_texture, d.depth_texture);
+        }
+    }
+    boot_nvn_tic_diag.n = keep;
+    ReleaseSRWLockExclusive(&boot_nvn_tic_diag.lock);
+    ReleaseSRWLockExclusive(&w->lock);
+}
 /* Sampler object (0x40 bytes) -> sampler description. */
 static inline void boot_nvn_tsc_from_sampler(const uint8_t o[0x40], BootTsc *s) {
     memset(s, 0, sizeof *s);
@@ -1952,7 +3444,7 @@ static inline void boot_nvn_observe_register(BootContext *c, uint64_t self, int 
         uint8_t o[0x80] = {0}, v[16] = {0}; BootTic t;
         if (boot_nvn_peek(c, self, c->x[2], o, sizeof o) != sizeof o) return;
         if (c->x[3]) boot_nvn_peek(c, self, c->x[3], v, sizeof v);
-        if (boot_nvn_tic_from_texture(o, v, &t)) boot_render_host_register(0, pool, id, &t, NULL);
+        if (boot_nvn_tic_from_texture(o, v, &t)) { boot_render_host_register(0, pool, id, &t, NULL); boot_nvn_tic_diag_note(pool, id, o, v, &t); }   /* batch-3 N5 */
         else if (failed++ < 16) boot_nvn_log("host descriptor: texture not representable (guest words used)", "texture", c->x[2]);
     }
 }
@@ -2019,6 +3511,40 @@ static inline void boot_nvn_observe_write_texels(BootContext *c, uint64_t self, 
     }
     boot_render_cpu_texels_push(va, size);
 }
+/* batch-3 N6: nvnTextureFlushTexels(texture, view, region): the game wrote the texture's storage with CPU stores and makes
+ * them visible to the GPU. The whole texture's guest range goes to the render queue of CPU-written memory, as for
+ * nvnTextureWriteTexels above (textures over it rebuild at their next use). Before, such writes were found only by the
+ * texture watch or the round-robin verifier (host_gpu_render.h render-39), late. nxport (MIT,
+ * crates/engine/src/nvn/api.rs:4740-4750) marks the texture dirty here for the same reason. The region is logged, not
+ * used (as for WriteTexels). TOTK_FLUSH_TEXELS=0: not observed (host_nvn_exec.h boot_nvn_flush_texels_on). */
+static inline void boot_nvn_observe_flush_texels(BootContext *c, uint64_t self) {
+    uint8_t o[0x80] = {0}, v[16] = {0}; BootTic t; BootTexFormat f;
+    ++boot_state_diag.flush_texels;
+    if (!c->x[0] || boot_nvn_peek(c, self, c->x[0], o, sizeof o) != sizeof o) return;
+    uint64_t va = 0, size = 0; memcpy(&va, o + 0x60, 8);
+    if (boot_nvn_tic_from_texture(o, v, &t) && t.address) {   /* the range boot_nvn_observe_write_texels pushes */
+        va = t.address;
+        if (boot_tex_format(t.components, t.data_type[0], &f)) {
+            BootTexLevel lv[16]; unsigned levels = t.max_mip + 1 > 16 ? 16 : t.max_mip + 1;
+            uint64_t stride = boot_tex_layout(&t, &f, lv, levels);
+            uint64_t layers = t.texture_type == BOOT_TEX_CUBE ? 6 : t.texture_type == BOOT_TEX_CUBE_ARRAY ? 6 * (uint64_t)t.depth :
+                              (t.texture_type == BOOT_TEX_2D_ARRAY || t.texture_type == BOOT_TEX_1D_ARRAY) ? t.depth : 1;
+            size = stride * (layers ? layers : 1);
+        }
+    }
+    if (!va) return;
+    if (!size) size = 0x10000;   /* layout unknown: the first 64 KiB */
+    ++boot_state_diag.flush_pushed;
+    static unsigned logged;
+    if (logged < 16 && boot_render_state_diag_on()) {
+        int32_t region[6] = {0}; ++logged;
+        if (c->x[2]) boot_nvn_peek(c, self, c->x[2], region, sizeof region);
+        boot_gp_log("nvn native: N6 nvnTextureFlushTexels texture %llx: guest %llx + %llx, %ux%ux%u components %x, region %d,%d,%d %dx%dx%d%s (call %llu)",
+                    (unsigned long long)c->x[0], (unsigned long long)va, (unsigned long long)size, t.width, t.height, t.depth, t.components,
+                    region[0], region[1], region[2], region[3], region[4], region[5], c->x[2] ? "" : " (none)", (unsigned long long)boot_state_diag.flush_texels);
+    }
+    boot_render_cpu_texels_push(va, size);
+}
 #endif
 /* Observed driver functions: record, then continue in the driver function (tail call). */
 BOOT_NVN_FN(boot_nvn_hybrid_observe) {
@@ -2032,7 +3558,13 @@ BOOT_NVN_FN(boot_nvn_hybrid_observe) {
     else if (!strcmp(n, "nvnDeviceSetWindowOriginMode")) { BootNvnExec *e = boot_nvn_exec(); if (e) e->origin_upper_left = (uint32_t)c->x[1]; }
     else if (!strcmp(n, "nvnTexturePoolRegisterTexture")) boot_nvn_observe_register(c, self, 0);
     else if (!strcmp(n, "nvnSamplerPoolRegisterSampler")) boot_nvn_observe_register(c, self, 1);
+    else if (!strcmp(n, "nvnTextureFlushTexels")) boot_nvn_observe_flush_texels(c, self);   /* batch-3 N6 */
     else if (!strcmp(n, "nvnTextureWriteTexels") || !strcmp(n, "nvnTextureWriteTexelsStrided")) boot_nvn_observe_write_texels(c, self, !strcmp(n, "nvnTextureWriteTexelsStrided"));   /* render-32 */
+#endif
+    {   static int pool_final = -2; if (pool_final == -2) pool_final = boot_nvn_name_index("nvnMemoryPoolFinalize");
+        if (index == pool_final) boot_nvn_ev_pool_final(c, self, c->x[0]); }   /* rec-evict: the pool's recordings are dead */
+#ifdef TOTK_DRAW_PATH
+    boot_ds_pool_note(n, c->x[0], c->x[1], c->x[2]);   /* data-snapshot: pool flags by storage address (own lock) */
 #endif
     *target = real;
     return BOOT_HOST_DONE;
@@ -2094,13 +3626,23 @@ static inline void boot_nvn_native_register(void) {
             else if (!strcmp(n, "nvnCommandBufferEndRecording")) kind = BOOT_NVN_CMD_END;
             else if (!strcmp(n, "nvnCommandBufferInitialize") || !strcmp(n, "nvnCommandBufferFinalize")) kind = BOOT_NVN_CMD_RESET;
             else if (!strcmp(n, "nvnCommandBufferAddCommandMemory")) kind = BOOT_NVN_CMD_ADD_MEMORY;
+            else if (!strcmp(n, "nvnCommandBufferAddControlMemory")) kind = BOOT_NVN_CMD_ADD_CONTROL;   /* rec-evict */
             boot_nvn_cmd_kinds()[i] = kind;
             snprintf(name, sizeof name, "nvno:%s", n); boot_host_fn_register(name, boot_nvn_cmd_observe, (void *)(intptr_t)i, BOOT_HOST_FN_NOLOCK, 0); continue;   /* records: shadow store and maps are locked */
         }
-        if (policy == BOOT_NVN_OBSERVE) { snprintf(name, sizeof name, "nvno:%s", n); boot_host_fn_register(name, boot_nvn_hybrid_observe, (void *)(intptr_t)i, 0, 0); continue; }
+        if (policy == BOOT_NVN_OBSERVE) {   /* rec-evict: nvnMemoryPoolFinalize's hook never touches the renderer (no lock: no wait behind a submit) */
+            snprintf(name, sizeof name, "nvno:%s", n);
+#ifdef TOTK_DRAW_PATH
+            if (boot_frt_name(n)) { boot_host_fn_register(name, boot_frt_observe, boot_frt_user(n, i), BOOT_HOST_FN_NOLOCK, 0); continue; }   /* fence-read trace: no lock */
+#endif
+            boot_host_fn_register(name, boot_nvn_hybrid_observe, (void *)(intptr_t)i, !strcmp(n, "nvnMemoryPoolFinalize") || boot_nvn_ds_pool(n) ? BOOT_HOST_FN_NOLOCK : 0, 0); continue;
+        }
         if (policy != BOOT_NVN_OWN) continue;
         BootHostFunction fn = boot_nvn_unimplemented; intptr_t user = i;
         for (size_t k = 0; k < sizeof impl / sizeof impl[0]; ++k) if (!strcmp(impl[k].name, n)) { fn = impl[k].fn; user = impl[k].user; }
+#ifdef TOTK_DRAW_PATH
+        fn = boot_frt_own(fn);   /* fence-read trace (TOTK_FENCE_READ_TRACE=1): its observing wrapper; off: fn itself */
+#endif
         snprintf(name, sizeof name, "nvn:%s", n);
         boot_host_fn_register(name, fn, (void *)user, 0, 0);
     }

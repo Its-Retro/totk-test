@@ -35,7 +35,7 @@ typedef struct SdkHidMotion { uint64_t sampling, delta_ns; float accel[3], gyro[
 typedef struct SdkHid {
     SRWLOCK lock;
     int initialized, disconnected; uint32_t supported_styles, hold_type, supported_ids;
-    uint64_t pad_ms, motion_ms; int pad_have, motion_have;
+    uint64_t pad_ms, motion_ms, motion_ns; int pad_have, motion_have;
     SdkHidPad pad[SDK_HID_RING]; unsigned pad_tail, pad_count;
     SdkHidMotion motion[SDK_HID_RING]; unsigned motion_tail, motion_count;
     volatile LONG sixaxis_started;
@@ -55,12 +55,30 @@ static inline uint32_t sdk_hid_style(const SdkHid *h, uint32_t *id) {
 
 /* ---------------------------------------------------------------- host input */
 #ifndef SDK_HID_NOW_MS
-static inline uint64_t sdk_hid_now_ms(BootContext *c) {
-    uint64_t t;
-    if (boot_guest_clock_mode() == BOOT_GUEST_CLOCK_DILATED && boot_guest_clock_now(c, &t)) return t / (BOOT_GUEST_HZ / 1000);
-    return GetTickCount64();
+/* svc-S3: the wall clock is QPC. GetTickCount64 advances in 15.6 ms steps, so a new pad/motion sample was taken only
+ * every ~16 ms whatever the frame rate, and the motion delta_ns was 15 or 16 ms; nxport samples on every
+ * GetNpadStates call (MIT, crates/engine/src/horizon/hle.rs:1617-1670). TOTK_HID_CLOCK=tick (or 0): GetTickCount64,
+ * as before. Dilated guest time keeps its 1 ms steps. */
+static inline int sdk_hid_qpc(void) {
+    static int on = -1;
+    if (on < 0) { char v[16]; DWORD n = GetEnvironmentVariableA("TOTK_HID_CLOCK", v, sizeof v); on = !(n && n < sizeof v && (!_stricmp(v, "tick") || !strcmp(v, "0"))); }
+    return on;
 }
+static inline uint64_t sdk_hid_now_ns(BootContext *c) {   /* nanoseconds of the clock sdk_hid_now_ms counts */
+    uint64_t t;
+    if (boot_guest_clock_mode() == BOOT_GUEST_CLOCK_DILATED && boot_guest_clock_now(c, &t)) return t / (BOOT_GUEST_HZ / 1000) * 1000000u;
+    if (!sdk_hid_qpc()) return GetTickCount64() * 1000000u;
+    static LARGE_INTEGER f; LARGE_INTEGER q;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    return (uint64_t)(q.QuadPart / f.QuadPart) * 1000000000u + (uint64_t)(q.QuadPart % f.QuadPart) * 1000000000u / (uint64_t)f.QuadPart;
+}
+static inline uint64_t sdk_hid_now_ms(BootContext *c) { return sdk_hid_now_ns(c) / 1000000u; }
 #define SDK_HID_NOW_MS(c) sdk_hid_now_ms(c)
+#define SDK_HID_NOW_NS(c) sdk_hid_now_ns(c)
+#endif
+#ifndef SDK_HID_NOW_NS
+#define SDK_HID_NOW_NS(c) (SDK_HID_NOW_MS(c) * 1000000u)
 #endif
 #ifndef SDK_HID_SAMPLE
 /* The runtime npad backend's mapping (boot_hid_npad_tick): keyboard when the game window has focus,
@@ -114,7 +132,7 @@ static inline uint64_t sdk_hid_direction_bits(const SdkHidPad *p) {
 }
 /* Takes a new sample when guest time moved by >= 1 ms (caller holds the lock exclusively). */
 static inline void sdk_hid_update(BootContext *c, SdkHid *h, int motion) {
-    uint64_t now = SDK_HID_NOW_MS(c);
+    uint64_t now_ns = SDK_HID_NOW_NS(c), now = now_ns / 1000000u;
     uint64_t *last = motion ? &h->motion_ms : &h->pad_ms; int *have = motion ? &h->motion_have : &h->pad_have;
     if (*have && now <= *last) return;
     SdkHidPad p; SdkHidMotion m; memset(&p, 0, sizeof p); memset(&m, 0, sizeof m);
@@ -126,7 +144,7 @@ static inline void sdk_hid_update(BootContext *c, SdkHid *h, int motion) {
         if (h->pad_count < 16) ++h->pad_count;
     } else {
         SdkHidMotion *prev = &h->motion[h->motion_tail];
-        m.sampling = h->motion_count ? prev->sampling + 1 : 1; m.delta_ns = *have ? (now - *last) * 1000000u : 0;
+        m.sampling = h->motion_count ? prev->sampling + 1 : 1; m.delta_ns = *have ? now_ns - h->motion_ns : 0; h->motion_ns = now_ns;
         h->motion_tail = h->motion_count ? (h->motion_tail + 1) % SDK_HID_RING : 0; h->motion[h->motion_tail] = m;
         if (h->motion_count < 16) ++h->motion_count;
     }
