@@ -32,7 +32,8 @@ if (-not $env:TOTK_OCCLUSION) { $env:TOTK_OCCLUSION = 'fake' }         # occlusi
 if (-not $env:TOTK_TEX_LIVE_TRIM) { $env:TOTK_TEX_LIVE_TRIM = '1' }    # keep textures within the budget every submission, not only when idle
 if (-not $env:TOTK_TEX_MIN_AGE) { $env:TOTK_TEX_MIN_AGE = '120' }      # frames a texture stays unused before it may be evicted
 if (-not $env:TOTK_VERTEX_FORMATS) { $env:TOTK_VERTEX_FORMATS = '0' }  # 1 made broken slabs on stone ruins
-if (-not $env:TOTK_DATA_SNAPSHOT_PLAN) { $env:TOTK_DATA_SNAPSHOT_PLAN = '0' }   # 1 made vertex explosions on the Sky Island
+if (-not $env:TOTK_DATA_SNAPSHOT_PLAN) { $env:TOTK_DATA_SNAPSHOT_PLAN = '1' }   # faster snapshot planning (~3 ms per frame)
+if (-not $env:TOTK_GPU_TS) { $env:TOTK_GPU_TS = 'ns' }   # keeps the game's dynamic resolution lower: higher detail shows a broken LOD on the Sky Island (being fixed)
 if (-not $env:TOTK_SLOT_VERSIONING) { $env:TOTK_SLOT_VERSIONING = '0' }
 if ($Diagnostics) { $env:TOTK_DRED_MARKERS = '1'; $env:TOTK_FLICKER_LOG = '1' }
 else { $env:TOTK_DRED_MARKERS = '0'; $env:TOTK_FLICKER_LOG = '0'; $env:TOTK_FRAME_DUMP_EVERY = '0' }
