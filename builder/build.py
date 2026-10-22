@@ -626,8 +626,13 @@ def step_play(c):
     except ValueError: py_ref = str(py)
     (c.out / 'play-settings.json').write_text(json.dumps({'python': py_ref}, indent=1))
     (c.out / 'play.cmd').write_bytes(b'@echo off\r\nrem Starts the game (see play.ps1 for options).\r\n'
-                                     b'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0play.ps1" %*\r\n')
+                                     b'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0play.ps1" %*\r\n'
+                                     b'set "RC=%ERRORLEVEL%"\r\n' + PAUSE_ON_DOUBLE_CLICK + b'exit /b %RC%\r\n')
     say(f'    {c.out / "play.cmd"}')
+
+
+# play.cmd (like build.cmd): keep the window open when it was double-clicked, so a crash or error message can be read.
+PAUSE_ON_DOUBLE_CLICK = b'rem Started by double-click (Explorer is the parent of this cmd.exe): keep the window open so the messages can be\r\nrem read. Never pauses when run from a terminal, a script or Claude, or with TOTK_NO_PAUSE set.\r\nif not defined TOTK_NO_PAUSE powershell -NoProfile -Command "$c=(Get-CimInstance Win32_Process -Filter (\'ProcessId=\'+$PID)).ParentProcessId; $e=(Get-CimInstance Win32_Process -Filter (\'ProcessId=\'+$c)).ParentProcessId; if ((Get-Process -Id $e -ErrorAction SilentlyContinue).ProcessName -eq \'explorer\') { Write-Host \'\'; Read-Host \'Press Enter to close this window\' | Out-Null }"\r\n'
 
 
 STEPS = [

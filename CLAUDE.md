@@ -32,6 +32,7 @@ You can build and launch the game for the user. Nothing needs installing: `vendo
    - `-From <step>` redoes a step and everything after it; `-DryRun` shows the plan.
 4. **Play:** start `output\play.cmd` **in the background**, since it waits until the game window closes. Then read the logs below.
 5. On a 16 GB PC, don't run a build and the game at the same time.
+   Double-clicked, `build.cmd` and `play.cmd` keep their window open at the end so the user can read errors. Run from a shell they never pause; set `TOTK_NO_PAUSE=1` to be sure.
 6. After the user pulls new commits: run the same build command again (step 3), then play.
 
 ## Logs
