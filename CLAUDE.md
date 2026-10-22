@@ -19,10 +19,22 @@ A native Windows x86-64 port of *The Legend of Zelda: Tears of the Kingdom* (bas
   - `startup/host_gpu_render.h`: repo-relative comment paths.
 - Check `docs/STATUS.md` first: it says what is in progress, so two people don't redo or undo the same work.
 
-## Build and run
+## Build and play it yourself (Claude: you do this, the user shouldn't have to)
 
-- `build.cmd -ExeFS <dir> -RomFS <dir or romfs.bin>` builds everything into `output\` (about 3-5 hours the first time; later runs redo only what changed). `builder/build.py --help` lists steps (`--only <step>`, `--from <step>`, `--dry-run`).
-- `output\play.cmd` (or `play.ps1 -OutputDir output`) starts the game with the tested settings.
+You can build and launch the game for the user. Nothing needs installing: `vendor/` has every tool, and the builder never prompts.
+
+1. **The dump paths.** The first time, ask the user where their own extracted ExeFS folder (with `main`, `main.npdm`, `rtld`, `sdk`, `subsdk0`) and RomFS (the extracted folder or a `romfs.bin`) are. Write them to `local\build-inputs.txt`; `local/` is git-ignored. Read them from there next time instead of asking again.
+2. **Check the inputs** (seconds): `build.cmd -ExeFS <exefs> -RomFS <romfs> -CheckInputs`. It confirms the base game 1.0.0 with no update, and explains any mismatch in plain words.
+3. **Build:** `build.cmd -ExeFS <exefs> -RomFS <romfs>`.
+   - Run it **in the background**: the first build takes about 3-5 hours, and later builds after a `git pull` only redo what changed.
+   - Follow progress in the console's heartbeat lines and in `output\logs\<step>.log`.
+   - If it stops, the message says why. Fix it and run the same command again: finished steps are skipped.
+   - `-From <step>` redoes a step and everything after it; `-DryRun` shows the plan.
+4. **Play:** start `output\play.cmd` **in the background**, since it waits until the game window closes. Then read the logs below.
+5. On a 16 GB PC, don't run a build and the game at the same time.
+6. After the user pulls new commits: run the same build command again (step 3), then play.
+
+## Logs
 - Logs from a play session, all in the output folder:
   - `logs\play-<time>-stderr.log`: frame pacing ("present pacing: ... interval N" = the game's frame-rate cap, 2 = 30 fps, 3 = 20 fps), crashes;
   - `draw-path.log`: renderer counters every 300 presents: "render draw cost" (µs per draw by phase), "data-snapshot frame", "nvn native: async-xlate" (async translation), "blacktex", texture budget;

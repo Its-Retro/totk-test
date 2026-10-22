@@ -142,3 +142,6 @@ __pycache__/
 *.partial
 .vscode/
 .idea/
+
+# ===== local notes (e.g. local/build-inputs.txt: your dump paths, kept by Claude) =====
+/local/
