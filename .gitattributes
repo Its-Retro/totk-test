@@ -4,3 +4,4 @@
 *.dxil binary
 *.bin binary
 *.png binary
+vendor/** -text -diff

@@ -93,6 +93,7 @@ class Ctx:
         e = dict(os.environ)
         e.update(PYTHONNOUSERSITE='1', TOTK_DRAW_PATH='1', TOTK_MEMORY_PROFILE='expanded-lab')
         if self.perl: e['PERL'] = str(self.perl)
+        if vendored_rtcd(): e['VPX_RTCD_DIR'] = str(REPO / 'vendor' / 'libvpx-rtcd')   # build_vpx.py: no perl
         e.update({k: str(v) for k, v in extra.items()})
         return e
 
@@ -214,7 +215,25 @@ def step_sources(c):
 
 
 # Step 3: toolchain
+# Every download the build needs ships in <repo>/vendor (checked against the same pins), so a build needs nothing but the
+# extracted game: no internet, no Git, no Perl. A missing vendor file falls back to the download as before.
+def vendored(name, sha256):
+    p = REPO / 'vendor' / name
+    if not p.is_file(): return None
+    if sha256_file(p) != sha256:
+        raise BuildError(f'vendor/{name} does not have the expected SHA-256 (the repository copy is damaged).\n'
+                         f'  expected {sha256}\nDownload the repository again (or delete that file to fetch it from the internet).')
+    return p
+
+
+def vendored_rtcd():
+    d = REPO / 'vendor' / 'libvpx-rtcd'
+    return all((d / f'{n}.h.raw').is_file() for n in pins.VPX_RTCD)
+
+
 def download(c, url, sha256, name, size=None):
+    v = vendored(name, sha256)
+    if v: return v
     c.downloads.mkdir(parents=True, exist_ok=True)
     dest = c.downloads / name
     if dest.is_file() and sha256_file(dest) == sha256: return dest
@@ -275,13 +294,20 @@ def find_perl(git):
 def step_toolchain(c):
     c.git = find_git()
     c.perl = find_perl(c.git)
-    if not c.git:
+    need_git = not all(s.get('vendor') and (REPO / 'vendor' / s['vendor']).is_file() for s in (pins.LIBVPX, pins.LIBWEBM))
+    need_perl = not vendored_rtcd()
+    if not need_perl:
+        for n, h in pins.VPX_RTCD.items():
+            if sha256_file(REPO / 'vendor' / 'libvpx-rtcd' / f'{n}.h.raw') != h:
+                raise BuildError(f'vendor/libvpx-rtcd/{n}.h.raw does not have the expected SHA-256 (the repository copy is damaged).')
+    if need_git and not c.git:
         raise BuildError('Git was not found. Install Git for Windows from https://git-scm.com/download/win\n'
                          '(it also brings Perl, which the libvpx build needs) and run the command again.')
-    if not c.perl:
+    if need_perl and not c.perl:
         raise BuildError('Perl was not found (libvpx needs it). It comes with Git for Windows in "Git\\usr\\bin\\perl.exe";\n'
                          'reinstall Git for Windows or set the PERL environment variable to a perl.exe.')
-    say(f'    git: {c.git}\n    perl: {c.perl}')
+    say('    libvpx/libwebm sources and libvpx headers from vendor/ (no git or perl needed)' if not (need_git or need_perl)
+        else f'    git: {c.git}\n    perl: {c.perl}')
     if not c.zig.is_file():
         z = download(c, pins.ZIG['url'], pins.ZIG['sha256'], Path(pins.ZIG['url']).name, pins.ZIG['bytes'])
         say('    unpacking zig'); safe_extract_zip(z, c.tools)
@@ -296,6 +322,17 @@ def step_toolchain(c):
 
 # Step 4: third-party sources
 def git_checkout(c, spec, dest):
+    tar = REPO / 'vendor' / spec['vendor'] if spec.get('vendor') else None
+    if tar and tar.is_file():   # the shipped archive of the pinned commit
+        mark = dest / '.vendored-commit'
+        if mark.is_file() and mark.read_text().strip() == spec['commit']: return
+        if sha256_file(tar) != spec['vendor_sha256']:
+            raise BuildError(f'vendor/{tar.name} does not have the expected SHA-256 (the repository copy is damaged).')
+        if dest.exists(): shutil.rmtree(dest)
+        say(f'    unpacking {tar.name}')
+        with tarfile.open(tar) as t: t.extractall(dest.parent, filter='data')
+        mark.write_text(spec['commit'] + '\n')
+        return
     if (dest / '.git').is_dir():
         head = subprocess.run([str(c.git), '-C', str(dest), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
         if head == spec['commit']: return

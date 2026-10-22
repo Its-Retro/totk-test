@@ -108,7 +108,10 @@ def write_config():
 #define VERSION_STRING      " v{major}.{minor}.{patch}"
 #endif  // VPX_VERSION_H_
 ''',newline='\n')
+    rt=os.environ.get('VPX_RTCD_DIR')   # builder: vendor/libvpx-rtcd (the same rtcd.pl output, shipped so no perl is needed)
     for sym,defs in RTCD:
+        if rt and (Path(rt)/f'{sym}.h.raw').is_file():
+            (CONFIG/f'{sym}.h.raw').write_text((Path(rt)/f'{sym}.h.raw').read_text(),newline='\n');continue
         r=run([PERL,str(SRC/'build/make/rtcd.pl'),'--arch=x86_64',f'--sym={sym}',f'--config={CONFIG/"vpx_config.txt"}',
                '--disable-mmx','--disable-avx512',str(SRC/defs)],capture_output=True,text=True)
         (CONFIG/f'{sym}.h.raw').write_text(r.stdout,newline='\n')

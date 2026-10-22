@@ -83,6 +83,8 @@ LIBVPX = {
     'tag': 'v1.15.2',
     'commit': 'd168454ecd099805c675d4a98c66f4891373302a',
     'dir': 'libvpx',
+    'vendor': 'libvpx-v1.15.2.tar.gz',   # git archive of the commit above, shipped in vendor/ (no git needed)
+    'vendor_sha256': 'ef95e72111d63ff475bdd5ba7be103a782d21a911d640780460a567d68f22914',
 }
 LIBWEBM = {
     'version': '1.0.0.32',
@@ -91,8 +93,19 @@ LIBWEBM = {
     'tag': 'libwebm-1.0.0.32',
     'commit': 'f2a982d748b80586ae53b89a2e6ebbc305848b8c',
     'dir': 'libwebm',
+    'vendor': 'libwebm-1.0.0.32.tar.gz',
+    'vendor_sha256': '79166fc27c821f86603cea53e85fe9c62a15b09672a8a7af14c80c65aafe84e6',
 }
 
 # Disk space the build needs on the output drive (bytes), with and without packing the RomFS.
 DISK_NEEDED = 60 * 10**9
 DISK_NEEDED_NO_PACK = 42 * 10**9
+
+# libvpx's run-time CPU dispatch headers, generated once by libvpx's own build/make/rtcd.pl (perl) for this exact
+# configuration (x86_64, --disable-mmx --disable-avx512, build_vpx.py's vpx_config.txt) and shipped in vendor/libvpx-rtcd,
+# so the build needs no perl. name -> sha256
+VPX_RTCD = {
+    'vp9_rtcd': '50950b34ec921b6adad0482e04cbb9b76129b65f9c222fd3beffb364bd033e1f',
+    'vpx_dsp_rtcd': '2a6444ccd194492e00a9645de44e3943572839c90795fae3ee1bbd1370c26a43',
+    'vpx_scale_rtcd': '14295d4093779a9fcc8c3b5dda4164f15fef46df1241645cec116acb6de2c02e',
+}

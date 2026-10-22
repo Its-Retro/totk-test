@@ -64,9 +64,13 @@ function Get-PrivatePython {
     $downloads = Join-Path $OutputDir 'downloads'
     New-Item -ItemType Directory -Force $downloads | Out-Null
     $pkg = Join-Path $downloads "python.$pyVersion.nupkg"
+    $vendorPkg = Join-Path $repo "vendor\python.$pyVersion.nupkg"
+    if (Test-Path $vendorPkg) { Say "  Using the bundled Python $pyVersion (vendor folder)"; Copy-Item $vendorPkg $pkg -Force }
+    else {
     Say "  Downloading Python $pyVersion (python.org NuGet package, about 15 MB)"
     try { Invoke-WebRequest -Uri $pyUrl -OutFile $pkg -UseBasicParsing }
     catch { Stop-Build "Could not download Python from $pyUrl ($($_.Exception.Message)). Check the internet connection, or install Python 3.12 (64-bit) from https://www.python.org/downloads/windows/ and run this again." }
+    }
     $sha = [Security.Cryptography.SHA512]::Create()
     $fs = [IO.File]::OpenRead($pkg)
     try { $got = [Convert]::ToBase64String($sha.ComputeHash($fs)) } finally { $fs.Close() }
@@ -110,7 +114,9 @@ $probe = Invoke-Quiet $py @('-c', "import capstone,zstandard,numpy,sys; sys.exit
 if ($probe.Code -ne 0) {
     Say '  Installing the pinned Python packages (capstone 5.0.7, zstandard 0.25.0, numpy 2.3.5)'
     if ((Invoke-Quiet $py @('-m', 'pip', '--version')).Code -ne 0) { Invoke-Quiet $py @('-m', 'ensurepip', '--default-pip') | Out-Null }
-    & $py -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: -r (Join-Path $repo 'builder\requirements.txt')
+    $wheels = Join-Path $repo 'vendor\wheels'
+    $offline = if (Test-Path $wheels) { @('--no-index', '--find-links', $wheels) } else { @() }   # bundled wheels: no internet
+    & $py -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: @offline -r (Join-Path $repo 'builder\requirements.txt')
     if ($LASTEXITCODE -ne 0) { Stop-Build 'Installing the Python packages failed (see above). Check the internet connection and run the command again.' }
 }
 

@@ -22,8 +22,8 @@ This is not an emulator. The builder in this repository reads the game files *yo
 | **GPU** | DirectX 12 with Shader Model 6.6 and an up-to-date driver; 8 GB of video memory recommended (see `-TextureBudgetMB` below for less). Only an NVIDIA RTX 4070 Laptop GPU has been tested. |
 | **RAM** | 16 GB minimum, with Windows' automatic page file on a drive with plenty of free space. 32 GB recommended. The build itself is the memory-hungry part; the game uses 3.5-7 GB. |
 | **Disk** | About **60 GB free** on the drive that holds the output folder (17 GB for the RomFS image, 4 GB of generated C, up to 10 GB of translator caches, several GB of compiled objects and shaders, about 1 GB for the game itself). About 42 GB if you give a RomFS image file on the same drive. An SSD helps a lot. |
-| **Software** | [Git for Windows](https://git-scm.com/download/win) (the builder uses its `git` and `perl`). Python 3.12 is used if you have it; otherwise the builder downloads a private copy into the output folder. Nothing is installed system-wide and no admin rights are needed. |
-| **Internet** | For the first run only: zig 0.16.0 (97 MB), the DirectX Shader Compiler (32 MB), Python 3.12 if needed (15 MB), three Python packages and the sources of libopus, SDL 3, libvpx and libwebm. Every download is pinned to an exact version and checked against its SHA-256 (or git commit) before use. |
+| **Software** | Nothing to install. Everything the build uses ships in the `vendor` folder of this repository: zig 0.16.0, the DirectX Shader Compiler, a private Python 3.12 (used only if you do not already have Python 3.12) with its three packages, and the sources of libopus, SDL 3, libvpx and libwebm. Each file is checked against its pinned SHA-256 before use. No Git, no Perl, no admin rights, nothing installed system-wide. |
+| **Internet** | Not needed. The build works offline; it only downloads a file if that file is missing from `vendor` (for example a partial copy of the repository). |
 | **Time** | About 3-5 hours for the first build on a 16-thread laptop. The PC stays usable (the builder runs at low priority) but will be busy. Later runs only redo what changed. |
 
 ## Build it (one command)
@@ -53,8 +53,8 @@ Use your own paths. `-RomFS` can also point at a RomFS image file. You can stop 
 
 1. **Checks your PC**: Windows version, CPU (AVX2), RAM, free disk space, GPU.
 2. **Copies the source code** into the output folder (the repository itself is never changed).
-3. **Gets the compilers**: zig 0.16.0 and DXC v1.9.2609 (downloaded and hash-checked once), and finds Git and Perl.
-4. **Gets the open-source libraries**: libopus 1.5.2, SDL 3.4.16, libvpx 1.15.2 and libwebm 1.0.0.32, at pinned versions.
+3. **Gets the compilers**: zig 0.16.0 and DXC v1.9.2609, unpacked from `vendor` after a hash check.
+4. **Gets the open-source libraries**: libopus 1.5.2, SDL 3.4.16, libvpx 1.15.2 and libwebm 1.0.0.32, unpacked from `vendor` at their pinned versions (libvpx's generated CPU-dispatch headers are shipped too, so no Perl is needed).
 5. **Checks your ExeFS files** against the base game's exact SHA-256 hashes. A wrong version, an update or a damaged file is explained in plain words.
 6. **Decompresses the game code**: the ExeFS modules are LZ4-compressed NSO files; the builder unpacks them itself (no keys involved) and checks the result.
 7. **Prepares your RomFS**: packs the extracted folder into one image file, the form the game reads, or links your image file in. The result must be identical, byte for byte, to the base game's RomFS, which also proves every file is intact.
@@ -80,7 +80,7 @@ output\
   startup\save-data\        your saves (made on first start)
   assets\romfs.bin          your RomFS as one image
   exefs\, uncompressed\     your ExeFS files and the unpacked modules
-  tools\, downloads\        zig, DXC and (if needed) Python
+  tools\, downloads\        zig, DXC and (if needed) Python, unpacked from vendor
   logs\                     build and play logs
 ```
 
@@ -111,7 +111,7 @@ Double-click **`output\play.cmd`**.
 
 Each part of the pipeline has been run in the development tree. The builder's own light steps were tested (checking real game files, the error messages, unpacking the pinned archives, compiling the helper shaders and the launcher, generating the headers). The following has **not** yet been run from a fresh clone, so the first friend builds are also the test of the builder:
 
-- Downloading zig, DXC, Python and the libraries, and `build.ps1` finding or fetching Python and installing the packages.
+- `build.ps1` setting up the bundled Python on a PC without Python 3.12. (Tested: the toolchain and library steps from `vendor` with no downloads, the offline install of the three Python packages from `vendor\wheels`, and a libvpx build with no Perl on the PC.)
 - Packing a real extracted RomFS folder. The packer reproduces the base game's RomFS layout exactly (checked byte for byte against the original image's tables) and round-trips a small test folder, but a full 17 GB pack has not been run.
 - The C translation, DLL compile and shader steps as the builder runs them in a fresh output folder (same commands as development), including the new parallel translation of the scanned shaders and the shader manifest with relative paths.
 - The point-sprite geometry shader step (`make_point_gs.py`) as the builder runs it, on a manifest with relative paths. It is optional: if it fails, the build continues.
