@@ -34,6 +34,7 @@ if (-not $env:TOTK_TEX_MIN_AGE) { $env:TOTK_TEX_MIN_AGE = '120' }      # frames 
 if (-not $env:TOTK_VERTEX_FORMATS) { $env:TOTK_VERTEX_FORMATS = '1' }  # decode vertex format 100 (corner offsets of distant tree/terrain cards)
 if (-not $env:TOTK_DATA_SNAPSHOT_PLAN) { $env:TOTK_DATA_SNAPSHOT_PLAN = '1' }   # faster snapshot planning (~3 ms per frame)
 if (-not $env:TOTK_GPU_TS) { $env:TOTK_GPU_TS = 'ns' }   # the game keeps a lower detail level (fewer draws, faster while the render thread is the bottleneck)
+if (-not $env:TOTK_ASYNC_XLATE) { $env:TOTK_ASYNC_XLATE = '2' }   # async translation stage 2: a separate thread translates each frame for the GPU (0 = the old single-thread path)
 if (-not $env:TOTK_SLOT_VERSIONING) { $env:TOTK_SLOT_VERSIONING = '0' }
 if ($Diagnostics) { $env:TOTK_DRED_MARKERS = '1'; $env:TOTK_FLICKER_LOG = '1' }
 else { $env:TOTK_DRED_MARKERS = '0'; $env:TOTK_FLICKER_LOG = '0'; $env:TOTK_FRAME_DUMP_EVERY = '0' }
