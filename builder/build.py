@@ -535,8 +535,10 @@ def step_headers(c):
 # Step 9: translate
 def step_translate(c):
     db = c.startup / 'emitted-instructions.sqlite'
-    def beat():
-        return f'instruction cache {human(db.stat().st_size)}' if db.is_file() else ''
+    def beat():   # phase 1 fills the instruction cache (~0.4 GB); phase 2 writes the page cache and the C (~1.2 GB and ~3.7 GB)
+        parts = [f'{label} {human(f.stat().st_size)}' for f, label in ((db, 'instruction cache'), (c.startup / 'incremental-page-cache.sqlite', 'page cache'),
+                                                                     (c.startup / 'translated_startup.c', 'C code')) if f.is_file()]
+        return ', '.join(parts)
     c.py('incremental/translate_startup_incremental.py', '--ranges-dir', '.', '--output', 'translated_startup.c',
          '--edges-output', 'external-edges.json', '--sidecar', 'incremental-page-cache.sqlite', '--write-instruction-cache',
          log='translate', heartbeat=beat, what='The ARM64 -> C translation')
