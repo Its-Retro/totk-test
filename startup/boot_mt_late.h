@@ -932,8 +932,9 @@ static inline void boot_mt_quiesce_end(void){_InterlockedExchange(&boot_mt_quies
  * region table (a snapshot from the start of multi-core execution), which the caller resolves its GPU
  * mappings through. */
 /* t2-A: per worker, boot_gpu_pack_rgen()+1 when its region table was last refreshed from the master here (0: never).
- * Outside BootCore so the page header does not change. */
-static uint64_t boot_mt_pack_seen[BOOT_MT_MAX];
+ * Outside BootCore so the page header does not change. async-xlate: slot BOOT_MT_MAX is the translation thread X's
+ * (host_nvn_async.h: a core-shaped context whose index is never a worker's), so its submissions keep the unlocked path. */
+static uint64_t boot_mt_pack_seen[BOOT_MT_MAX+1];
 static inline int boot_mt_gpu_pack(BootContext*c,BootWindow*w,uint32_t as_fd){
     BootCore*k=(BootCore*)c;BootContext*M=boot_mt.master;
     /* t2-A: steady state without the kernel lock: this core's region table was copied at the current region
@@ -943,7 +944,7 @@ static inline int boot_mt_gpu_pack(BootContext*c,BootWindow*w,uint32_t as_fd){
      * so a generation equal to the cached one means no change completed since the cached full pack; a change still in
      * flight is ordered after this submission, exactly as if the submission had taken the kernel lock first. */
     const int verify=boot_gpu_pack_verify();
-    if(!verify && k->index<BOOT_MT_MAX){uint64_t g=boot_gpu_pack_rgen();
+    if(!verify && k->index<=BOOT_MT_MAX){uint64_t g=boot_gpu_pack_rgen();
         if(boot_mt_pack_seen[k->index]==g+1 && boot_gpu_pack_unchanged(M,w,as_fd,g)){
             c->exclusive_valid=0;++boot_gpu_pack_stats.skipped_unlocked;return 1;}
     }
@@ -954,7 +955,7 @@ static inline int boot_mt_gpu_pack(BootContext*c,BootWindow*w,uint32_t as_fd){
     AcquireSRWLockExclusive(&w->lock);
     /* TOTK_PACK_VERIFY: the unlocked decision, evaluated here where nothing can change under it */
     int would_skip=0;
-    if(verify && k->index<BOOT_MT_MAX){uint64_t g=boot_gpu_pack_rgen();would_skip=boot_mt_pack_seen[k->index]==g+1 && boot_gpu_pack_unchanged(M,w,as_fd,g);}
+    if(verify && k->index<=BOOT_MT_MAX){uint64_t g=boot_gpu_pack_rgen();would_skip=boot_mt_pack_seen[k->index]==g+1 && boot_gpu_pack_unchanged(M,w,as_fd,g);}
     int ok=boot_gpu_pack_regions_locked(M,w,as_fd);
     unsigned n=M->region_count<BOOT_REGION_CAPACITY?M->region_count:BOOT_REGION_CAPACITY;
     if(would_skip){
@@ -968,7 +969,7 @@ static inline int boot_mt_gpu_pack(BootContext*c,BootWindow*w,uint32_t as_fd){
     c->region_count=n;
     memcpy(c->aliases,M->aliases,sizeof(c->aliases));c->alias_count=M->alias_count;
     c->exclusive_valid=0;
-    if(k->index<BOOT_MT_MAX)boot_mt_pack_seen[k->index]=boot_gpu_pack_rgen()+1;   /* t2-A: the copy above is of this generation */
+    if(k->index<=BOOT_MT_MAX)boot_mt_pack_seen[k->index]=boot_gpu_pack_rgen()+1;   /* t2-A: the copy above is of this generation */
     boot_mt.kernel_core=UINT32_MAX;
     ReleaseSRWLockExclusive(&boot_mt.klock);
     boot_mt_guest_enter(k);

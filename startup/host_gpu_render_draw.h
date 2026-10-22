@@ -1403,6 +1403,49 @@ static inline void boot_render_vbounds_diag(BootRender *r, const BootDrawState *
         }
     }
 }
+/* fmt100 diagnostic (TOTK_STATE_DIAG; log only, changes no draw; 2026-10-22): K3 vertex format 100 (RGBA8 SSCALED, attribute 1)
+ * decoded (TOTK_VERTEX_FORMATS=1) removed the high-detail LOD sheets on the Sky Island (play-109 A/B with TOTK_GPU_TS=gpu), but on
+ * 2026-10-21 the same decode broke stone-ruin slabs. Each distinct (vertex program, attribute, stream layout) that fetches an
+ * 8_8_8_8 SSCALED attribute is logged once (64 at most): stream, offset, stride, divisor, bound size, the draw's shape, every active
+ * attribute's format and the attribute's raw signed bytes for the first four elements the draw fetches (indexed draws: from the
+ * base vertex, indices not scanned; per-instance streams: from the base instance), so a correct use (trees, terrain) and a broken
+ * one (ruins) can be compared. */
+static inline void boot_render_fmt100_diag(BootRender *r, const BootDrawState *s, const uint8_t *vs_id) {
+    static struct { uint64_t vs, lay; } seen[64]; static unsigned n_seen;
+    if (n_seen >= 64) return;
+    for (unsigned i = 0; i < 32 && n_seen < 64; ++i) {
+        const BootVertexAttrib *a = &s->attrib[i];
+        if (a->inactive || a->size != 0x0au || a->type != 6u) continue;
+        const BootVertexStream *st = &s->stream[a->stream & 15];
+        uint64_t vs; memcpy(&vs, vs_id, 8);
+        const uint64_t lay = (uint64_t)i | (uint64_t)(a->stream & 31) << 5 | (uint64_t)a->offset << 10 | (uint64_t)st->stride << 24 | (uint64_t)st->divisor << 40;
+        unsigned k = 0;
+        while (k < n_seen && !(seen[k].vs == vs && seen[k].lay == lay)) ++k;
+        if (k < n_seen) continue;
+        seen[n_seen].vs = vs; seen[n_seen].lay = lay; ++n_seen;
+        char fm[256]; size_t at = 0; fm[0] = 0;
+        for (unsigned j = 0; j < 32 && at + 24 < sizeof fm; ++j) {
+            const BootVertexAttrib *b = &s->attrib[j];
+            if (!b->inactive) at += (size_t)snprintf(fm + at, sizeof fm - at, " %u:%x/%u@%u+%u", j, b->size, b->type, b->stream & 15, b->offset);
+        }
+        int8_t sm[16]; memset(sm, 0, sizeof sm); unsigned got = 0;
+        if (st->enabled && st->stride) {
+            const int64_t first = st->divisor ? (int64_t)s->base_instance_reg : s->indexed ? (int64_t)(int32_t)s->base_vertex_reg : (int64_t)s->first;
+            for (unsigned q = 0; q < 4; ++q) {
+                const int64_t el = first + (int64_t)q;
+                if (el < 0) break;
+                const uint8_t *p = boot_render_diag_guest(r, st->address + (uint64_t)el * st->stride + a->offset, 4);
+                if (!p) break;
+                memcpy(sm + 4 * q, p, 4); ++got;
+            }
+        }
+        char vs_hex[17]; for (int b = 0; b < 8; ++b) snprintf(vs_hex + 2 * b, 3, "%02x", vs_id[b]);
+        boot_gp_log("nvn native: fmt100 diag #%u: vs %s attr %u (RGBA8 SSCALED) stream %u va %llx offset %u stride %u divisor %u size %u | draw topo %u indexed %u count %u first %u base %d inst %u | attrs%s | first elements (%u read): (%d,%d,%d,%d) (%d,%d,%d,%d) (%d,%d,%d,%d) (%d,%d,%d,%d) (submission %llu)",
+                    n_seen, vs_hex, i, a->stream & 15, (unsigned long long)st->address, a->offset, st->stride, st->divisor, boot_render_stream_size(st),
+                    s->topology, s->indexed, s->count, s->first, (int)s->base_vertex_reg, s->base_instance_reg, fm, got,
+                    sm[0], sm[1], sm[2], sm[3], sm[4], sm[5], sm[6], sm[7], sm[8], sm[9], sm[10], sm[11], sm[12], sm[13], sm[14], sm[15], (unsigned long long)boot_render_exec_id);
+    }
+}
 /* batch-3 G8: NVN ignores blending on an integer colour target (integer data passes the blend unit unchanged); D3D12
  * refuses a pipeline that enables it there (E_INVALIDARG) and the draw is lost. Blend stays off for UINT/SINT targets,
  * as nxport does (MIT, crates/engine/src/metal/translated.rs:7308-7309: blending only for pf_kind 0). With
@@ -2160,6 +2203,7 @@ programs_known:
     }
     boot_ds_vertex(r, s, attribs);   /* data-snapshot: streams it takes read their copy in the arena (stream VA rewritten) */
     if (boot_render_state_diag_on() && !ind.kind && s->count) boot_render_vbounds_diag(r, s, vs_id);   /* vbounds diagnostic (log only) */
+    if (boot_render_state_diag_on() && s->count) boot_render_fmt100_diag(r, s, vs_id);   /* fmt100 diagnostic (log only) */
     if (boot_sd_on()) boot_sd_draw_vs(r, s, vs, ind.kind != 0, draw_instances, fb_handles[0], fb_handle_valid[0]);   /* suspect-diag S1 / S2 / S4 */
     /* topology and index source */
     static const D3D_PRIMITIVE_TOPOLOGY direct[6] = {D3D_PRIMITIVE_TOPOLOGY_POINTLIST, D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,

@@ -63,6 +63,7 @@ static inline void boot_nvn_exec_dispatch(BootContext *c, uint64_t self, BootRen
                if (BOOT_CENSUS_ON()) BOOT_CENSUS_COMPUTE(0, NULL, e->ssbo[5], 16, 1, "dispatch without a compute program");
                return; }
     uint32_t ctl[0x70 / 4];
+    boot_ax_live(BOOT_AX_L_CODE, sizeof ctl);   /* async-xlate: counted as a live read on X (shader control data, written once at load) */
     if (!boot_host_read(c, self, cs->control + 0x700, ctl, sizeof ctl)) { ++e->skipped;
         if (BOOT_CENSUS_ON()) BOOT_CENSUS_COMPUTE(cs->data, NULL, e->ssbo[5], 16, 1, "compute control block read");
         return; }
@@ -233,7 +234,7 @@ static inline void boot_nvn_exec_copy_tex_to_buf(BootContext *c, uint64_t self, 
     if (region_n < 24 || !x[1] || !x[4]) { if (failed++ < 8) boot_draw_log("nvn native: copy texture to buffer without region or destination%s %llx %llx", "", x[1], x[4]); return; }
     memcpy(rg, region, 24);
     if (captured) { if (x[2]) vp = captured; }   /* flashfix: as recorded (zero view bytes select nothing) */
-    else if (x[2] && boot_host_read(c, self, x[2], view, sizeof view)) vp = view;
+    else if (x[2] && (boot_ax_live(BOOT_AX_L_OBJECT, sizeof view), boot_host_read(c, self, x[2], view, sizeof view))) vp = view;   /* async-xlate: counted on X */
     if (!boot_nvn_texture_target_obj(c, self, x[1], captured ? captured + 16 : NULL, vp, &ct, NULL) || ct.pitch_layout) { if (failed++ < 8) boot_draw_log("nvn native: copy texture to buffer: source not a colour image%s %llx %llu", "", x[1], 0); return; }
     DXGI_FORMAT cfmt;
     if (!boot_render_ct_format(ct.format, &cfmt) || !ct.width || !ct.height || ct.log_gob_w || ct.log_gob_h > 5 || ct.log_gob_d > 5) {
@@ -319,7 +320,7 @@ static inline void boot_nvn_exec_copy_buf_to_tex(BootContext *c, uint64_t self, 
     if (region_n < 24 || !x[1] || !x[2]) { if (failed++ < 8) boot_draw_log("nvn native: copy buffer to texture without region or source%s %llx %llx", "", x[1], x[2]); return; }
     memcpy(rg, region, 24);
     if (captured) { if (x[3]) vp = captured; }   /* flashfix: as recorded */
-    else if (x[3] && boot_host_read(c, self, x[3], view, sizeof view)) vp = view;
+    else if (x[3] && (boot_ax_live(BOOT_AX_L_OBJECT, sizeof view), boot_host_read(c, self, x[3], view, sizeof view))) vp = view;   /* async-xlate: counted on X */
     if (!boot_nvn_texture_target_obj(c, self, x[2], captured ? captured + 16 : NULL, vp, &ct, NULL)) { if (failed++ < 8) boot_draw_log("nvn native: copy buffer to texture: destination not a colour image%s %llx %llu", "", x[2], 0); return; }
     DXGI_FORMAT cfmt;
     if (!boot_render_ct_format(ct.format, &cfmt) || !ct.width || !ct.height || ct.log_gob_w || ct.log_gob_h > 5 || ct.log_gob_d > 5) {
@@ -486,7 +487,8 @@ static inline int boot_nvn_ind_gpu(BootRender *r, uint32_t kind, uint32_t mode, 
 /* Driver texture/sampler pool object {memory pool, offset, count} -> descriptor GPU address. */
 static inline uint64_t boot_nvn_exec_pool_va(BootContext *c, uint64_t self, const uint8_t *pool_obj, uint32_t *count) {
     uint64_t mem, off, va = 0; uint32_t n; memcpy(&mem, pool_obj, 8); memcpy(&off, pool_obj + 8, 8); memcpy(&n, pool_obj + 16, 4);
-    if (!mem || !boot_host_read(c, self, mem + 0x18, &va, 8)) return 0;
+    if (!mem) return 0;
+    if (!boot_ax_obj_word(mem + 0x18, &va) && (boot_ax_live(BOOT_AX_L_POOLWORD, 8), !boot_host_read(c, self, mem + 0x18, &va, 8))) return 0;   /* async-xlate: on X the word t2 captured */
     *count = n; return va + off;
 }
 
@@ -1129,7 +1131,7 @@ static DWORD WINAPI boot_nvn_par_main(void *arg) {
 }
 /* Render thread, before the translation of `handle`: helpers decode its units. 1 = a job runs. */
 static inline int boot_nvn_par_begin(uint64_t handle) {
-    if (!boot_nvn_par_on() || !boot_nvn_dsnap.active || !boot_nvn_dsnap.fz_on || boot_nvn_dsnap.tid != GetCurrentThreadId() || (handle & BOOT_NVN_SHADOW)) return 0;
+    if (!boot_nvn_par_on() || boot_nvn_dsnap_tls || !boot_nvn_dsnap.active || !boot_nvn_dsnap.fz_on || boot_nvn_dsnap.tid != boot_nvn_call_tid() || (handle & BOOT_NVN_SHADOW)) return 0;   /* async-xlate: X acts for the call's thread; stage 2: helpers would read the main table */
     if (!boot_nvn_par.started) {
         boot_nvn_par.started = 1; InitializeSRWLock(&boot_nvn_par.lock);
         char v[8]; DWORD k = GetEnvironmentVariableA("TOTK_NVN_PAR_THREADS", v, sizeof v);
@@ -1147,7 +1149,7 @@ static inline int boot_nvn_par_begin(uint64_t handle) {
     /* helpers idle (boot_nvn_par_end waited): reset the tables and arenas, then publish the job */
     memset(boot_nvn_par.unit, 0, sizeof boot_nvn_par.unit); boot_nvn_par.units = 0; boot_nvn_par.qhead = boot_nvn_par.qtail = 0; boot_nvn_par.full = 0;
     for (unsigned i = 0; i < boot_nvn_par.threads; ++i) { boot_nvn_par.w[i].cur = 0; boot_nvn_par.w[i].used = 0; }
-    boot_nvn_par.call_op = boot_nvn_ops()->call_commands; boot_nvn_par.tid = GetCurrentThreadId();
+    boot_nvn_par.call_op = boot_nvn_ops()->call_commands; boot_nvn_par.tid = boot_nvn_call_tid();
     boot_nvn_par_unit_locked(handle, 1);
     ++boot_nvn_par.jobs;
     InterlockedExchange(&boot_nvn_par.stop, 0); InterlockedExchange(&boot_nvn_par.job, 1);
@@ -1313,6 +1315,7 @@ static inline int boot_nvn_exec_handle(BootContext *c, uint64_t self, BootRender
             if (!n && at == handle && boot_nvn_ev_skip(handle, depth)) return 1;   /* rec-evict: a released handle used again: its commands skipped, logged */
             boot_draw_log("nvn native: bad record%s at %llx %llu", "", at, n); return 0;
         }
+        if (boot_ax_chk_log) boot_ax_chk_rec(at, &rec, size);   /* async-xlate sentinel (TOTK_ASYNC_XLATE_CHECK=1): what this read gave X */
         if (rec.op == BOOT_NVN_OP_END) return 1;
         if (rec.op == BOOT_NVN_OP_JUMP) { at = rec.x[1]; continue; }
         at += size;
@@ -1735,9 +1738,10 @@ static inline int boot_nvn_exec_submit(void *ctx, BootContext *c, uint64_t self,
             {   char pk[1280];   /* t2-A: GPU arena pack fast path counters, after the fields the existing parsers read */
                 /* drawcost: cost per draw since the previous line: submit time (page-table sync + record + kick, QPC) and the
                  * submitting thread's CPU time (t2: GetThreadTimes, user + kernel, everything it ran in between) over the draws */
-                static uint64_t dc_draws, dc_qpc, dc_cpu; FILETIME tc, te, tk, tu; uint64_t cpu_now = 0;
+                static uint64_t dc_draws, dc_qpc, dc_cpu; static DWORD dc_tid; FILETIME tc, te, tk, tu; uint64_t cpu_now = 0;
                 if (GetThreadTimes(GetCurrentThread(), &tc, &te, &tk, &tu))
                     cpu_now = ((uint64_t)tk.dwHighDateTime << 32 | tk.dwLowDateTime) + ((uint64_t)tu.dwHighDateTime << 32 | tu.dwLowDateTime);
+                if (dc_tid != GetCurrentThreadId()) { dc_tid = GetCurrentThreadId(); dc_cpu = 0; }   /* async-xlate: the translating thread changed (t2 / X): no delta across threads */
                 uint64_t dc_q = e->submit_qpc + boot_nvn_mem_qpc, dd = e->draws - dc_draws;
                 double sub_us = dd ? (double)(dc_q - dc_qpc) * 1e6 / (double)f.QuadPart / (double)dd : 0.0;
                 double cpu_us = dd && dc_cpu && cpu_now >= dc_cpu ? (double)(cpu_now - dc_cpu) / 10.0 / (double)dd : 0.0;
@@ -2079,6 +2083,7 @@ static inline void boot_nvn_flicker_counts(void) {
 static inline void boot_nvn_ftrace_exec_counts(uint64_t v[3]) {
     BootNvnExec *e = boot_nvn_exec(); v[0] = e ? e->draws : 0; v[1] = e ? e->clears : 0; v[2] = e ? e->skipped : 0;
 }
+static inline void boot_nvn_exec_present_body(BootWindow *w, const BootColorTarget *ctp);
 static inline int boot_nvn_exec_present(void *ctx, BootContext *c, uint64_t queue, uint64_t window, uint32_t index) {
     (void)ctx; (void)queue;
     uint64_t trace_outer=boot_present_trace_frame;
@@ -2090,6 +2095,54 @@ static inline int boot_nvn_exec_present(void *ctx, BootContext *c, uint64_t queu
     uint64_t tex = boot_nvn_window_texture(c, window, index);
     BootColorTarget ct;
     if (!w || !tex || !boot_nvn_texture_target(c, window, tex, NULL, &ct, NULL)) { boot_draw_log("nvn native: present texture%s %llx %llu", "", tex, index); boot_present_trace_frame=trace_outer; return 1; }
+    boot_nvn_exec_present_body(w, &ct);
+    boot_present_trace_frame=trace_outer;
+    return 1;
+}
+/* async-xlate stage 2: a present's half that reads only guest objects and the game's timing (pacing, the window texture through the calling
+ * context): t2 runs it at the call, the PRESENT op carries the result to X, which runs the body below in FIFO order. */
+typedef struct BootAxPresentPay { BootWindow *w; uint64_t trace_frame; BootColorTarget ct; } BootAxPresentPay;
+static inline int boot_nvn_exec_present_call(BootContext *c, uint64_t window, uint32_t index, BootAxPresentPay *p) {
+    uint64_t trace_outer=boot_present_trace_frame;
+    p->trace_frame=boot_present_trace_begin(window,index);
+    boot_nvn_present_note(c, window);
+    if (!boot_present_pace_at_acquire()) boot_present_interval_pace(c, window);   /* N2: else the wait runs in nvnWindowAcquireTexture */
+    boot_present_trace_event(BOOT_PT_INTERVAL_DONE,p->trace_frame,0,window,index,0);
+    p->w = (BootWindow *)(uintptr_t)c->window_native;
+    uint64_t tex = boot_nvn_window_texture(c, window, index);
+    const int ok = p->w && tex && boot_nvn_texture_target(c, window, tex, NULL, &p->ct, NULL);
+    if (!ok) boot_draw_log("nvn native: present texture%s %llx %llu", "", tex, index);
+    boot_present_trace_frame=trace_outer;
+    return ok;
+}
+static inline void boot_nvn_exec_present_x(const BootAxPresentPay *p) {
+    uint64_t trace_outer=boot_present_trace_frame; boot_present_trace_frame=p->trace_frame;
+    boot_nvn_exec_present_body(p->w, &p->ct);
+    boot_present_trace_frame=trace_outer;
+}
+/* async-xlate stage 2: the queue idle a waiting nvnSyncWait / nvnQueueFinish runs today (boot_nvn_exec_wait's complete wait: everything
+ * recorded executed, the queue idle (deferred compute stores applied), pitch-linear targets copied to guest memory, the texture budget,
+ * retired pipelines), as an IDLE / FINISH op on X after everything queued before it. */
+static inline int boot_nvn_exec_idle_x(void) {
+    BootNvnExec *e = boot_nvn_exec(); BootWindow *w = e ? e->w : NULL;
+    if (!w) return 1;
+    AcquireSRWLockExclusive(&w->lock);
+    BootRender *r = w->render; int ok = 1;
+    if (r) {
+        LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+        ok = boot_render_idle(r) && boot_render_flush_pitch(r);
+        static uint64_t budget;
+        if (!budget) { char v[32]; DWORD n = GetEnvironmentVariableA("TOTK_TEX_BUDGET_MB", v, sizeof v); unsigned long long mb = (n && n < sizeof v) ? strtoull(v, NULL, 10) : 0;
+                       budget = mb >= 256 ? (uint64_t)mb << 20 : BOOT_RENDER_TEX_BUDGET; }
+        if (ok && !r->recording) { boot_render_tex_trim(r, budget); boot_render_pso_release_retired(); }
+        QueryPerformanceCounter(&t1); ++e->idles; e->idle_qpc += (uint64_t)(t1.QuadPart - t0.QuadPart);
+    }
+    ReleaseSRWLockExclusive(&w->lock);
+    return ok;
+}
+/* The part of a present that reads renderer state (on the calling thread before stage 2; X's PRESENT op in stage 2). */
+static inline void boot_nvn_exec_present_body(BootWindow *w, const BootColorTarget *ctp) {
+    const BootColorTarget ct = *ctp;
     AcquireSRWLockExclusive(&w->lock);
     int ok = boot_draw_device_recover(w) && boot_draw_open(w);
     if (ok && !w->present) {
@@ -2115,8 +2168,6 @@ static inline int boot_nvn_exec_present(void *ctx, BootContext *c, uint64_t queu
     ReleaseSRWLockExclusive(&w->lock);
     boot_psoc_tick();   /* play (73): persists new pipelines (background thread) once enough exist */
     boot_nvn_state_diag_present(w);   /* batch-3: N5 compare, K1 scan budget, 300-present counters (TOTK_STATE_DIAG) */
-    boot_present_trace_frame=trace_outer;
-    return 1;
 }
 static inline void boot_nvn_exec_install(BootNvnBackend *b) {
     boot_compute_defer = 1; boot_present_no_wait = 1;

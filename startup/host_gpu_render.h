@@ -222,6 +222,145 @@ static inline int boot_ds_fill_wanted(uint64_t va, uint64_t n);
 static inline void boot_ds_fill(BootRender *r, uint8_t *dst, uint64_t va, const uint8_t *live, uint64_t n);
 static inline void boot_ds_idle(void);
 static inline void boot_ds_s1_changed(BootRender *r, uint64_t va, uint64_t n, unsigned kind);
+/* ---------------------------------------------------------------- async-xlate (play-work/async-xlate-work: stage1/README.md, stage2/README.md)
+ * The translation thread X, the FIFO, the capture and the virtual fences are host_nvn_async.h; here what the renderer reads and marks.
+ * The capture: at the submit call t2 copies, through its own context and a snapshot of the GPU mappings (never renderer state), every
+ * uniform-buffer range the submission can bind, at exactly the size boot_render_cbv_ex copies (boot_render_cb_view_bytes), into an arena
+ * and a guest GPU VA -> (offset, length, flags) table. While X translates that submission boot_ax_cap_view points at it, and
+ * boot_render_cbv_ex takes a binding data-snapshot takes (boot_ds_cb_now) from it (boot_ax_cb_src), unless GPU work not yet idle at the
+ * capture may write the range (flagged: GPU order decides, the bytes are read when X records the draw, as before) or the page table, the
+ * big-write count or a host write moved since the capture. NULL whenever TOTK_ASYNC_XLATE is unset/0 (one not-taken branch per copy). */
+#define BOOT_AX_KIND_CB 0u   /* = BOOT_NVN_AXR_CB (host_nvn.h; static-asserted in host_nvn_async.h) */
+enum { BOOT_AX_CAPF_GPU = 1,      /* GPU work not yet idle at the capture may write it: GPU order decides (no bytes kept) */
+       BOOT_AX_CAPF_ZERO = 2,     /* some pages had no CPU backing at the capture: zero there, as boot_render_cbv_ex's page path */
+       BOOT_AX_CAPF_UNMAPPED = 4, /* not copied: its first page had no CPU backing (cbv_ex fails such a binding) */
+       BOOT_AX_CAPF_OVER = 8 };   /* not copied: the arena or the table was full */
+typedef struct BootAxCap {
+    uint8_t *arena; uint64_t used, cap, committed;   /* reserved once (cap bytes), committed on demand in 1 MiB steps */
+    uint64_t *key; uint32_t *off, *len, hcap, n; uint8_t *flag;   /* open addressing by guest GPU VA (0 = empty), at most half full */
+    uint64_t map_gen, big, epoch;                    /* boot_render_map_gen, boot_render_big_writes, boot_render_cb_epoch at the capture */
+} BootAxCap;
+static const BootAxCap *boot_ax_cap_view;
+/* constant-buffer copies on X by source: from the capture; not captured (no entry: no summary or inherited binding reached it; an entry
+ * shorter than the copy; its first page unmapped at the capture; over budget); captured but stale; GPU-ordered at the capture; not taken by
+ * data-snapshot (GPU-only pools, pending GPU writes, budget, compute); program constants (shader-code class, taken only with
+ * TOTK_DATA_SNAPSHOT_CB=2: shader code is live by design) */
+enum { BOOT_AX_CB_HIT, BOOT_AX_CB_MISS, BOOT_AX_CB_SHORT, BOOT_AX_CB_UNMAPPED, BOOT_AX_CB_OVER, BOOT_AX_CB_STALE, BOOT_AX_CB_GPU, BOOT_AX_CB_NOT_TAKEN, BOOT_AX_CB_CODE, BOOT_AX_CB_N };
+static uint64_t boot_ax_cb_n[BOOT_AX_CB_N], boot_ax_cb_bytes[BOOT_AX_CB_N];
+static inline uint32_t boot_ax_cap_slot(uint64_t va, uint32_t hcap) { va ^= va >> 29; va *= UINT64_C(0xbf58476d1ce4e5b9); va ^= va >> 32; return (uint32_t)va & (hcap - 1); }
+/* The entry of start address va, UINT32_MAX if none. */
+static inline uint32_t boot_ax_cap_at(const BootAxCap *c, uint64_t va) {
+    if (!c || !c->hcap || !va) return UINT32_MAX;
+    for (uint32_t m = c->hcap - 1, j = boot_ax_cap_slot(va, c->hcap), k = 0; k <= m && c->key[j]; j = (j + 1) & m, ++k)
+        if (c->key[j] == va) return j;
+    return UINT32_MAX;
+}
+/* The captured bytes of [va, va + n) (an entry starting at va with at least n bytes), NULL if none. */
+static inline const uint8_t *boot_ax_cap_find(const BootAxCap *c, uint64_t va, uint64_t n) {
+    const uint32_t j = boot_ax_cap_at(c, va);
+    return j != UINT32_MAX && c->len[j] && n <= c->len[j] ? c->arena + c->off[j] : NULL;
+}
+/* n bytes of the arena (16-byte aligned), committing it in 1 MiB steps; NULL when beyond the reservation or out of memory. */
+static inline uint8_t *boot_ax_arena_take(BootAxCap *c, uint64_t n) {
+    const uint64_t at = (c->used + 15) & ~UINT64_C(15);
+    if (!c->arena || at > c->cap || n > c->cap - at) return NULL;
+    if (at + n > c->committed) {
+        uint64_t to = (at + n + (UINT64_C(1) << 20) - 1) & ~((UINT64_C(1) << 20) - 1); if (to > c->cap) to = c->cap;
+        if (!VirtualAlloc(c->arena + c->committed, (SIZE_T)(to - c->committed), MEM_COMMIT, PAGE_READWRITE)) return NULL;
+        c->committed = to;
+    }
+    c->used = at + n; return c->arena + at;
+}
+/* Empties the capture and sizes its table for `ranges` ranges; the arena (cap_bytes) is reserved at the first use. 0: no memory. */
+static inline int boot_ax_cap_begin(BootAxCap *c, uint32_t ranges, uint64_t cap_bytes) {
+    c->used = 0; c->n = 0;
+    if (!c->arena) { c->arena = (uint8_t *)VirtualAlloc(NULL, (SIZE_T)cap_bytes, MEM_RESERVE, PAGE_NOACCESS); c->cap = c->arena ? cap_bytes : 0; c->committed = 0; }
+    uint32_t h = 1024; while (h < 2u * ranges + 2 && h < (1u << 24)) h *= 2;
+    if (h > c->hcap) {
+        uint64_t *k = (uint64_t *)realloc(c->key, (size_t)h * 8); if (k) c->key = k;
+        uint32_t *o = k ? (uint32_t *)realloc(c->off, (size_t)h * 4) : NULL; if (o) c->off = o;
+        uint32_t *l = o ? (uint32_t *)realloc(c->len, (size_t)h * 4) : NULL; if (l) c->len = l;
+        uint8_t *g = l ? (uint8_t *)realloc(c->flag, h) : NULL; if (g) c->flag = g;
+        if (!g) { c->hcap = 0; return 0; }
+        c->hcap = h;
+    }
+    memset(c->key, 0, (size_t)c->hcap * 8);
+    return c->arena != NULL;
+}
+/* An entry for start address va: one per start (a longer range replaces a shorter one; a GPU-ordered entry stays so). n > 0: returns the
+ * n bytes to fill (NULL when the arena is full: the entry then notes OVER if it holds nothing yet); n == 0: notes `flags` only (GPU-ordered,
+ * unmapped). *slot: the entry (when the table had room). */
+static inline uint8_t *boot_ax_cap_put(BootAxCap *c, uint64_t va, uint64_t n, unsigned flags, uint32_t *slot) {
+    if (!va || n > 0xffffffffu || !c->hcap) return NULL;
+    uint32_t m = c->hcap - 1, j = boot_ax_cap_slot(va, c->hcap);
+    for (uint32_t k = 0; k <= m && c->key[j] && c->key[j] != va; ++k) j = (j + 1) & m;
+    if (c->key[j] != va) {
+        if (c->key[j] || 2 * (c->n + 1) > c->hcap) return NULL;   /* table full: no entry (counted as not captured) */
+        c->key[j] = va; ++c->n; c->off[j] = 0; c->len[j] = 0; c->flag[j] = 0;
+    }
+    if (slot) *slot = j;
+    if (c->flag[j] & BOOT_AX_CAPF_GPU) return NULL;
+    if (!n || (flags & BOOT_AX_CAPF_GPU)) { c->len[j] = 0; c->flag[j] = (uint8_t)flags; return NULL; }
+    if (c->len[j] >= n) return NULL;
+    uint8_t *dst = boot_ax_arena_take(c, n);
+    if (!dst) { if (!c->len[j]) c->flag[j] = BOOT_AX_CAPF_OVER; return NULL; }
+    c->off[j] = (uint32_t)(dst - c->arena); c->len[j] = (uint32_t)n; c->flag[j] = (uint8_t)flags;
+    return dst;
+}
+/* stage 2: the call-start chunks of the submission X translates (in its capture's arena, sorted by chunk number): boot_ds_capture fills
+ * the shadow through boot_ax_dyn_page instead of guest memory while it is set. */
+typedef struct BootAxDyn { uint64_t *chunk; uint32_t *off, *mask, n, cap; const uint8_t *arena; } BootAxDyn;
+static const BootAxDyn *boot_ax_dyn_view;
+static inline const uint8_t *boot_ax_dyn_page(void *ctx, uint64_t va) {   /* BootDsPageFn: the captured 4 KiB page at va, NULL if not captured */
+    const BootAxDyn *d = (const BootAxDyn *)ctx; const uint64_t ch = va >> 16; uint32_t lo = 0, hi = d->n;
+    while (lo < hi) { const uint32_t mid = lo + (hi - lo) / 2; if (d->chunk[mid] < ch) lo = mid + 1; else hi = mid; }
+    if (lo == d->n || d->chunk[lo] != ch) return NULL;
+    const unsigned p = (unsigned)((va >> 12) & 15);
+    return (d->mask[lo] >> p & 1u) ? d->arena + d->off[lo] + (size_t)p * 4096 : NULL;
+}
+/* The sentinel's log (TOTK_ASYNC_XLATE_CHECK=1, host_nvn_async.h): for a sampled submission X logs the records it reads and the
+ * constant-buffer bytes it copies, and t2 replays the log after the join. NULL otherwise. */
+enum { BOOT_AX_CHK_REC = 1, BOOT_AX_CHK_CB = 2 };
+typedef struct BootAxChkEnt { uint64_t at, h, va; uint32_t n, kind; } BootAxChkEnt;   /* kind: type << 24 | source << 16 | op */
+typedef struct BootAxChkLog { BootAxChkEnt *e; uint32_t n, cap; uint64_t lost; } BootAxChkLog;
+static BootAxChkLog *boot_ax_chk_log;
+#define BOOT_AX_H0 UINT64_C(0xcbf29ce484222325)
+static inline uint64_t boot_ax_hash(const void *p, uint64_t n, uint64_t h) {   /* 64-bit, 8 bytes a step (not cryptographic) */
+    const uint8_t *b = (const uint8_t *)p;
+    for (; n >= 8; b += 8, n -= 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * UINT64_C(0x100000001b3); h ^= h >> 29; }
+    for (; n; ++b, --n) h = (h ^ *b) * UINT64_C(0x100000001b3);
+    return h ^ (h >> 32);
+}
+/* X, boot_render_cbv_ex: a constant-buffer copy (src 1 from the capture, 2 taken by data-snapshot but not from the capture, 3 not taken). */
+static inline void boot_ax_chk_cb(uint64_t va, uint64_t n, const uint8_t *bytes, unsigned src) {
+    BootAxChkLog *L = boot_ax_chk_log;
+    if (!L) return;
+    if (L->n >= L->cap) { ++L->lost; return; }
+    BootAxChkEnt *e = &L->e[L->n++]; e->at = 0; e->va = va; e->n = (uint32_t)n; e->kind = (uint32_t)BOOT_AX_CHK_CB << 24 | (src & 0xffu) << 16;
+    e->h = boot_ax_hash(bytes, n, BOOT_AX_H0);
+}
+/* What X shares with the renderer code. The registry epoch moves with every observed registration, program and texel write
+ * (host_nvn_async.h boot_ax_reg_note, before the call's own effect); a submission notes it at its capture. While X translates a stage-2
+ * submission boot_ax_x_epoch1 is that epoch + 1 (0 everywhere else): registry lookups then see the entries as they were at the capture
+ * (boot_ax_hist, host_nvn.h boot_nvn_prog_hist) and the texel queue applies only the writes before it (boot_ax_texel_cut1). boot_ax_x_item:
+ * the FIFO item X runs (0 idle); boot_ax_idle_done: every item up to it completed on the GPU with its deferred stores applied (a queue
+ * idle marks it, boot_render_idle_cleanup): the capture's GPU-order test drops the write ranges of those. */
+static volatile LONG64 boot_ax_reg_epoch, boot_ax_x_item, boot_ax_idle_done, boot_ax_fifo_done_seq;
+static _Thread_local int boot_ax_on_x;   /* 1 on X while it translates a captured submission */
+static _Thread_local uint64_t boot_ax_x_epoch1, boot_ax_texel_cut1;
+static int boot_ax_hist_on;              /* TOTK_ASYNC_XLATE >= 2 at boot (host_nvn.h registration): registrations keep the entries they replace */
+static uint64_t boot_ax_texel_held;      /* texel writes left for a later submission (written after the capture of the one X translated) */
+static inline void boot_ax_idle_mark(void) {
+    const uint64_t cur = (uint64_t)__atomic_load_n(&boot_ax_x_item, __ATOMIC_ACQUIRE);
+    const uint64_t d = cur ? cur - 1 : (uint64_t)__atomic_load_n(&boot_ax_fifo_done_seq, __ATOMIC_ACQUIRE);
+    for (LONG64 o = __atomic_load_n(&boot_ax_idle_done, __ATOMIC_ACQUIRE); (uint64_t)o < d && InterlockedCompareExchange64(&boot_ax_idle_done, (LONG64)d, o) != o;
+         o = __atomic_load_n(&boot_ax_idle_done, __ATOMIC_ACQUIRE)) {}
+}
+/* Residual live guest reads X makes, by class (counted only on X while it translates; the async-xlate line prints them). */
+enum { BOOT_AX_L_DBIND, BOOT_AX_L_OBJECT, BOOT_AX_L_POOLWORD, BOOT_AX_L_CODE, BOOT_AX_L_DIAG, BOOT_AX_L_SHADER, BOOT_AX_L_TEXEL, BOOT_AX_L_REHASH, BOOT_AX_L_N };
+static uint64_t boot_ax_live_n[BOOT_AX_L_N], boot_ax_live_bytes[BOOT_AX_L_N];
+static inline void boot_ax_live(unsigned cls, uint64_t n) { if (boot_ax_on_x && cls < BOOT_AX_L_N) { ++boot_ax_live_n[cls]; boot_ax_live_bytes[cls] += n; } }
+static inline int boot_ds_code_range(uint64_t va, uint64_t n);   /* the range lies in a shader-code pool (data-snapshot classes, X) */
 
 /* ---------------------------------------------------------------- persistent pipeline library (play (73))
  * Pipelines are compiled by the driver the first time they are created (hundreds of ms for a large pixel
@@ -1353,7 +1492,7 @@ static inline int boot_render_program_id(BootRender *r, uint64_t va, uint8_t id[
         if (boot_render_program_cache[way].bytes && boot_render_program_cache[way].va == va &&
             (q = boot_render_guest(r, va, boot_render_program_cache[way].size > 0x80 ? boot_render_program_cache[way].size : 0x80)) != NULL &&
             boot_render_memeq(q, boot_render_program_cache[way].bytes, boot_render_program_cache[way].size)) {   /* batch-b */
-            memcpy(id, boot_render_program_cache[way].id, 32); ++boot_render_program_hits;
+            memcpy(id, boot_render_program_cache[way].id, 32); ++boot_render_program_hits; boot_ax_live(BOOT_AX_L_SHADER, boot_render_program_cache[way].size);   /* async-xlate: compared live */
             pc->exec = boot_render_exec_id; pc->map_gen = boot_render_map_gen; pc->big = boot_render_big_writes; pc->epoch = ++boot_render_cb_epoch; pc->at = q;
             boot_render_last_program = boot_render_program_cache[way].bytes; boot_render_last_program_size = boot_render_program_cache[way].size;
             return 1;
@@ -1385,7 +1524,7 @@ static inline int boot_render_program_id(BootRender *r, uint64_t va, uint8_t id[
                 {   __typeof__(boot_render_program_cache[0]) *nc = &boot_render_program_cache[way];   /* just read: verified now */
                     nc->exec = boot_render_exec_id; nc->map_gen = boot_render_map_gen; nc->big = boot_render_big_writes; nc->epoch = ++boot_render_cb_epoch; nc->at = p; }
                 memcpy(boot_render_program_cache[way].id, id, 32);
-                boot_render_last_program = buf; boot_render_last_program_size = n; return 1;
+                boot_render_last_program = buf; boot_render_last_program_size = n; boot_ax_live(BOOT_AX_L_SHADER, n); return 1;   /* async-xlate: read live (by design) */
             }
         }
     }
@@ -2388,18 +2527,19 @@ static inline void boot_render_rt_copies_written(const BootRenderTarget *x);
  * them rebuild. Under "GPU images are authoritative" this is the one case where guest memory is newer than a GPU
  * image (e.g. a history/exposure texture reset by the CPU at a camera cut). Overflow merges into one covering range. */
 #define BOOT_RENDER_CPU_TEXELS 256
-static struct { uint64_t va, size; } boot_render_cpu_texels[BOOT_RENDER_CPU_TEXELS];
+static struct { uint64_t va, size, ep; } boot_render_cpu_texels[BOOT_RENDER_CPU_TEXELS];   /* async-xlate: ep, the registry epoch of the earliest write not applied */
 static unsigned boot_render_cpu_texels_n; static SRWLOCK boot_render_cpu_texels_lock = SRWLOCK_INIT;
 static uint64_t boot_render_cpu_texel_calls, boot_render_cpu_texel_ranges;   /* calls seen / ranges applied (perf3) */
 static inline void boot_render_cpu_texels_push(uint64_t va, uint64_t size) {
     if (!va || !size) return;
+    const uint64_t ep = (uint64_t)__atomic_load_n(&boot_ax_reg_epoch, __ATOMIC_ACQUIRE);   /* async-xlate: this write's epoch (boot_ax_reg_note ran before) */
     AcquireSRWLockExclusive(&boot_render_cpu_texels_lock);
     ++boot_render_cpu_texel_calls;
     unsigned n = boot_render_cpu_texels_n;
-    for (unsigned i = 0; i < n; ++i)   /* the same texture written again before the drain */
+    for (unsigned i = 0; i < n; ++i)   /* the same texture written again before the drain (the earlier write's epoch stays: it is due first) */
         if (boot_render_cpu_texels[i].va == va && boot_render_cpu_texels[i].size == size) { n = UINT32_MAX; break; }
     if (n != UINT32_MAX) {
-        if (n < BOOT_RENDER_CPU_TEXELS) { boot_render_cpu_texels[n].va = va; boot_render_cpu_texels[n].size = size; boot_render_cpu_texels_n = n + 1; }
+        if (n < BOOT_RENDER_CPU_TEXELS) { boot_render_cpu_texels[n].va = va; boot_render_cpu_texels[n].size = size; boot_render_cpu_texels[n].ep = ep; boot_render_cpu_texels_n = n + 1; }
         else {   /* full: widen the last entry to cover this one too */
             uint64_t lo = boot_render_cpu_texels[n - 1].va < va ? boot_render_cpu_texels[n - 1].va : va;
             uint64_t hi = boot_render_cpu_texels[n - 1].va + boot_render_cpu_texels[n - 1].size; if (va + size > hi) hi = va + size;
@@ -2411,9 +2551,15 @@ static inline void boot_render_cpu_texels_push(uint64_t va, uint64_t size) {
 static inline void boot_render_rt_guest_written(BootRender *r, uint64_t va, uint64_t size);
 static inline void boot_render_cpu_texels_drain(BootRender *r) {
     if (!boot_render_cpu_texels_n) return;   /* racy read: a push now is applied by the next submission */
-    struct { uint64_t va, size; } q[BOOT_RENDER_CPU_TEXELS]; unsigned n;
+    struct { uint64_t va, size; } q[BOOT_RENDER_CPU_TEXELS]; unsigned n = 0;
+    const uint64_t cut = boot_ax_texel_cut1 ? boot_ax_texel_cut1 - 1 : UINT64_MAX;   /* async-xlate stage 2 (X): only the writes before this submission's capture */
     AcquireSRWLockExclusive(&boot_render_cpu_texels_lock);
-    n = boot_render_cpu_texels_n; memcpy(q, boot_render_cpu_texels, sizeof q[0] * n); boot_render_cpu_texels_n = 0;
+    unsigned kept = 0;
+    for (unsigned i = 0; i < boot_render_cpu_texels_n; ++i) {
+        if (boot_render_cpu_texels[i].ep <= cut) { q[n].va = boot_render_cpu_texels[i].va; q[n].size = boot_render_cpu_texels[i].size; ++n; }
+        else boot_render_cpu_texels[kept++] = boot_render_cpu_texels[i];
+    }
+    boot_render_cpu_texels_n = kept; boot_ax_texel_held += kept;
     ReleaseSRWLockExclusive(&boot_render_cpu_texels_lock);
     unsigned trace_origin = boot_render_image_cpu_origin;
     if (boot_image_trace_enabled) { ++boot_render_image_drain_id; boot_render_image_cpu_origin = 1; }
@@ -3989,6 +4135,7 @@ static inline void boot_render_idle_cleanup(BootRender *r) {
     boot_render_gt_npending = 0;    /* and every GPU render-target write-back */
     /* idle: the whole ring is free again (a module that does not segment sees its full size) */
     if (boot_render_seg.r == r && boot_render_seg.ring_total) r->ring_size = boot_render_seg.ring_total;
+    boot_ax_idle_mark();   /* async-xlate: items before the one X runs are complete, their deferred stores applied */
 }
 
 static inline int boot_render_rt_barrier_at(BootRender *r, BootRenderTarget *t, D3D12_RESOURCE_STATES to, const char *file, unsigned line) {
@@ -4459,6 +4606,33 @@ static inline void boot_render_cbv_put(BootRender *r, const D3D12_CONSTANT_BUFFE
 }
 static inline int boot_render_cbv_ex(BootRender *r, uint64_t va, uint32_t size, uint32_t descriptor, const BootRenderCbPatch *patch, unsigned patches, uint32_t group);
 static inline int boot_render_cbv(BootRender *r, uint64_t va, uint32_t size, uint32_t descriptor) { return boot_render_cbv_ex(r, va, size, descriptor, NULL, 0, 0); }
+/* async-xlate: the bytes boot_render_cbv_ex copies for a uniform-buffer binding of `bound` bytes (host_nvn_exec.h boot_nvn_st_buffers rounds
+ * the bound size up to 256, cbv_ex then copies min(size, its 256-byte aligned view, 64 KiB)). The capture copies exactly this many, so a
+ * binding it holds is never short (stage 1 copied the bound size: every binding that was not a multiple of 256 bytes missed). */
+static inline uint32_t boot_render_cb_view_bytes(uint64_t bound) {
+    const uint32_t size = (uint32_t)((bound + 255) & ~UINT64_C(255));
+    uint64_t aligned = ((uint64_t)(size ? size : 256) + 255) & ~UINT64_C(255); if (aligned > 65536) aligned = 65536;
+    return size ? (size < aligned ? size : (uint32_t)aligned) : 0;
+}
+/* async-xlate (on X only, boot_ax_cap_view set): the source of a constant-buffer copy. taken: data-snapshot takes the binding (boot_ds_cb_now):
+ * the capture's bytes when it holds the range and nothing moved since (page table, big writes, host writes at a later epoch); else guest
+ * memory, counted by why (no entry, short, unmapped or over budget at the capture, stale; GPU-ordered at the capture and program constants
+ * by design). A binding data-snapshot does not take reads guest memory as before: GPU order decides for it. live may be NULL (the page
+ * path: the captured bytes or NULL). */
+static inline const uint8_t *boot_ax_cb_src(uint64_t va, uint64_t n, const uint8_t *live, int taken) {
+    const BootAxCap *c = boot_ax_cap_view; unsigned k = BOOT_AX_CB_NOT_TAKEN; const uint8_t *p = live;
+    if (taken) {
+        const uint32_t j = boot_ax_cap_at(c, va); const unsigned f = j != UINT32_MAX ? c->flag[j] : 0u;
+        if (j == UINT32_MAX) k = boot_ds_code_range(va, n) ? BOOT_AX_CB_CODE : BOOT_AX_CB_MISS;
+        else if (f & BOOT_AX_CAPF_GPU) k = BOOT_AX_CB_GPU;
+        else if (!c->len[j]) k = (f & BOOT_AX_CAPF_OVER) ? BOOT_AX_CB_OVER : BOOT_AX_CB_UNMAPPED;
+        else if (n > c->len[j]) k = BOOT_AX_CB_SHORT;
+        else if (c->map_gen != boot_render_map_gen || c->big != boot_render_big_writes || !boot_render_cb_clean(va, n, c->epoch + 1)) k = BOOT_AX_CB_STALE;
+        else { k = BOOT_AX_CB_HIT; p = c->arena + c->off[j]; }
+    }
+    ++boot_ax_cb_n[k]; boot_ax_cb_bytes[k] += n;
+    return p;
+}
 /* As boot_render_cbv; patches of bind group `group` are applied to a private snapshot (never cached). */
 static inline int boot_render_cbv_ex(BootRender *r, uint64_t va, uint32_t size, uint32_t descriptor, const BootRenderCbPatch *patch, unsigned patches, uint32_t group) {
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv = {0};
@@ -4489,18 +4663,21 @@ static inline int boot_render_cbv_ex(BootRender *r, uint64_t va, uint32_t size, 
     if (n) {
         uint8_t *src = boot_render_guest(r, va, n);
         if (src) {
-            if (boot_ds_cb_now || boot_ds_fill_wanted(va, n)) boot_ds_fill(r, dst, va, src, n);   /* data-snapshot: the bytes at the submit call where it has them */
+            const uint8_t *fsrc = boot_ax_cap_view ? boot_ax_cb_src(va, n, src, boot_ds_cb_now) : src;   /* async-xlate: on X, the bytes t2 captured at the submit call */
+            if (boot_ds_cb_now || boot_ds_fill_wanted(va, n)) boot_ds_fill(r, dst, va, fsrc, n);   /* data-snapshot: the bytes at the submit call where it has them */
             else memcpy(dst, src, n);
+            if (boot_ax_chk_log) boot_ax_chk_cb(va, n, dst, fsrc != src ? 1u : boot_ds_cb_now ? 2u : 3u);   /* async-xlate sentinel: what the copy put in the ring */
             boot_render_cb_copied += n; if (boot_sd_on()) boot_sd_note(r, boot_ds_cb_now ? BOOT_SD_K_CBSNAP : BOOT_SD_K_CB, va, src, dst, n);   /* suspect-diag S1 */
         }
         else {
             /* Games bind constant buffers larger than the memory behind them (up to 64 KiB) and read
              * only the used part: copy the mapped pages, zero the rest. The first page must map. */
             if (!boot_render_guest(r, va, 1)) return 0;
+            const uint8_t *cap = boot_ax_cap_view ? boot_ax_cb_src(va, n, NULL, boot_ds_cb_now) : NULL;   /* async-xlate: the captured bytes of the mapped pages */
             for (uint64_t at = 0; at < n;) {
                 uint64_t chunk = 4096 - ((va + at) & 0xfff); if (chunk > n - at) chunk = n - at;
                 uint8_t *page = boot_render_guest(r, va + at, chunk);
-                if (page) { memcpy(dst + at, page, (size_t)chunk); boot_render_cb_copied += chunk; }
+                if (page) { memcpy(dst + at, cap ? cap + at : page, (size_t)chunk); boot_render_cb_copied += chunk; }
                 else { memset(dst + at, 0, (size_t)chunk); boot_render_cb_zeroed += chunk; }
                 at += chunk;
             }
@@ -5226,6 +5403,7 @@ static inline void boot_render_tex_seal(BootRender *r, uint32_t index) {
     const BootRenderTexSlot *slot = &boot_render_tex_slots[index];
     const uint8_t *p = slot->size ? boot_render_guest(r, slot->va, slot->size) : NULL;
     boot_render_tex_sum[index] = p ? boot_render_tex_checksum(p, slot->size) : 0;
+    if (p) boot_ax_live(BOOT_AX_L_TEXEL, slot->size);   /* async-xlate: a buffer texture built from guest memory (counted on X) */
 }
 /* Host descriptors (native NVN path, host_nvn.h): nvnTexturePoolRegisterTexture / nvnSamplerPoolRegisterSampler
  * describe each pool entry from the NVN objects (texture + view, sampler) as decoded BootTic / BootTsc
@@ -5235,7 +5413,7 @@ static inline void boot_render_tex_seal(BootRender *r, uint32_t index) {
  * never registered read the guest words as before. */
 #define BOOT_RENDER_HOST_POOLS 4
 typedef struct BootRenderHostDesc { uint32_t key[8]; BootTic tic; BootTsc tsc; } BootRenderHostDesc;
-typedef struct BootRenderHostTable { uint64_t pool; uint32_t cap; BootRenderHostDesc *desc; uint8_t *valid; } BootRenderHostTable;
+typedef struct BootRenderHostTable { uint64_t pool; uint32_t cap; BootRenderHostDesc *desc; uint8_t *valid; uint64_t *ep; } BootRenderHostTable;   /* ep: async-xlate */
 static BootRenderHostTable boot_render_host_tables[2][BOOT_RENDER_HOST_POOLS];   /* [0] textures, [1] samplers */
 static uint64_t boot_render_host_hits, boot_render_host_guest_reads;
 static inline BootRenderHostTable *boot_render_host_table(int smp, uint64_t pool, int create) {
@@ -5250,12 +5428,50 @@ static inline BootRenderHostTable *boot_render_host_table(int smp, uint64_t pool
     }
     return NULL;
 }
+/* async-xlate stage 2 (TOTK_ASYNC_XLATE >= 2): the registry history (DESIGN 5.6, SMW's replay marks). A registration that replaces a valid
+ * entry keeps the old one with the registry epoch it was registered at (ev) and the one that replaced it (er); the table holds each
+ * entry's epoch (ep). X translating a submission captured at epoch e reads an entry registered after e from here: the newest kept entry of
+ * that key with ev <= e. Registrations hold the renderer lock, as X does for each item, so the ring needs no lock of its own. The ring is
+ * in er order: a lookup stops at the first entry retired at or before e. Its texture / sampler memo is reset when X starts and ends such a
+ * submission (boot_ax_hist_memo_reset), so neither version is remembered for the other. */
+#define BOOT_AX_HIST 8192u
+typedef struct BootAxHist { uint64_t pool, ev, er; uint32_t index, smp, valid, pad; BootRenderHostDesc d; } BootAxHist;
+static BootAxHist *boot_ax_hist; static uint64_t boot_ax_hist_n;
+static uint64_t boot_ax_hist_c[4];   /* entries kept, lookups served an older entry, lookups that found none (current used), memo resets */
+static inline void boot_ax_hist_keep(int smp, uint64_t pool, uint32_t index, const BootRenderHostTable *t, uint64_t er) {
+    if (!boot_ax_hist && !(boot_ax_hist = (BootAxHist *)calloc(BOOT_AX_HIST, sizeof *boot_ax_hist))) return;
+    BootAxHist *h = &boot_ax_hist[boot_ax_hist_n++ % BOOT_AX_HIST];
+    h->pool = pool; h->index = index; h->smp = (uint32_t)smp; h->valid = t->valid[index]; h->pad = 0; h->ev = t->ep[index]; h->er = er; h->d = t->desc[index];
+    ++boot_ax_hist_c[0];
+}
+static inline const BootAxHist *boot_ax_hist_at(int smp, uint64_t pool, uint32_t index, uint64_t e) {
+    const uint64_t n = boot_ax_hist_n < BOOT_AX_HIST ? boot_ax_hist_n : BOOT_AX_HIST;
+    for (uint64_t k = 0; boot_ax_hist && k < n; ++k) {
+        const BootAxHist *h = &boot_ax_hist[(boot_ax_hist_n - 1 - k) % BOOT_AX_HIST];
+        if (h->er <= e) break;
+        if (h->index == index && h->pool == pool && h->smp == (uint32_t)smp && h->ev <= e) { ++boot_ax_hist_c[1]; return h; }
+    }
+    ++boot_ax_hist_c[2]; return NULL;
+}
+static inline void boot_ax_hist_memo_reset(uint64_t e) {
+    const uint64_t n = boot_ax_hist_n < BOOT_AX_HIST ? boot_ax_hist_n : BOOT_AX_HIST;
+    for (uint64_t k = 0; boot_ax_hist && k < n; ++k) {
+        const BootAxHist *h = &boot_ax_hist[(boot_ax_hist_n - 1 - k) % BOOT_AX_HIST];
+        if (h->er <= e) break;
+        if (h->smp) { if (h->index < BOOT_RENDER_SAMPLERS) boot_render_smpmemo[h->index] = 0; } else if (h->index < BOOT_RENDER_TEX_SLOTS) boot_render_texmemo[h->index] = 0;
+        ++boot_ax_hist_c[3];
+    }
+}
 /* Registers entry `index` of the texture (smp 0, tic) or sampler (smp 1, tsc) pool at GPU address `pool`. */
 static inline int boot_render_host_register(int smp, uint64_t pool, uint32_t index, const BootTic *tic, const BootTsc *tsc) {
     if (smp) { if (index < BOOT_RENDER_SAMPLERS) boot_render_smpmemo[index] = 0; }   /* nvnpar-work: a new descriptor */
     else if (index < BOOT_RENDER_TEX_SLOTS) boot_render_texmemo[index] = 0;
     BootRenderHostTable *t = boot_render_host_table(smp, pool, 1);
     if (!t || index >= t->cap) return 0;
+    if (boot_ax_hist_on) {   /* async-xlate stage 2: the entry it replaces stays readable for the submissions captured before */
+        if (!t->ep) t->ep = (uint64_t *)calloc(t->cap, 8);
+        if (t->ep) { const uint64_t er = (uint64_t)__atomic_load_n(&boot_ax_reg_epoch, __ATOMIC_ACQUIRE); if (t->valid[index]) boot_ax_hist_keep(smp, pool, index, t, er); t->ep[index] = er; }
+    }
     BootRenderHostDesc d; memset(&d, 0, sizeof d);
     if (tic) d.tic = *tic;
     if (tsc) d.tsc = *tsc;
@@ -5266,11 +5482,18 @@ static inline int boot_render_host_register(int smp, uint64_t pool, uint32_t ind
 /* The descriptor words of entry `index`: the host key when registered, else the guest pool's words. */
 static inline const uint32_t *boot_render_desc_words(BootRender *r, uint64_t pool, uint32_t index, int smp) {
     BootRenderHostTable *t = boot_render_host_table(smp, pool, 0);
-    if (t && index < t->cap && t->valid[index]) { ++boot_render_host_hits; return t->desc[index].key; }
+    if (t && index < t->cap && t->valid[index]) {
+        if (boot_ax_x_epoch1 && t->ep && t->ep[index] >= boot_ax_x_epoch1) {   /* async-xlate stage 2: registered after this submission's capture */
+            const BootAxHist *h = boot_ax_hist_at(smp, pool, index, boot_ax_x_epoch1 - 1);
+            if (h && h->valid) { ++boot_render_host_hits; return h->d.key; }
+        }
+        ++boot_render_host_hits; return t->desc[index].key; }
     if (t) ++boot_render_host_guest_reads;
     return (const uint32_t *)boot_render_guest(r, pool + (uint64_t)index * 32, 32);
 }
 static inline const BootRenderHostDesc *boot_render_host_of(const uint32_t *words) {
+    if (boot_ax_hist && (const void *)words >= (const void *)boot_ax_hist && (const void *)words < (const void *)(boot_ax_hist + BOOT_AX_HIST))   /* async-xlate: a kept entry */
+        return &boot_ax_hist[((const uint8_t *)words - (const uint8_t *)boot_ax_hist) / sizeof *boot_ax_hist].d;
     for (unsigned s = 0; s < 2; ++s) for (unsigned k = 0; k < BOOT_RENDER_HOST_POOLS; ++k) {
         const BootRenderHostTable *t = &boot_render_host_tables[s][k];
         if (t->desc && (const void *)words >= (const void *)t->desc && (const void *)words < (const void *)(t->desc + t->cap))
@@ -6887,7 +7110,7 @@ view:;
         unsigned cm = 0; for (unsigned c = 0; c < 4; ++c) if (t.source[c] >= 2 && t.source[c] <= 5) cm |= 1u << (t.source[c] - 2);
         boot_render_tex_astc[index] = (uint8_t)(1u | cm << 1 | (fmt == f.srgb && f.srgb != DXGI_FORMAT_UNKNOWN ? 32u : 0u) | (f.block_w * f.block_h > 16 ? 64u : 0u));
     } else boot_render_tex_astc[index] = 0;
-    boot_render_tex_sum[index] = sum_now; boot_render_tex_dedup_note(index);
+    boot_render_tex_sum[index] = sum_now; boot_render_tex_dedup_note(index); boot_ax_live(BOOT_AX_L_TEXEL, slot->size);   /* async-xlate: built from guest memory (counted on X) */
     boot_render_rt_copies_forget(index);   /* wb-01: a copy's registrations no longer describe this build (range invalidation does) */
     boot_render_tex_watch_note(index, &t, &f, lv, levels, layers, dim, fmt, src);   /* render-39 */
     boot_bc7_built(r, index, t.components, &bc7pre, &sv);   /* bc7-work: a cache miss queues its BC7 encode */
@@ -7255,7 +7478,7 @@ static inline unsigned boot_render_tex_verify_par(BootRender *r, uint64_t budget
     boot_render_par_for(n, boot_render_tex_verify_hash, items);
     for (unsigned k = 0; k < n; ++k)
         if (items[k].sum != boot_render_tex_sum[items[k].index]) { boot_render_tex_poison(items[k].index); boot_render_tex_watch_want[items[k].index] = 1; ++stale; }
-    boot_render_tex_verify_cursor = i; boot_render_tex_verified_bytes += done; boot_render_tex_stale_rebuilds += stale;
+    boot_render_tex_verify_cursor = i; boot_render_tex_verified_bytes += done; boot_render_tex_stale_rebuilds += stale; boot_ax_live(BOOT_AX_L_REHASH, done);   /* async-xlate: counted on X */
     return stale;
 }
 /* End of a guest submission (after boot_render_tex_trim): re-hash built slots round-robin until
@@ -7279,7 +7502,7 @@ static inline unsigned boot_render_tex_verify(BootRender *r, uint64_t budget) {
         }
         ++visited; i = (i + 1) % high;
     }
-    boot_render_tex_verify_cursor = i; boot_render_tex_verified_bytes += done; boot_render_tex_stale_rebuilds += stale;
+    boot_render_tex_verify_cursor = i; boot_render_tex_verified_bytes += done; boot_render_tex_stale_rebuilds += stale; boot_ax_live(BOOT_AX_L_REHASH, done);   /* async-xlate: counted on X */
     return stale;
 }
 static inline D3D12_TEXTURE_ADDRESS_MODE boot_render_address(uint32_t a) {
@@ -9254,7 +9477,8 @@ static inline void boot_ds_capture(BootRender *r) {
                 const uint64_t va = (e->key - 1) << BOOT_DS_CHUNK_SHIFT;
                 if (boot_ds_cls_at(d, va) & BOOT_DS_C_HOST) continue;
                 if (boot_ds_gpu_pending(r, va, BOOT_DS_CHUNK_BYTES, 0)) { ++boot_ds_c.cap_pending; continue; }   /* GPU order decides: no CPU copy */
-                if (boot_ds_shadow_take(d, e, boot_ds_page_fn, r, boot_render_cb_epoch, boot_render_big_writes, boot_render_map_gen)) ++boot_ds_c.cap_chunks;
+                if (boot_ds_shadow_take(d, e, boot_ax_dyn_view ? boot_ax_dyn_page : boot_ds_page_fn, boot_ax_dyn_view ? (void *)(uintptr_t)boot_ax_dyn_view : (void *)r,   /* async-xlate stage 2: from the capture */
+                                        boot_render_cb_epoch, boot_render_big_writes, boot_render_map_gen)) ++boot_ds_c.cap_chunks;
                 else if (d->shadow_cap - d->shadow_used < BOOT_DS_CHUNK_BYTES) { ++boot_ds_c.cap_full; full = 1; break; }
             }
         boot_ds_c.cap_bytes += d->shadow_used;
@@ -9430,6 +9654,25 @@ static inline void boot_ds_present(BootRender *r, uint64_t frames) {
     boot_ds_l = boot_ds_c; boot_ds_arena.peak = 0;
     (void)r;
 }
+/* async-xlate stage 2 (X, after each submission; host_nvn_async.h boot_ax_publish): the chunks the next call-start copy takes (boot_ds_capture's
+ * choice and order: recently used or learnt dynamic chunks, vertex / index first, never the executor's block), at most `cap` and the shadow's
+ * room. t2 copies them at the next submit call into that submission's arena; X's boot_ds_capture then fills the shadow from there. */
+static inline uint32_t boot_ax_chunk_list(uint64_t *out, uint32_t cap) {
+    BootDsCore *d = &boot_ds_core; uint32_t n = 0;
+    if (!boot_ds_on() || !boot_ds_cfg.early || !d->shadow || !d->n) return 0;
+    const uint32_t room = d->shadow_cap / (uint32_t)BOOT_DS_CHUNK_BYTES; if (cap > room) cap = room;
+    const uint32_t vi = (1u << BOOT_DS_K_VERTEX) | (1u << BOOT_DS_K_INDEX);
+    for (int pass = 0; pass < 2 && n < cap; ++pass)
+        for (uint32_t j = 0, nj = boot_ds_scan_n(d); j < nj && n < cap; ++j) {
+            const BootDsChunk *e = boot_ds_scan_at(d, j);
+            if (!e->key || (d->call - e->last_use > 600 && d->call - e->learned > 600)) continue;
+            if (!pass != !!(e->kinds & vi)) continue;
+            if (boot_ds_cls_at(d, (e->key - 1) << BOOT_DS_CHUNK_SHIFT) & BOOT_DS_C_HOST) continue;
+            out[n++] = e->key - 1;
+        }
+    return n;
+}
+static inline int boot_ds_code_range(uint64_t va, uint64_t n) { return boot_ds_on() && (boot_ds_cls_span(&boot_ds_core, va, n) & BOOT_DS_C_CODE) != 0; }
 
 #include "host_gpu_render_draw.h"
 #endif

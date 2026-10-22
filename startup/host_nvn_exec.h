@@ -193,13 +193,14 @@ static inline int boot_nvn_texture_target_obj(BootContext *c, uint64_t self, uin
     if (object && obj_pool) {
         memcpy(o, object, sizeof o);
         uint8_t now[0x20];
-        if (boot_host_read(c, self, tex, now, sizeof now) && memcmp(now + 0x10, o + 0x10, 0x10) && boot_nvn_target_object_changed++ < 16) {
+        if ((boot_ax_live(BOOT_AX_L_DIAG, sizeof now), boot_host_read(c, self, tex, now, sizeof now)) && memcmp(now + 0x10, o + 0x10, 0x10) && boot_nvn_target_object_changed++ < 16) {   /* async-xlate: counted on X */
             uint64_t a, b; memcpy(&a, o + 0x18, 8); memcpy(&b, now + 0x18, 8);
             boot_draw_log("nvn native: target texture re-initialized since recording%s (recorded offset %llx, now %llx)", "", a & UINT64_C(0xffffffffffff), b & UINT64_C(0xffffffffffff));
         }
-    } else if (!boot_host_read(c, self, tex, o, sizeof o)) return 0;
+    } else if ((boot_ax_live(BOOT_AX_L_OBJECT, sizeof o), !boot_host_read(c, self, tex, o, sizeof o))) return 0;   /* async-xlate: counted on X */
     uint64_t pool, off, va = 0; memcpy(&pool, o + 0x10, 8); memcpy(&off, o + 0x18, 8);
-    if (!pool || !boot_host_read(c, self, pool + 0x18, &va, 8)) return 0;
+    if (!pool) return 0;
+    if (!boot_ax_obj_word(pool + 0x18, &va) && (boot_ax_live(BOOT_AX_L_POOLWORD, 8), !boot_host_read(c, self, pool + 0x18, &va, 8))) return 0;   /* async-xlate: on X the word t2 captured */
     uint32_t w; uint16_t h, d; memcpy(&w, o + 0x20, 4); memcpy(&h, o + 0x24, 2); memcpy(&d, o + 0x26, 2);
     uint32_t fmt = o[0x2a], target = o[0x2b] / 2, log_h = o[0x71], log_d = o[0x72]; uint32_t base_fmt = fmt; uint64_t view_lo = 0, view_hi = 0;
     uint64_t address = va + (off & UINT64_C(0xffffffffffff));
@@ -960,6 +961,7 @@ static inline void boot_nvn_exec_bind_deferred(BootContext *c, uint64_t self, Bo
     if (boot_nvn_dsnap.active) { if (snap) ++boot_nvn_dsnap.hits; else ++boot_nvn_dsnap.misses; }
     int use = snap && boot_nvn_defer_snapshot_on(), check = snap && boot_nvn_defer_late_check_on();
     if (use) memcpy(h, boot_nvn_dsnap.h + snap->at, 8 * (size_t)count);
+    if (!use || check) boot_ax_live(use ? BOOT_AX_L_DIAG : BOOT_AX_L_DBIND, 8 * (uint64_t)count);   /* async-xlate: on X, not in the call's copy (must stay 0); the late check is a diagnostic */
     if ((!use || check) && !boot_host_read(c, self, at, use ? now : h, 8 * (size_t)count)) {
         if (!use) { if (failed++ < 16) boot_draw_log("nvn native: deferred texture handles unreadable%s at %llx count %llu", "", at, count); return; }
         check = 0;

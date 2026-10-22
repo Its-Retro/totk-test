@@ -754,6 +754,25 @@ static inline int boot_nvn_defer_late_check_on(void) {
     static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_DEFER_LATE_CHECK", s, sizeof s); v = k && k < sizeof s && s[0] == '1'; }
     return v;
 }
+/* async-xlate (play-work/async-xlate-work: DESIGN.md, PRECHECKS.md, stage1/README.md, stage2/README.md): TOTK_ASYNC_XLATE, read once;
+ * unset/0 = today's code paths. 1 = stage 1 "join" (host_nvn_async.h: t2 captures each submission, the translation thread X translates it,
+ * t2 waits for X inside the submit); 2 = stage 2 "async" (the submit returns after the capture, virtual fences, the frame fence stays full);
+ * 3 (early frame fence) is not built yet and runs as 2. The launcher (no TOTK_DRAW_PATH) reads 0.
+ * With it on the submit freeze is forced on (the walk's freeze table, pins and copies are what X translates from) and recordings keep
+ * range summaries (boot_nvn_axr_of). */
+static inline int boot_nvn_ax_mode(void) {
+#ifdef TOTK_DRAW_PATH
+    static int v = -1;
+    if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_ASYNC_XLATE", s, sizeof s); v = k && k < sizeof s && s[0] >= '1' && s[0] <= '3' ? s[0] - '0' : 0; }
+    return v;
+#else
+    return 0;
+#endif
+}
+/* The host thread a submit call's translation acts for: the translation thread X sets the submitting thread's id while it translates
+ * that call's submission, so the checks keyed by thread (freeze, call-bind, NVN_PAR) see the call's thread; 0 on every other thread. */
+static _Thread_local DWORD boot_nvn_act_tid;
+static inline DWORD boot_nvn_call_tid(void) { const DWORD t = boot_nvn_act_tid; return t ? t : GetCurrentThreadId(); }
 /* batch-a (play-work/batch-a): the submit freeze. play-87's flicker.log has the cause of the remaining dark frames in its
  * own counters: in every dip present with deferred binds, a large share of the binds the translation executed were "not
  * in copy" (7, 34, 50, 82, 224 of 287; 0 in the frames around them). A bind is missing from the copy only when the
@@ -771,7 +790,8 @@ static inline int boot_nvn_defer_late_check_on(void) {
  * resolve (not recorded yet) or did not reach still takes the live map, counted. The pins keep a replaced recording
  * readable until the call ends (the old slot is only marked dead). Costs nothing when the walk runs anyway. */
 static inline int boot_nvn_freeze_on(void) {
-    static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_SUBMIT_FREEZE", s, sizeof s); v = k && k < sizeof s ? s[0] != '0' : boot_mt_overlap_on(); }
+    static int v = -1; if (v < 0) { char s[8]; DWORD k = GetEnvironmentVariableA("TOTK_SUBMIT_FREEZE", s, sizeof s); v = k && k < sizeof s ? s[0] != '0' : boot_mt_overlap_on();
+                                    if (boot_nvn_ax_mode()) v = 1; }   /* async-xlate: forced on (PRECHECKS 1 #12: X translates from the walk's table) */
     return v;
 }
 /* batch-a: TOTK_RERECORD_WAIT (on unless =0; default follows TOTK_OVERLAP). A thread whose EndRecording replaces a
@@ -873,7 +893,7 @@ static inline unsigned boot_nvn_guest_thread(const BootContext *c) {
 typedef struct BootNvnDsnapEnt { uint64_t rec, ptr; uint32_t count, n, at, ok; } BootNvnDsnapEnt;
 typedef struct BootNvnDsnapWork { uint64_t shadow; uint32_t depth; } BootNvnDsnapWork;
 typedef struct BootNvnFzEnt { uint64_t handle, shadow; } BootNvnFzEnt;   /* batch-a: a driver handle as the call resolved it (shadow 0: not in the map then) */
-static struct {
+typedef struct BootNvnDsnap {   /* async-xlate: named (was anonymous); stage 2 gives each captured submission its own table */
     int active; uint32_t stamp;                                   /* active: the table belongs to the submit call running now */
     BootNvnDsnapEnt *ent; uint32_t n, cap; uint64_t *h; uint32_t hn, hcap;
     uint32_t *hash, *hash_stamp, hash_cap;                        /* rec -> ent index, valid where hash_stamp == stamp */
@@ -890,7 +910,36 @@ static struct {
      * that the call did not (live map), freeze entries lost (out of memory) */
     uint64_t fz_frozen, fz_missing, fz_reads, fz_moved, fz_unknown, fz_lost;
     uint64_t ft_latest_end; uint32_t ft_latest_thread, ft_recent;   /* frame trace: newest EndRecording among the reached recordings */
-} boot_nvn_dsnap;
+} BootNvnDsnap;
+/* async-xlate stage 2: the walk table a thread works with. Every thread uses the submit call's table (boot_nvn_dsnap_main) except the
+ * translation thread X while it translates a stage-2 submission: that submission took the call's table (boot_nvn_dsnap_swap at its
+ * capture, so t2's next walk fills another) and X points boot_nvn_dsnap_tls at it; the counters X adds are folded back
+ * (boot_nvn_dsnap_fold). One cached TLS load and a predicted branch per access. */
+static BootNvnDsnap boot_nvn_dsnap_main;
+static _Thread_local BootNvnDsnap *boot_nvn_dsnap_tls;
+static inline BootNvnDsnap *boot_nvn_dsnap_cur(void) { BootNvnDsnap *p = boot_nvn_dsnap_tls; return p ? p : &boot_nvn_dsnap_main; }
+#define boot_nvn_dsnap (*boot_nvn_dsnap_cur())
+/* Exchanges the call's table (the per-call fields: active, deferred-bind copies, freeze table, top handles, thread, coverage) of the main
+ * table with *s; s takes the call's stamp (hash entries are valid where their stamp equals it), the main table keeps counting stamps, so a
+ * table coming back never matches a later call's stamp. The cumulative counters stay where they are. */
+static inline void boot_nvn_dsnap_swap(BootNvnDsnap *s) {
+    BootNvnDsnap *m = &boot_nvn_dsnap_main;
+#define BOOT_NVN_DSNAP_X(f) do { __typeof__(m->f) t_ = m->f; m->f = s->f; s->f = t_; } while (0)
+    BOOT_NVN_DSNAP_X(active); BOOT_NVN_DSNAP_X(ent); BOOT_NVN_DSNAP_X(n); BOOT_NVN_DSNAP_X(cap); BOOT_NVN_DSNAP_X(h); BOOT_NVN_DSNAP_X(hn); BOOT_NVN_DSNAP_X(hcap);
+    BOOT_NVN_DSNAP_X(hash); BOOT_NVN_DSNAP_X(hash_stamp); BOOT_NVN_DSNAP_X(hash_cap); BOOT_NVN_DSNAP_X(fz); BOOT_NVN_DSNAP_X(fz_n); BOOT_NVN_DSNAP_X(fz_cap);
+    BOOT_NVN_DSNAP_X(fz_hash); BOOT_NVN_DSNAP_X(fz_hstamp); BOOT_NVN_DSNAP_X(fz_hcap); BOOT_NVN_DSNAP_X(top); BOOT_NVN_DSNAP_X(top_n); BOOT_NVN_DSNAP_X(top_cap);
+    BOOT_NVN_DSNAP_X(tid); BOOT_NVN_DSNAP_X(fz_on); BOOT_NVN_DSNAP_X(covered);
+#undef BOOT_NVN_DSNAP_X
+    s->stamp = m->stamp;
+}
+/* X after a stage-2 submission: the counters it added into the submission's table go to the main table (t2's walk adds others meanwhile). */
+static inline void boot_nvn_dsnap_fold(BootNvnDsnap *s) {
+    BootNvnDsnap *m = &boot_nvn_dsnap_main;
+#define BOOT_NVN_DSNAP_F(f) do { if (s->f) { InterlockedExchangeAdd64((volatile LONG64 *)&m->f, (LONG64)s->f); s->f = 0; } } while (0)
+    BOOT_NVN_DSNAP_F(binds); BOOT_NVN_DSNAP_F(hits); BOOT_NVN_DSNAP_F(misses); BOOT_NVN_DSNAP_F(late_checked); BOOT_NVN_DSNAP_F(late_changed);
+    BOOT_NVN_DSNAP_F(fz_reads); BOOT_NVN_DSNAP_F(fz_moved); BOOT_NVN_DSNAP_F(fz_unknown); BOOT_NVN_DSNAP_F(index_lost); BOOT_NVN_DSNAP_F(unread);
+#undef BOOT_NVN_DSNAP_F
+}
 static inline void boot_nvn_dsnap_lost(void) { InterlockedIncrement64((volatile LONG64 *)&boot_nvn_dsnap.index_lost); }
 /* p grown to hold `need` elements (*cap updated); NULL when out of memory (p unchanged). */
 static inline void *boot_nvn_dsnap_grow(void *p, uint32_t *cap, uint64_t need, size_t elem) {
@@ -899,6 +948,74 @@ static inline void *boot_nvn_dsnap_grow(void *p, uint32_t *cap, uint64_t need, s
     uint32_t c = *cap ? *cap : 256; while (c < need) c *= 2;
     void *q = realloc(p, (size_t)c * elem); if (q) *cap = c;
     return q;
+}
+/* async-xlate: record-time range summaries (DESIGN 4.2, the nxport model: per-list summaries built where the list is recorded, unioned at
+ * submit). With TOTK_ASYNC_XLATE each record that makes the GPU read or write guest memory, or makes the translation read an NVN object
+ * word from CPU memory, adds index entries next to the flashfix ones (count BOOT_NVN_DREF_RANGE, ptr the address, bound size | kind << 56 |
+ * stage/slot << 40). The submit walk copies each reached recording's index anyway and collects them (boot_nvn_dsnap_take ->
+ * boot_nvn_axr), so the capture knows the submission's ranges without decoding it. Kinds: reads (uniform buffer, vertex buffer, index
+ * range of a direct indexed draw, storage buffer, indirect arguments, conditional-render counters), GPU-ordered writes (UpdateUniformBuffer,
+ * ClearBuffer, reports), NVN object words (the GPU-address word of a texture / sampler pool's memory pool and of each render target's pool,
+ * guest CPU addresses). The index consumers that act on entries (call-bind, rec-evict, the walk) select theirs by count. */
+#define BOOT_NVN_DREF_RANGE 0xfffffffeu
+enum { BOOT_NVN_AXR_CB, BOOT_NVN_AXR_VB, BOOT_NVN_AXR_IB, BOOT_NVN_AXR_SSBO, BOOT_NVN_AXR_IND, BOOT_NVN_AXR_COND, BOOT_NVN_AXR_W_UBO, BOOT_NVN_AXR_W_CLEAR,
+       BOOT_NVN_AXR_W_REPORT, BOOT_NVN_AXR_OBJ, BOOT_NVN_AXR_N };
+#define BOOT_NVN_AXR_BOUND(size, kind, slot) (((uint64_t)(size) & UINT64_C(0xffffffffff)) | (uint64_t)(kind) << 56 | ((uint64_t)(slot) & 0xffffu) << 40)
+typedef struct BootNvnAxr { uint64_t va, bound; } BootNvnAxr;
+static struct { BootNvnAxr *e; uint32_t n, cap; uint64_t lost; } boot_nvn_axr;   /* the running submit call's summaries (t2: reset and filled by its walk) */
+static inline void boot_nvn_axr_add(uint64_t va, uint64_t bound) {
+    if (boot_nvn_axr.n == boot_nvn_axr.cap) {
+        const uint32_t cap = boot_nvn_axr.cap ? boot_nvn_axr.cap * 2 : 4096;
+        BootNvnAxr *e = cap < (1u << 26) ? (BootNvnAxr *)realloc(boot_nvn_axr.e, (size_t)cap * sizeof *e) : NULL;
+        if (!e) { ++boot_nvn_axr.lost; return; }
+        boot_nvn_axr.e = e; boot_nvn_axr.cap = cap;
+    }
+    boot_nvn_axr.e[boot_nvn_axr.n].va = va; boot_nvn_axr.e[boot_nvn_axr.n].bound = bound; ++boot_nvn_axr.n;
+}
+/* The summary entries of record r (ptr[k] the address, bound[k]), at most 10; 0 for any other record. Op indices once (release flag:
+ * recording threads call this concurrently). */
+static inline unsigned boot_nvn_axr_of(int op, const BootNvnRecord *r, uint64_t *ptr, uint64_t *bound) {
+    enum { AXO_UBO, AXO_VBUF, AXO_SSBO, AXO_DE, AXO_DEBV, AXO_DEI, AXO_DAI, AXO_DEIND, AXO_DISPI, AXO_COND, AXO_UPD, AXO_CLR, AXO_RVAL, AXO_RCNT, AXO_TPOOL,
+           AXO_SPOOL, AXO_RTS, AXO_N };
+    static int ix[AXO_N]; static volatile LONG ready;
+    if (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) {
+        static const char *const names[AXO_N] = {"BindUniformBuffer", "BindVertexBuffer", "BindStorageBuffer", "DrawElements", "DrawElementsBaseVertex",
+            "DrawElementsInstanced", "DrawArraysIndirect", "DrawElementsIndirect", "DispatchComputeIndirect", "SetRenderEnableConditional", "UpdateUniformBuffer",
+            "ClearBuffer", "ReportValue", "ReportCounter", "SetTexturePool", "SetSamplerPool", "SetRenderTargets"};
+        char n[96];
+        for (unsigned i = 0; i < AXO_N; ++i) { snprintf(n, sizeof n, "nvnCommandBuffer%s", names[i]); ix[i] = boot_nvn_name_index(n); }
+        __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+    }
+    const uint64_t *x = r->x; unsigned k = 0;
+#define BOOT_NVN_AXR_PUT(a, size, kind, slot) do { if ((a) && (size)) { ptr[k] = (a); bound[k] = BOOT_NVN_AXR_BOUND(size, kind, slot); ++k; } } while (0)
+    if (op == ix[AXO_UBO]) BOOT_NVN_AXR_PUT(x[3], x[4], BOOT_NVN_AXR_CB, x[1] << 4 | (x[2] & 15));   /* (stage, slot, address, size), as the executor */
+    else if (op == ix[AXO_VBUF]) BOOT_NVN_AXR_PUT(x[2], x[3], BOOT_NVN_AXR_VB, x[1]);
+    else if (op == ix[AXO_SSBO]) BOOT_NVN_AXR_PUT(x[3], x[4], BOOT_NVN_AXR_SSBO, x[1] << 4 | (x[2] & 15));
+    else if (op == ix[AXO_DE] || op == ix[AXO_DEBV] || op == ix[AXO_DEI])   /* (mode, type, count, index buffer, ...) */
+        BOOT_NVN_AXR_PUT(x[4], x[3] * (x[2] == 0 ? 1u : x[2] == 1 ? 2u : 4u), BOOT_NVN_AXR_IB, x[2]);
+    else if (op == ix[AXO_DAI]) BOOT_NVN_AXR_PUT(x[2], 16, BOOT_NVN_AXR_IND, 0);
+    else if (op == ix[AXO_DEIND]) BOOT_NVN_AXR_PUT(x[4], 20, BOOT_NVN_AXR_IND, 1);   /* its index buffer's size is not known here */
+    else if (op == ix[AXO_DISPI]) BOOT_NVN_AXR_PUT(x[1], 12, BOOT_NVN_AXR_IND, 2);
+    else if (op == ix[AXO_COND]) BOOT_NVN_AXR_PUT(x[2], 32, BOOT_NVN_AXR_COND, 0);
+    else if (op == ix[AXO_UPD]) BOOT_NVN_AXR_PUT(x[1] + x[3], r->blocks ? r->block[0].bytes : 0, BOOT_NVN_AXR_W_UBO, 0);
+    else if (op == ix[AXO_CLR]) BOOT_NVN_AXR_PUT(x[1], x[2], BOOT_NVN_AXR_W_CLEAR, 0);
+    else if (op == ix[AXO_RVAL]) BOOT_NVN_AXR_PUT(x[2], 4, BOOT_NVN_AXR_W_REPORT, 0);
+    else if (op == ix[AXO_RCNT]) BOOT_NVN_AXR_PUT(x[2], 16, BOOT_NVN_AXR_W_REPORT, 1);
+    else if ((op == ix[AXO_TPOOL] || op == ix[AXO_SPOOL]) && r->blocks && r->block[0].bytes >= 20) {   /* {memory pool object, offset, count} */
+        uint64_t mem; memcpy(&mem, r->block[0].data, 8);
+        BOOT_NVN_AXR_PUT(mem ? mem + 0x18 : 0, 8, BOOT_NVN_AXR_OBJ, 0);
+    } else if (op == ix[AXO_RTS] && r->blocks > 1) {   /* the texture objects captured at record time (views, then 0x80 per object): each pool word */
+        const uint32_t n = x[1] < 8 ? (uint32_t)x[1] : 8;
+        if (r->block[1].bytes >= (16u + 0x80u) * (n + 1)) {
+            const uint8_t *objs = r->block[1].data + 16 * (size_t)(n + 1);
+            for (uint32_t i = 0; i <= n; ++i) {   /* the colour targets, then the depth target's */
+                uint64_t pool; memcpy(&pool, objs + 0x80 * (size_t)i + 0x10, 8);
+                if (i < n || x[4]) BOOT_NVN_AXR_PUT(pool ? pool + 0x18 : 0, 8, BOOT_NVN_AXR_OBJ, 1);
+            }
+        }
+    }
+#undef BOOT_NVN_AXR_PUT
+    return k;
 }
 /* Record time: the index entries of record r (its deferred bind, or the handles of a CallCommands: the ones the
  * executor follows, 64 at most), for the record's append (boot_nvn_slot_append). 0 entries: none. */
@@ -912,6 +1029,7 @@ static inline unsigned boot_nvn_dsnap_dref(int op, const BootNvnRecord *r, uint6
         uint32_t n = r->block[0].bytes / 8 < 64 ? r->block[0].bytes / 8 : 64;
         memcpy(h, r->block[0].data, (size_t)n * 8); d->count = UINT32_MAX; d->n = n;
     }
+    else if (boot_nvn_ax_mode() && (d->n = boot_nvn_axr_of(op, r, h, h + 32)) != 0) { d->count = BOOT_NVN_DREF_RANGE; d->bound = h + 32; }   /* async-xlate: summaries */
     return d->n;
 }
 /* Host maps (open addressing, key 0 = empty, backward-shift deletion): the command buffer object -> the slot of
@@ -979,7 +1097,12 @@ static inline BootNvnHostMap *boot_nvn_handles(void) { static BootNvnHostMap m =
  * without the store lock: the slot cannot have been freed or reused since (its map entry is removed before any
  * release, and a pinned slot is never freed), so this is the answer the locked path would give (TOTK_RECLOCK=0:
  * asked under the store lock, as before). */
-static _Thread_local struct { BootNvnPin *pin; uint32_t *hash; uint32_t n, cap, hcap, last; } boot_nvn_pins;
+typedef struct BootNvnPinSet { BootNvnPin *pin; uint32_t *hash; uint32_t n, cap, hcap, last; } BootNvnPinSet;   /* async-xlate: named (was anonymous) */
+static _Thread_local BootNvnPinSet boot_nvn_pins;
+/* async-xlate: a submit call's pins move with its captured submission (t2 -> S -> the translation thread X -> S -> t2, host_nvn_async.h):
+ * exchanges this thread's set with *s. A set held outside a thread is either the call's pins or an empty one keeping its buffers (an
+ * empty set's hash is all zero: boot_nvn_unpin_all clears each entry it drops), so either side can take the other's. */
+static inline void boot_nvn_pins_swap(BootNvnPinSet *s) { const BootNvnPinSet t = boot_nvn_pins; boot_nvn_pins = *s; *s = t; }
 static inline uint32_t boot_nvn_pin_hash(uint32_t i, uint32_t hcap) { return (i * 2654435761u) & (hcap - 1); }
 static inline const BootNvnPin *boot_nvn_pin_find(uint32_t i) {
     uint32_t l = boot_nvn_pins.last;
@@ -1209,7 +1332,7 @@ static inline uint64_t boot_nvn_dsnap_resolve(uint64_t h) {
 /* Translation (boot_nvn_record_read, the submitting thread): the recording the call resolved for handle h, 0 to use
  * the live map (freeze off, another thread, a handle the call did not reach or could not resolve). */
 static inline uint64_t boot_nvn_freeze_resolve(uint64_t h) {
-    if (!boot_nvn_dsnap.active || !boot_nvn_dsnap.fz_on || boot_nvn_dsnap.tid != GetCurrentThreadId()) return 0;
+    if (!boot_nvn_dsnap.active || !boot_nvn_dsnap.fz_on || boot_nvn_dsnap.tid != boot_nvn_call_tid()) return 0;   /* async-xlate: X acts for the call's thread */
     const BootNvnFzEnt *f = boot_nvn_freeze_find(h);
     if (!f) { ++boot_nvn_dsnap.fz_unknown; if (!boot_nvn_rv.missed) InterlockedExchange(&boot_nvn_rv.missed, 1); return 0; }   /* rerecord-work: no more versions in this call */
     if (!f->shadow) return 0;   /* not in the map at the call (counted as missing there) */
@@ -1226,7 +1349,7 @@ static inline unsigned boot_nvn_cb_resolve(uint64_t h, uint64_t b, uint64_t *bou
     *bound_sh = *live_sh = 0;
     if (!b) { InterlockedIncrement64(&boot_nvn_cb.ex_unbound); return BOOT_NVN_CB_R_UNBOUND; }
     if (!boot_nvn_cb_mode()) { InterlockedIncrement64(&boot_nvn_cb.ex_off); return BOOT_NVN_CB_R_OFF; }
-    const BootNvnFzEnt *f = boot_nvn_dsnap.active && boot_nvn_dsnap.fz_on && boot_nvn_dsnap.tid == GetCurrentThreadId() ? boot_nvn_freeze_find(h) : NULL;
+    const BootNvnFzEnt *f = boot_nvn_dsnap.active && boot_nvn_dsnap.fz_on && boot_nvn_dsnap.tid == boot_nvn_call_tid() ? boot_nvn_freeze_find(h) : NULL;   /* async-xlate: as above */
     const uint64_t cur = f ? f->shadow : boot_nvn_hmap_get(boot_nvn_handles(), h);
     *live_sh = cur;
     if (cur && boot_nvn_slot_of(cur) == boot_nvn_slot_of(b)) {   /* the same slot: the same version while b's binding holds it (else stale: check) */
@@ -1259,6 +1382,7 @@ static inline uint64_t boot_nvn_cb_target(uint64_t h, uint64_t b, unsigned *how,
 static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t handles, uint64_t count) {
     boot_nvn_dsnap.active = 0; boot_nvn_dsnap.fz_on = 0; boot_nvn_dsnap.top_n = 0; boot_nvn_dsnap.covered = 0;
     boot_nvn_dsnap.ft_latest_end = 0; boot_nvn_dsnap.ft_latest_thread = UINT32_MAX; boot_nvn_dsnap.ft_recent = 0;
+    boot_nvn_axr.n = 0;   /* async-xlate: this call's range summaries (collected by the walk below) */
     if (!count || !boot_nvn_dsnap_wanted()) return;
     LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
     if (!++boot_nvn_dsnap.stamp) boot_nvn_dsnap.stamp = 1;
@@ -1300,6 +1424,7 @@ static inline void boot_nvn_dsnap_take(BootContext *c, uint64_t self, uint64_t h
         ReleaseSRWLockExclusive(&t->lock);
         for (uint32_t k = 0; k < nr; ++k) {   /* guest reads and pins outside the slot lock */
             const BootNvnDref *d = &boot_nvn_dsnap.refs[k];
+            if (d->count == BOOT_NVN_DREF_RANGE) { boot_nvn_axr_add(d->ptr, d->bound); continue; }   /* async-xlate: a range summary (no guest read) */
             if (d->count != UINT32_MAX) { boot_nvn_dsnap_add(c, self, base + d->off, d->ptr, d->count); continue; }
             const uint64_t sh = w.depth < 8 && d->ptr ? boot_nvn_dsnap_resolve(d->ptr) : 0;
             if (sh) boot_nvn_dsnap_push(sh, w.depth + 1);
@@ -2863,6 +2988,25 @@ static inline int boot_nvn_queue_load(BootContext *c, uint64_t self, uint64_t ad
 #ifdef TOTK_DRAW_PATH
 static inline void boot_sd_call_end(BootContext *c);   /* suspect-diag (host_nvn_exec.h): TOTK_SUSPECT_DIAG end-of-call re-hash */
 static inline void boot_ds_call_end(BootContext *c);   /* data-snapshot (host_nvn_exec.h): the detector's end-of-call check */
+/* async-xlate (host_nvn_async.h, included after host_nvn_play.h): the submit's capture / hand-off / join, its 300-present line, the
+ * registry epoch, and what the executor (host_nvn_play.h, host_nvn_exec.h) asks while it runs on the translation thread X: object words
+ * captured at the call, residual live guest reads by class (host_gpu_render.h), the sentinel's record log. Stage 2: the lock-free paths of
+ * the queue and sync calls (boot_ax_lf: set by the registration wrapper while the live mode is 2; boot_ax_held: a lock such a call took
+ * later, released by the wrapper). */
+enum { BOOT_AX_SYNC, BOOT_AX_DONE, BOOT_AX_FAIL, BOOT_AX_READ_FAIL, BOOT_AX_QUEUED };
+static _Thread_local int boot_ax_lf, boot_ax_held;
+static inline int boot_ax_join(BootContext *c, uint64_t self, uint64_t queue, int frozen, uint64_t *submitted, uint64_t *bad, int *xdiag);
+static inline uint64_t boot_ax_tagged(uint64_t v);
+static inline uint64_t boot_ax_fence(BootContext *c);
+static inline int boot_ax_sync_wait(BootContext *c, uint64_t *v, uint64_t timeout_ns);
+static inline void boot_ax_finish(BootContext *c);
+static inline int boot_ax_present_queue(BootContext *c, uint64_t window, uint32_t index);
+static inline void boot_ax_lock_now(void);
+static inline void boot_ax_present(void);
+static inline void boot_ax_reg_note(int index);
+static inline void boot_ax_live(unsigned cls, uint64_t n);
+static inline int boot_ax_obj_word(uint64_t a, uint64_t *v);
+static inline void boot_ax_chk_rec(uint64_t at, const BootNvnRecord *rec, uint64_t size);
 #endif
 #ifdef TOTK_DRAW_PATH   /* overlap-work P3: every return of the submit ends its in-submit stretch */
 #define BOOT_NVN_FF_END() boot_ff_submit_end(c)
@@ -2874,7 +3018,8 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
     if (!boot_nvn_queue_load(c, self, address, &q)) return BOOT_HOST_STOP;
     boot_nvn_sub_begin(c);   /* batch-a: a submit call runs (re-record wait, frame trace) */
 #ifdef TOTK_DRAW_PATH
-    boot_ds_call_begin();   /* data-snapshot (host_gpu_render.h): a new call (call-start copy due, detector records reset) */
+    int ax_xdiag = 0;   /* async-xlate stage 2: X ran the call's data-snapshot / suspect-diag begin and end */
+    if (!boot_ax_lf) boot_ds_call_begin();   /* data-snapshot (host_gpu_render.h): a new call (call-start copy due, detector records reset); stage 2: on X */
 #endif
     /* flashfix: the deferred-bind handles as the driver reads them, at the call, before anything below can let other
      * guest threads run; the recordings it reaches stay pinned until the end of the call (boot_nvn_dsnap_end) */
@@ -2882,6 +3027,15 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
     const int dsnap_held = boot_nvn_dsnap.active, frozen = dsnap_held && boot_nvn_dsnap.fz_on;
 #ifdef TOTK_DRAW_PATH
     boot_ff_submit(c);   /* overlap-work P3: this thread is inside a submit (repeat waits on its frame sync: no give-up) */
+    {   /* async-xlate (host_nvn_async.h): stage 1 (=1) captures the submission here, X translates it and this call joins it; stage 2 (=2,
+         * lock-free) returns once it is captured and queued (BOOT_AX_QUEUED: the walk table and the pins went with it), or joins it. The
+         * outcomes below are the loop's own. BOOT_AX_SYNC (off, or not possible: counted): the loop (stage 2: X drained, the lock taken) */
+        uint64_t bad = 0; const int ax = boot_ax_join(c, self, address, frozen, &q.submitted, &bad, &ax_xdiag);
+        if (ax == BOOT_AX_READ_FAIL) { boot_nvn_dsnap_end(); boot_nvn_sub_end(); BOOT_NVN_FF_END(); return BOOT_HOST_STOP; }
+        if (ax == BOOT_AX_FAIL) { if (boot_nvn_ftrace_on()) boot_nvn_ftrace_write(c, c->x[1], 0); boot_nvn_dsnap_end(); boot_nvn_sub_end(); BOOT_NVN_FF_END(); return boot_nvn_fail(c, self, "submit", bad); }
+        if (ax == BOOT_AX_DONE) goto submitted;
+        if (ax == BOOT_AX_QUEUED) { boot_nvn_dsnap_end(); boot_nvn_sub_end(); BOOT_NVN_FF_END(); BOOT_NVN_PUT(q); return BOOT_HOST_DONE; }   /* X translates it */
+    }
 #endif
     BootNvnBackend *be = boot_nvn_backend();
     for (uint64_t k = 0; k < c->x[1]; ++k) {
@@ -2893,10 +3047,15 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
         if (!ok) { if (boot_nvn_ftrace_on()) boot_nvn_ftrace_write(c, c->x[1], 0); boot_nvn_dsnap_end(); boot_nvn_sub_end(); BOOT_NVN_FF_END(); return boot_nvn_fail(c, self, "submit", handle); }
         ++q.submitted;
     }
+#ifdef TOTK_DRAW_PATH
+submitted:   /* async-xlate: X translated the submission */
+#endif
     if (boot_nvn_ftrace_on()) boot_nvn_ftrace_write(c, c->x[1], 1);   /* batch-a: before the pins go */
 #ifdef TOTK_DRAW_PATH
-    boot_sd_call_end(c);   /* suspect-diag: TOTK_SUSPECT_DIAG (off: one cached branch) */
-    boot_ds_call_end(c);   /* data-snapshot: TOTK_DATA_SNAPSHOT (=0: one cached branch) */
+    if (!ax_xdiag) {   /* stage 2: X ran them */
+        boot_sd_call_end(c);   /* suspect-diag: TOTK_SUSPECT_DIAG (off: one cached branch) */
+        boot_ds_call_end(c);   /* data-snapshot: TOTK_DATA_SNAPSHOT (=0: one cached branch) */
+    }
 #endif
     boot_nvn_dsnap_end();
     boot_nvn_sub_end();
@@ -2906,6 +3065,9 @@ BOOT_NVN_FN(boot_nvn_queue_submit) {   /* (queue, count, handles) */
 BOOT_NVN_FN(boot_nvn_queue_finish) {   /* Finish waits; Flush (user 1) only executes, which submit already did */
     (void)target; BootNvnQueue q; uint64_t address = c->x[0];
     if (!boot_nvn_queue_load(c, self, address, &q)) return BOOT_HOST_STOP;
+#ifdef TOTK_DRAW_PATH
+    if (!user && boot_ax_lf) { boot_ax_finish(c); return BOOT_HOST_DONE; }   /* async-xlate stage 2: a FINISH op through the FIFO */
+#endif
     if (!user) { BootNvnBackend *be = boot_nvn_backend(); uint64_t v = be->signal(be->ctx, address); be->wait(be->ctx, address, v, UINT64_MAX); }
     return BOOT_HOST_DONE;
 }
@@ -2920,7 +3082,11 @@ BOOT_NVN_FN(boot_nvn_queue_fence_sync) {   /* (queue, sync, condition, flags) */
     uint64_t address = c->x[1]; BootNvnSync s; BOOT_NVN_GET(s);
     if (s.magic != BOOT_NVN_MAGIC_SYNC) return boot_nvn_fail(c, self, "not a sync", address);
     BootNvnBackend *be = boot_nvn_backend();
-    s.queue = c->x[0]; s.value = be->signal(be->ctx, c->x[0]);
+    s.queue = c->x[0];
+#ifdef TOTK_DRAW_PATH
+    if (boot_ax_lf) s.value = boot_ax_fence(c); else   /* async-xlate stage 2: a FENCE op; the value is its tagged sequence number */
+#endif
+    s.value = be->signal(be->ctx, c->x[0]);
     BOOT_NVN_PUT(s);
 #ifdef TOTK_DRAW_PATH
     boot_ff_fence(c, address, s.value);   /* overlap-work P3: a new fence on this sync (after the sync holds its value) */
@@ -2940,6 +3106,16 @@ BOOT_NVN_FN(boot_nvn_sync_wait) {   /* (sync, timeout ns) -> NVNsyncWaitResult *
         if (ff > 0) { BOOT_NVN_GET(s); if (s.magic != BOOT_NVN_MAGIC_SYNC) return boot_nvn_fail(c, self, "not a sync", address); }
     }
     boot_nw_note(BOOT_NW_FRONT_ENTRY,BOOT_NW_A|BOOT_NW_B|BOOT_NW_C,address,s.queue,s.value,0);
+    if (s.queue && boot_ax_tagged(s.value)) {   /* async-xlate stage 2: a virtual fence (the result as the backend gives it; -1: a mode below 2 waits below for its D3D12 value) */
+        const int r = boot_ax_sync_wait(c, &s.value, c->x[1]);
+        if (r >= 0) {
+            c->x[0] = r == 0 ? BOOT_NVN_SYNC_ALREADY_SIGNALED : r == 1 ? BOOT_NVN_SYNC_CONDITION_SATISFIED : BOOT_NVN_SYNC_TIMEOUT_EXPIRED;
+            if (r < 2) boot_ff_consumed(c, address, ff_fence);
+            boot_nw_note(BOOT_NW_FRONT_RESULT,BOOT_NW_A,c->x[0],0,0,0);
+            return BOOT_HOST_DONE;
+        }
+    }
+    if (boot_ax_lf && s.queue && be->completed(be->ctx, s.queue) < s.value) boot_ax_lock_now();   /* stage 2, an untagged value: today's wait, under the renderer lock */
 #endif
     if (!s.queue || be->completed(be->ctx, s.queue) >= s.value) {
 #ifdef TOTK_DRAW_PATH
@@ -2972,9 +3148,15 @@ BOOT_NVN_FN(boot_nvn_queue_wait_sync) {   /* (queue, sync): GPU-side wait */
 static inline int boot_nvn_window_presented(BootContext *c, uint64_t self, uint64_t window, uint64_t index);
 BOOT_NVN_FN(boot_nvn_queue_present) {   /* (queue, window, texture index) */
     BOOT_NVN_UNUSED; BootNvnBackend *be = boot_nvn_backend();
+#ifdef TOTK_DRAW_PATH
+    if (boot_ax_lf) (void)boot_ax_present_queue(c, c->x[1], (uint32_t)c->x[2]); else   /* async-xlate stage 2: the call's half here, a PRESENT op for X */
+#endif
     if (!be->present(be->ctx, c, c->x[0], c->x[1], (uint32_t)c->x[2])) return boot_nvn_fail(c, self, "present", c->x[1]);
     boot_nvn_rv_present();   /* rerecord-work: the 300-present line */
     boot_nvn_ev_present();   /* rec-evict: the budget sweep and its 300-present line */
+#ifdef TOTK_DRAW_PATH
+    boot_ax_present();   /* async-xlate: its 300-present line (TOTK_ASYNC_XLATE unset/0: one cached branch) */
+#endif
     return boot_nvn_window_presented(c, self, c->x[1], c->x[2]) ? BOOT_HOST_DONE : BOOT_HOST_STOP;
 }
 
@@ -2987,6 +3169,14 @@ typedef struct BootNvnProgram { uint64_t program; uint32_t count; BootNvnProgram
 #define BOOT_NVN_PROGRAMS 65536
 typedef struct BootNvnPrograms { SRWLOCK lock; BootNvnProgram p[BOOT_NVN_PROGRAMS]; } BootNvnPrograms;
 static inline BootNvnPrograms *boot_nvn_programs(void) { static BootNvnPrograms *t; if (!t) t = calloc(1, sizeof *t); return t; }
+/* async-xlate stage 2 (TOTK_ASYNC_XLATE >= 2): a SetShaders that replaces a program keeps the old stages with the registry epochs it was set
+ * at and replaced at (host_gpu_render.h boot_ax_hist's rule, under the table's lock): X translating a submission captured before reads them. */
+#ifdef TOTK_DRAW_PATH
+#define BOOT_NVN_PROG_HIST 1024u
+typedef struct BootNvnProgHist { BootNvnProgram p; uint64_t ev, er; } BootNvnProgHist;
+static BootNvnProgHist *boot_nvn_prog_hist; static uint64_t boot_nvn_prog_hist_n, *boot_nvn_prog_ep;
+static uint64_t boot_nvn_prog_hist_c[3];   /* kept, older served, none kept (current used) */
+#endif
 static inline const BootNvnProgram *boot_nvn_program_find(uint64_t program) {
     BootNvnPrograms *t = boot_nvn_programs(); if (!t || !program) return NULL;
     const BootNvnProgram *found = NULL;
@@ -2995,6 +3185,17 @@ static inline const BootNvnProgram *boot_nvn_program_find(uint64_t program) {
         if (!t->p[i].program) break;
         if (t->p[i].program == program) { found = &t->p[i]; break; }
     }
+#ifdef TOTK_DRAW_PATH
+    if (found && boot_ax_x_epoch1 && boot_nvn_prog_ep && boot_nvn_prog_ep[found - t->p] >= boot_ax_x_epoch1) {   /* set again after the capture X translates */
+        const uint64_t e = boot_ax_x_epoch1 - 1, n = boot_nvn_prog_hist_n < BOOT_NVN_PROG_HIST ? boot_nvn_prog_hist_n : BOOT_NVN_PROG_HIST; const BootNvnProgram *old = NULL;
+        for (uint64_t k = 0; boot_nvn_prog_hist && k < n && !old; ++k) {
+            const BootNvnProgHist *h = &boot_nvn_prog_hist[(boot_nvn_prog_hist_n - 1 - k) % BOOT_NVN_PROG_HIST];
+            if (h->er <= e) break;
+            if (h->p.program == program && h->ev <= e) old = &h->p;
+        }
+        if (old) { found = old; ++boot_nvn_prog_hist_c[1]; } else ++boot_nvn_prog_hist_c[2];
+    }
+#endif
     ReleaseSRWLockShared(&t->lock);
     return found;
 }
@@ -3002,7 +3203,20 @@ static inline void boot_nvn_program_put(const BootNvnProgram *p) {
     BootNvnPrograms *t = boot_nvn_programs(); if (!t) return;
     AcquireSRWLockExclusive(&t->lock);
     for (uint32_t i = (uint32_t)((p->program >> 3) * UINT64_C(0x9e3779b97f4a7c15) >> 48) & (BOOT_NVN_PROGRAMS - 1), n = 0; n < BOOT_NVN_PROGRAMS; ++n, i = (i + 1) & (BOOT_NVN_PROGRAMS - 1))
-        if (!t->p[i].program || t->p[i].program == p->program) { t->p[i] = *p; break; }
+        if (!t->p[i].program || t->p[i].program == p->program) {
+#ifdef TOTK_DRAW_PATH
+            if (boot_ax_hist_on) {   /* async-xlate stage 2: the stages it replaces stay readable for the submissions captured before */
+                if (!boot_nvn_prog_ep) boot_nvn_prog_ep = (uint64_t *)calloc(BOOT_NVN_PROGRAMS, 8);
+                if (!boot_nvn_prog_hist) boot_nvn_prog_hist = (BootNvnProgHist *)calloc(BOOT_NVN_PROG_HIST, sizeof *boot_nvn_prog_hist);
+                const uint64_t er = (uint64_t)__atomic_load_n(&boot_ax_reg_epoch, __ATOMIC_ACQUIRE);
+                if (boot_nvn_prog_ep && boot_nvn_prog_hist && t->p[i].program) {
+                    BootNvnProgHist *h = &boot_nvn_prog_hist[boot_nvn_prog_hist_n++ % BOOT_NVN_PROG_HIST]; h->p = t->p[i]; h->ev = boot_nvn_prog_ep[i]; h->er = er; ++boot_nvn_prog_hist_c[0];
+                }
+                if (boot_nvn_prog_ep) boot_nvn_prog_ep[i] = er;
+            }
+#endif
+            t->p[i] = *p; break;
+        }
     ReleaseSRWLockExclusive(&t->lock);
 }
 /* nvnProgramSetShaders(program, count, NVNshaderData*) / Ext (32-byte entries): record, then the driver runs. */
@@ -3164,6 +3378,7 @@ BOOT_NVN_FN(boot_nvn_sync_get_nvrm) { BOOT_NVN_UNUSED; (void)self; c->x[0] = 0; 
 
 #ifdef TOTK_DRAW_PATH
 #include "host_nvn_play.h"
+#include "host_nvn_async.h"   /* async-xlate: TOTK_ASYNC_XLATE (play-work/async-xlate-work/stage1, stage2) */
 #endif
 
 /* ---------------------------------------------------------------- registration */
@@ -3194,7 +3409,7 @@ static inline int boot_nvn_policy(const char *n) {
     if (!strcmp(n, "nvnTextureFlushTexels") && boot_nvn_flush_texels_on()) return BOOT_NVN_OBSERVE;   /* batch-3 N6 */
     if (boot_frt_name(n)) return BOOT_NVN_OBSERVE;   /* fence-read trace (TOTK_FENCE_READ_TRACE=1): pool/buffer invalidate and flush, timestamps */
 #endif
-    if (!strcmp(n, "nvnMemoryPoolFinalize") && boot_nvn_ev_dead_mode()) return BOOT_NVN_OBSERVE;   /* rec-evict: its recordings are dead */
+    if (!strcmp(n, "nvnMemoryPoolFinalize") && (boot_nvn_ev_dead_mode() || boot_nvn_ax_mode() >= 2)) return BOOT_NVN_OBSERVE;   /* rec-evict: its recordings are dead; async-xlate stage 2: the drain */
     if (boot_nvn_ds_pool(n)) return BOOT_NVN_OBSERVE;   /* data-snapshot: memory pool flags */
     return BOOT_NVN_PASS;
 }
@@ -3551,17 +3766,23 @@ BOOT_NVN_FN(boot_nvn_hybrid_observe) {
     int index = (int)(intptr_t)user; const char *n = boot_nvn_names[index].name;
     uint64_t logical = boot_nvn_trace()->procs[index], real = logical ? boot_address(c, logical) : 0;
     if (!real || real == UINT64_MAX) return boot_nvn_fail(c, self, "driver function unknown", (uint64_t)index);
+#ifdef TOTK_DRAW_PATH
+    if (boot_nvn_ax_mode()) boot_ax_reg_note(index);   /* async-xlate: the registry epoch (registrations, programs, texel writes) */
+#endif
     if (!strcmp(n, "nvnProgramSetShaders")) boot_nvn_observe_program(c, self, 0);
     else if (!strcmp(n, "nvnProgramSetShadersExt")) boot_nvn_observe_program(c, self, 1);
 #ifdef TOTK_DRAW_PATH
-    else if (!strcmp(n, "nvnDeviceSetDepthMode")) { BootNvnExec *e = boot_nvn_exec(); if (e) e->depth_mode = (uint32_t)c->x[1]; }
-    else if (!strcmp(n, "nvnDeviceSetWindowOriginMode")) { BootNvnExec *e = boot_nvn_exec(); if (e) e->origin_upper_left = (uint32_t)c->x[1]; }
+    else if (!strcmp(n, "nvnDeviceSetDepthMode")) { BootNvnExec *e = boot_nvn_exec(); if (e && !boot_ax_mode_op(c, 0, (uint32_t)c->x[1])) e->depth_mode = (uint32_t)c->x[1]; }   /* async-xlate stage 2: an op */
+    else if (!strcmp(n, "nvnDeviceSetWindowOriginMode")) { BootNvnExec *e = boot_nvn_exec(); if (e && !boot_ax_mode_op(c, 1, (uint32_t)c->x[1])) e->origin_upper_left = (uint32_t)c->x[1]; }
     else if (!strcmp(n, "nvnTexturePoolRegisterTexture")) boot_nvn_observe_register(c, self, 0);
     else if (!strcmp(n, "nvnSamplerPoolRegisterSampler")) boot_nvn_observe_register(c, self, 1);
     else if (!strcmp(n, "nvnTextureFlushTexels")) boot_nvn_observe_flush_texels(c, self);   /* batch-3 N6 */
     else if (!strcmp(n, "nvnTextureWriteTexels") || !strcmp(n, "nvnTextureWriteTexelsStrided")) boot_nvn_observe_write_texels(c, self, !strcmp(n, "nvnTextureWriteTexelsStrided"));   /* render-32 */
 #endif
     {   static int pool_final = -2; if (pool_final == -2) pool_final = boot_nvn_name_index("nvnMemoryPoolFinalize");
+#ifdef TOTK_DRAW_PATH
+        if (index == pool_final) boot_ax_pool_final(c);   /* async-xlate stage 2: every captured submission translated and executed first (no lock held) */
+#endif
         if (index == pool_final) boot_nvn_ev_pool_final(c, self, c->x[0]); }   /* rec-evict: the pool's recordings are dead */
 #ifdef TOTK_DRAW_PATH
     boot_ds_pool_note(n, c->x[0], c->x[1], c->x[2]);   /* data-snapshot: pool flags by storage address (own lock) */
@@ -3616,6 +3837,9 @@ static inline void boot_nvn_native_register(void) {
         while (fscanf(f, "%111s %llx", name, &logical) == 2) { int i = boot_nvn_name_index(name); if (i >= 0) t->procs[i] = logical; }
         fclose(f);
     }
+#ifdef TOTK_DRAW_PATH
+    if (boot_nvn_ax_mode() >= 2) boot_ax_hist_on = 1;   /* async-xlate stage 2: registrations keep the entries they replace */
+#endif
     for (int i = 0; i < BOOT_NVN_NAME_COUNT; ++i) {
         const char *n = boot_nvn_names[i].name; char name[112]; int policy = boot_nvn_policy(n);
         if (policy == BOOT_NVN_OBSERVE && !strncmp(n, "nvnCommandBuffer", 16)) {
@@ -3642,6 +3866,8 @@ static inline void boot_nvn_native_register(void) {
         for (size_t k = 0; k < sizeof impl / sizeof impl[0]; ++k) if (!strcmp(impl[k].name, n)) { fn = impl[k].fn; user = impl[k].user; }
 #ifdef TOTK_DRAW_PATH
         fn = boot_frt_own(fn);   /* fence-read trace (TOTK_FENCE_READ_TRACE=1): its observing wrapper; off: fn itself */
+        snprintf(name, sizeof name, "nvn:%s", n);
+        if (boot_nvn_ax_mode() >= 2 && boot_ax_own_add(n, &fn, &user)) { boot_host_fn_register(name, fn, (void *)user, BOOT_HOST_FN_NOLOCK, 0); continue; }   /* async-xlate stage 2: the wrapper locks */
 #endif
         snprintf(name, sizeof name, "nvn:%s", n);
         boot_host_fn_register(name, fn, (void *)user, 0, 0);
